@@ -2810,6 +2810,83 @@ TEST(GroupedSortedSetWriteE2e, MemberScoreProjectionPreservesOrderAndRecovery) {
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
+TEST(GroupedSortedSetWriteE2e, ScoreReadWavesNeverExposePartialBatchUpdates) {
+  PrivateDisk disk;
+  Server server(disk, 2);
+  Client client(server.port());
+  const std::string key = "score-wave-atomic";
+  const auto member = [](unsigned i) {
+    return std::to_string(i) + std::string(128, 'm');
+  };
+  std::vector<std::string> seed{"ZADD", key};
+  for (unsigned i = 0; i < 512; ++i) seed.insert(seed.end(), {"0", member(i)});
+  ASSERT_EQ(client.Command(seed).text_, "512");
+  std::vector<std::string> lookup{"ZMSCORE", key};
+  for (unsigned i = 0; i < 64; ++i) lookup.push_back(member(i * 8));
+  lookup.insert(lookup.end(), {member(0), "missing"});
+  auto writer = std::async(std::launch::async, [&] {
+    Client writes(server.port());
+    for (unsigned score = 1; score <= 200; ++score) {
+      std::vector<std::string> command{"ZADD", key};
+      for (unsigned i = 0; i < 64; ++i)
+        command.insert(command.end(), {std::to_string(score), member(i * 8)});
+      const auto reply = writes.Command(command);
+      EXPECT_EQ(reply.kind_, ':');
+      EXPECT_EQ(reply.text_, "0");
+    }
+  });
+  for (unsigned pass = 0; pass < 500; ++pass) {
+    const auto reply = client.Command(lookup);
+    ASSERT_EQ(reply.items_.size(), 66);
+    const auto score = std::stod(reply.items_.front().text_);
+    EXPECT_GE(score, 0);
+    EXPECT_LE(score, 200);
+    for (std::size_t i = 1; i < 65; ++i)
+      EXPECT_EQ(std::stod(reply.items_[i].text_), score);
+    EXPECT_EQ(reply.items_.back().text_, "-1");
+  }
+  writer.get();
+  const auto final = client.Command(lookup);
+  ASSERT_EQ(final.items_.size(), 66);
+  for (std::size_t i = 0; i < 65; ++i) EXPECT_EQ(final.items_[i].text_, "200");
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreReadPartialWaveFailureJoinsAndRecovers) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires partial score-window failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "score-wave-failure";
+  const auto seed = ZSetSeed(key);
+  std::vector<std::string> lookup{"ZMSCORE", key};
+  for (std::size_t i = 3; i < seed.size(); i += 2) lookup.push_back(seed[i]);
+  {
+    ScopedEnvironment failure("LAVIK_FAIL_ZSET_SCORE_READ_BATCH_START_KEY",
+                              key.c_str());
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(seed).text_, "256");
+    // Repeated failures must release both child ownership and the active
+    // batch count. A leaked count would suppress fanout and bypass this hook.
+    for (unsigned attempt = 0; attempt < 40; ++attempt) {
+      const auto failed = client.Command(lookup);
+      ASSERT_EQ(failed.kind_, '-');
+      EXPECT_TRUE(failed.text_.starts_with("OOM ")) << failed.text_;
+    }
+    // A failed wave cannot leave borrowed results/children or holds behind.
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "1", seed[3]}).text_, "1");
+    ASSERT_EQ(client.Command({"ZSCORE", key, seed[3]}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  const auto reply = client.Command(lookup);
+  ASSERT_EQ(reply.items_.size(), 256);
+  for (std::size_t i = 0; i < reply.items_.size(); ++i)
+    EXPECT_EQ(reply.items_[i].text_, std::to_string(i == 0 ? 1 : i));
+}
+
 TEST(GroupedSortedSetWriteE2e, MemberScoresUsePrefixPagesWithoutOrderedReads) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires ordered-read failure injection";

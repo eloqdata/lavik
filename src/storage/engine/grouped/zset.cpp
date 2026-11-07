@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <map>
@@ -2495,6 +2496,55 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const SortedSetOperation& operation, GroupedObject::Handle object,
     bool group_locked) {
+  // Keep batch plans/windows out of the single-score coroutine frame. This
+  // forwarding function does not suspend and allocates no frame of its own.
+  if (operation.members_.size() == 1)
+    return ReadGroupedSortedSetSingleScore(store, partition, db_id, key, digest,
+                                           operation, std::move(object),
+                                           group_locked);
+  return ReadGroupedSortedSetScoreBatch(store, partition, db_id, key, digest,
+                                        operation, std::move(object),
+                                        group_locked);
+}
+
+Task<absl::StatusOr<SortedSetResult>>
+StorageEngine::Impl::ReadGroupedSortedSetSingleScore(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, GroupedObject::Handle object,
+    bool group_locked) {
+  assert(operation.members_.size() == 1);
+  if (!object || !object->is_ordered() ||
+      object->ordered_directory().root().kind_ !=
+          OrderedCollectionKind::kSortedSet)
+    co_return absl::DataLossError("invalid grouped Sorted Set view");
+  SortedSetResult result;
+  result.key_exists_ = true;
+  result.length_ = object->ordered_directory().root().item_count_;
+  const auto fields = operation.members_;
+  auto status = PrepareScoreReply(fields.size(), &result);
+  if (!status.ok()) co_return status;
+  if (shutdown_flush_requested_)
+    co_return absl::CancelledError("member read cancelled by shutdown");
+  const auto* route = object->directory().Find(fields.front());
+  if (!route) co_return absl::DataLossError("missing member prefix route");
+  HashFieldLookup request{.group_ = route->id_,
+                          .field_ = fields.front(),
+                          .result_index_ = 0,
+                          .value_ = std::nullopt};
+  auto loaded = co_await LoadSortedSetMemberScores(
+      store, partition, db_id, key, digest, object, std::span(&request, 1),
+      result.scores_, nullptr, group_locked, operation.diagnostics_);
+  if (!loaded.ok()) co_return loaded.status();
+  co_return result;
+}
+
+Task<absl::StatusOr<SortedSetResult>>
+StorageEngine::Impl::ReadGroupedSortedSetScoreBatch(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, GroupedObject::Handle object,
+    bool group_locked) {
   if (!object || !object->is_ordered() ||
       object->ordered_directory().root().kind_ !=
           OrderedCollectionKind::kSortedSet)
@@ -2508,29 +2558,6 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
   if (fields.empty()) co_return result;
   if (shutdown_flush_requested_)
     co_return absl::CancelledError("member read cancelled by shutdown");
-  // Single-member score reads do not need a batch plan or mutation map.
-  // Published leaves have unique fields; the checked Hash lookup stops at the
-  // match. Decode its score before releasing the physical read lease.
-  if (fields.size() == 1) {
-    const auto* route = object->directory().Find(fields.front());
-    if (!route) co_return absl::DataLossError("missing member prefix route");
-    auto leaf = co_await LoadHashGroupPayload(
-        store, partition, db_id, key, digest, object, route->id_, false,
-        group_locked, operation.diagnostics_);
-    if (!leaf.ok()) co_return leaf.status();
-    const auto bytes = leaf->loaded_.value();
-    const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
-                                   bytes.size());
-    auto value =
-        FindHashGroupField(payload, leaf->field_count_, fields.front());
-    if (!value.ok()) co_return value.status();
-    if (*value) {
-      auto score = DecodeSortedSetMemberScore(**value);
-      if (!score.ok()) co_return score.status();
-      result.scores_.front() = *score;
-    }
-    co_return result;
-  }
   if (fields.size() > SIZE_MAX / sizeof(HashFieldLookup) ||
       fields.size() > std::vector<HashFieldLookup>{}.max_size()) {
     RecordMemoryRejection();
@@ -2559,44 +2586,100 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
   std::sort(requests.begin(), requests.end(), [](const auto& a, const auto& b) {
     return a.group_ != b.group_ ? a.group_ < b.group_ : a.field_ < b.field_;
   });
-  // One request-local plan, one checked leaf at a time. Repeated operands keep
-  // distinct reply positions; misses remain nil. Match only this leaf's
-  // requests, avoiding a hash lookup for every unrelated stored member.
+  // Each child extracts only its own reply slots and releases its lease
+  // before join. Bound each wave and its physical-owner read admission;
+  // memory pressure keeps the original serial floor instead of rejecting a
+  // request solely because optional concurrency could not be admitted.
+  constexpr std::size_t kScoreReadWidth = 8;
+  ++store.active_zset_score_batches_;
+  struct ActiveScoreBatch {
+    std::size_t& count_;
+    ~ActiveScoreBatch() {
+      assert(count_ != 0);
+      --count_;
+    }
+  } active_batch{store.active_zset_score_batches_};
   for (std::size_t begin = 0; begin < requests.size();) {
-    auto end = begin + 1;
-    while (end < requests.size() &&
-           requests[end].group_ == requests[begin].group_)
-      ++end;
     if (shutdown_flush_requested_)
       co_return absl::CancelledError("member read cancelled by shutdown");
-    auto leaf = co_await LoadHashGroupPayload(
-        store, partition, db_id, key, digest, object, requests[begin].group_,
-        false, group_locked, operation.diagnostics_);
-    if (!leaf.ok()) co_return leaf.status();
-    const auto bytes = leaf->loaded_.value();
-    const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
-                                   bytes.size());
-    auto page_requests = std::span(requests).subspan(begin, end - begin);
-    if (page_requests.size() == 1) {
-      auto value = FindHashGroupField(payload, leaf->field_count_,
-                                      page_requests.front().field_);
-      if (!value.ok()) co_return value.status();
-      page_requests.front().value_ = *value;
-    } else {
-      auto status =
-          FindHashGroupFields(payload, leaf->field_count_, page_requests);
-      if (!status.ok()) co_return status;
-    }
-    for (auto& request : page_requests) {
-      if (request.value_) {
-        auto score = DecodeSortedSetMemberScore(*request.value_);
-        if (!score.ok()) co_return score.status();
-        result.scores_[request.result_index_] = *score;
+    std::array<std::pair<std::size_t, std::size_t>, kScoreReadWidth> selected;
+    // Concurrent commands already overlap their reads. Avoid multiplying
+    // every active command into eight queued children on this same owner.
+    // Recompute after each wave so newly arrived/departed commands affect
+    // optional fanout; every command always retains its serial progress path.
+    const auto width = std::max<std::size_t>(
+        1, kScoreReadWidth / store.active_zset_score_batches_);
+    std::size_t count = 0, next = begin;
+    while (next < requests.size() && count < width) {
+      // Keep large/external leaves at the serial memory floor. Small inline
+      // leaves use the existing bounded physical read buffers; no page is
+      // retained by a completed child. The request plan certified this id in
+      // the immutable routing view before any physical lookup.
+      // At width one the loader already validates the physical record;
+      // there is no optional wave whose size needs a second physical lookup.
+      bool serial = width == 1;
+      if (!serial) {
+        const auto* physical = object->FindRecord(requests[next].group_);
+        if (!physical)
+          co_return absl::DataLossError("missing member prefix page");
+        serial = physical->external() || physical->total_disk_bytes() >
+                                             kCollectionGroupTargetBytes + 4096;
       }
-      // No borrowed value survives the lease or the next asynchronous read.
-      request.value_.reset();
+      if (serial && count != 0) break;
+      auto end = next + 1;
+      while (end < requests.size() &&
+             requests[end].group_ == requests[next].group_)
+        ++end;
+      selected[count++] = {next, end};
+      next = end;
+      if (serial) break;
     }
-    begin = end;
+    const auto read = [&](std::size_t ordinal, GroupReadLimiter* limiter) {
+      const auto [first, end] = selected[ordinal];
+      return LoadSortedSetMemberScores(
+          store, partition, db_id, key, digest, object,
+          std::span(requests).subspan(first, end - first), result.scores_,
+          limiter, group_locked, operation.diagnostics_);
+    };
+    auto window_admission =
+        count > 1 ? TryReserveMemory(GroupReadWindow<std::size_t>::StorageBytes(
+                                         worker_count_, count) +
+                                     (count - 1) * 4096)
+                  : std::nullopt;
+    if (!window_admission) {
+      auto loaded = co_await read(0, nullptr);
+      if (!loaded.ok()) co_return loaded.status();
+      begin = selected[0].second;
+      continue;
+    }
+    GroupReadWindow<std::size_t> window(store.worker_, worker_count_, count);
+    absl::Status start_status;
+    for (std::size_t i = 0; i < count; ++i) {
+      if (window.size() == 1 &&
+          LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_SCORE_READ_BATCH_START_KEY",
+                              key)) {
+        start_status = MemoryLimitError("OOM Sorted Set score read batch");
+        break;
+      }
+      window.Add(read(i, window.limiter()), i);
+    }
+    co_await window.Join();
+    const auto completed = window.Collect(
+        [](std::size_t, std::size_t) { return absl::OkStatus(); });
+    // The final child queues the parent. Recheck population/status after that
+    // scheduling gap, after joining and reclaiming every started child.
+    if (shutdown_flush_requested_)
+      co_return absl::CancelledError("member read cancelled by shutdown");
+    const auto& version = object->version();
+    if (EffectiveRecordDbEpoch(partition, db_id) != version.db_epoch_ ||
+        partition.replication_epoch_ != version.replication_epoch_ ||
+        partition.grouped_generations_[db_id] != version.index_generation_)
+      co_return absl::NotFoundError("member-index population changed");
+    const auto readable = object->ReadStatus();
+    if (!readable.ok()) co_return readable;
+    if (!start_status.ok()) co_return start_status;
+    if (!completed.ok()) co_return completed;
+    begin = next;
   }
   co_return result;
 }
