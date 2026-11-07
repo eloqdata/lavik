@@ -366,9 +366,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   });
   if (exists) {
     auto value = co_await LoadValue(
-        store, partition, db_id, key, digest, location, extents,
-        read_trace.get(), nullptr,
-        read_only ? ReadSharing::kImmutable : ReadSharing::kExclusive);
+        store, partition, db_id, key, digest, location, extents, nullptr,
+        read_only ? ReadSharing::kImmutable : ReadSharing::kExclusive,
+        read_trace.get());
     if (!value.ok()) {
       if (!read_epoch_changed()) co_return value.status();
     } else {

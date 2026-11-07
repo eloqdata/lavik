@@ -658,7 +658,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     lookup_scope.End();
     auto loaded = co_await LoadValue(
         store, partition, db_id, key, digest, MaterializeIndexLocation(*found),
-        ExtentsFor(store, found), trace, nullptr, ReadSharing::kImmutable);
+        ExtentsFor(store, found), nullptr, ReadSharing::kImmutable, trace);
     if (optimistic_read && !loaded.ok() &&
         (loaded.status().code() == absl::StatusCode::kNotFound ||
          loaded.status().code() == absl::StatusCode::kAborted)) {
@@ -1135,7 +1135,8 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
   lookup_scope.End();
 
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                   location, extents, detail.get());
+                                   location, extents, nullptr,
+                                   ReadSharing::kExclusive, detail.get());
   if (!loaded.ok()) co_return loaded.status();
   if (store.index_generations_[db_id] != index_generation ||
       DbEpoch(db_id) != db_epoch ||
@@ -1304,11 +1305,14 @@ absl::StatusOr<DiskValue> CompactReadValue::IntoDiskValue() && {
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadValueSlow(
-    WorkerStore& key_store, WorkerStore::PartitionStore& partition,
-    std::uint8_t db_id, std::string_view key, Digest digest,
-    RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
-    std::optional<absl::Status> failure, ReadSharing sharing) {
+StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
+                                   WorkerStore::PartitionStore& partition,
+                                   std::uint8_t db_id, std::string_view key,
+                                   Digest digest, RecordLocation location,
+                                   ExtentManifest extents,
+                                   std::optional<absl::Status> failure,
+                                   ReadSharing sharing,
+                                   ReadLatencyTrace* trace) {
   assert(!location.grouped());
   // The caller already resolved the key's partition for the index lookup.
   // Reuse it across retries instead of recomputing the Redis slot.
@@ -1334,12 +1338,12 @@ StorageEngine::Impl::LoadValueSlow(
       loaded = std::move(*failure);
       failure.reset();
     } else if (location.external()) {
-      loaded = co_await LoadExternalValueLocal(key_store, location,
-                                               std::move(extents), trace);
+      loaded = co_await LoadExternalValueLocal(
+          key_store, location, std::move(extents), false, trace);
     } else if (location.block_owner() == key_store.worker_->id()) {
       loaded =
           co_await LoadValueLocal(key_store, db_id, key, location,
-                                  replication_epoch, trace, db_epoch, sharing);
+                                  replication_epoch, db_epoch, sharing, trace);
     } else {
       const unsigned owner = location.block_owner();
       std::string owned_key(key);
@@ -1350,7 +1354,7 @@ StorageEngine::Impl::LoadValueSlow(
            trace]() mutable -> Task<absl::StatusOr<LoadedValue>> {
             co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
                                               location, replication_epoch,
-                                              trace, db_epoch, sharing);
+                                              db_epoch, sharing, trace);
           });
     }
     // Replica reset is partition-wide and does not take each key lock. Reject
@@ -1790,8 +1794,8 @@ Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
 StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                                             const RecordLocation& location,
                                             ExtentManifest extents,
-                                            ReadLatencyTrace* trace,
-                                            bool grouped_payload) {
+                                            bool grouped_payload,
+                                            ReadLatencyTrace* trace) {
   if (!location.external() || extents == nullptr) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value has no valid extent manifest");
@@ -1875,28 +1879,30 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
 StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
-    GroupedObject::Handle grouped_snapshot, ReadSharing sharing) {
+    RecordLocation location, ExtentManifest extents,
+    GroupedObject::Handle grouped_snapshot, ReadSharing sharing,
+    ReadLatencyTrace* trace) {
   return LoadValueAwaitable(*this, store, partition, db_id, key, digest,
-                            location, std::move(extents), trace,
-                            std::move(grouped_snapshot), sharing);
+                            location, std::move(extents),
+                            std::move(grouped_snapshot), sharing, trace);
 }
 
 StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValueLocal(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
-    ReadSharing sharing) {
+    std::optional<std::uint64_t> expected_db_epoch, ReadSharing sharing,
+    ReadLatencyTrace* trace) {
   return LoadValueAwaitable(*this, store, db_id, key, location,
-                            replication_epoch, trace, expected_db_epoch,
-                            sharing);
+                            replication_epoch, expected_db_epoch, sharing,
+                            trace);
 }
 
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
-    GroupedObject::Handle grouped_snapshot, ReadSharing sharing)
+    RecordLocation location, ExtentManifest extents,
+    GroupedObject::Handle grouped_snapshot, ReadSharing sharing,
+    ReadLatencyTrace* trace)
     : engine_(engine),
       store_(store),
       // Grouped snapshots have their own population/pin protocol.
@@ -1920,7 +1926,7 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
              location.block_owner() != store.worker_->id()) {
     slow_ =
         engine.LoadValueSlow(store, partition, db_id, key, digest, location,
-                             std::move(extents), trace, std::nullopt, sharing);
+                             std::move(extents), std::nullopt, sharing, trace);
   } else {
     PrepareLocal();
     if (ready_ && absl::IsAborted(ready_->status())) Retry(ready_->status());
@@ -1930,8 +1936,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
-    ReadSharing sharing)
+    std::optional<std::uint64_t> expected_db_epoch, ReadSharing sharing,
+    ReadLatencyTrace* trace)
     : engine_(engine),
       store_(store),
       key_(key),
@@ -2155,8 +2161,8 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
       Unpin();
       lease_.Reset();
       co_return co_await engine_.LoadValueSlow(
-          store_, *partition_, db_id_, key_, digest_, location_, {}, trace_,
-          parsed.status(), sharing_);
+          store_, *partition_, db_id_, key_, digest_, location_, {},
+          parsed.status(), sharing_, trace_);
     }
     co_return parsed.status();
   }
@@ -2179,8 +2185,8 @@ void StorageEngine::Impl::LoadValueAwaitable::Retry(absl::Status failure) {
   // resolves the index before any further I/O and preserves corruption errors
   // when the index still endorses the failed physical record.
   slow_ = engine_.LoadValueSlow(store_, *partition_, db_id_, key_, digest_,
-                                location_, {}, trace_, std::move(failure),
-                                sharing_);
+                                location_, {}, std::move(failure), sharing_,
+                                trace_);
 }
 
 void StorageEngine::Impl::LoadValueAwaitable::FinishBufferWait() {

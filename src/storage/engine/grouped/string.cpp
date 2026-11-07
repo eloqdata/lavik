@@ -260,8 +260,9 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
     std::optional<LoadedValue> loaded;
     std::string_view before;
     if (exists) {
-      auto value = co_await LoadValue(store, partition, db_id, key, digest,
-                                      location, extents, read_detail.get());
+      auto value = co_await LoadValue(
+          store, partition, db_id, key, digest, location, extents, nullptr,
+          ReadSharing::kExclusive, read_detail.get());
       if (!value.ok()) co_return value.status();
       loaded.emplace(std::move(*value));
       if (!read_only) {

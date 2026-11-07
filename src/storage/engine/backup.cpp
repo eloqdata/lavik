@@ -737,7 +737,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
   }
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                    physical.location_, physical.extents_,
-                                   nullptr, physical.grouped_);
+                                   physical.grouped_);
   if (!loaded.ok()) {
     store.rdb_snapshot_->invalidated_ = true;
     (void)co_await ReleaseRdbSnapshotValue(&saved->value_);

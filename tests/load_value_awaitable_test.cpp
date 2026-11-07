@@ -131,14 +131,14 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   auto ReadShared(std::string_view key = {}) {
     // Logical and physical forms use the same submitter-local registry.
     return storage_.impl_->LoadValueLocal(
-        Store(), 0, key.empty() ? std::string_view(key_) : key, location_, 1,
-        nullptr, 1, StorageEngine::Impl::ReadSharing::kImmutable);
+        Store(), 0, key.empty() ? std::string_view(key_) : key, location_, 1, 1,
+        StorageEngine::Impl::ReadSharing::kImmutable);
   }
   Task<Result> ReadSharedTask(bool logical = true, std::string_view key = {}) {
     if (!logical) co_return co_await ReadShared(key);
     co_return co_await storage_.impl_->LoadValue(
         Store(), Store().partitions_[0], 0, key_, digest_, location_, {},
-        nullptr, nullptr, StorageEngine::Impl::ReadSharing::kImmutable);
+        nullptr, StorageEngine::Impl::ReadSharing::kImmutable);
   }
   ReadFlightRegistry& Flights() { return *Store().read_flights_; }
   bool HasFlights() { return Store().read_flights_ != nullptr; }
@@ -154,7 +154,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     auto manifest = std::make_shared<const std::vector<ExtentRef>>(
         std::vector<ExtentRef>{ExtentReference()});
     co_return co_await storage_.impl_->LoadExternalValueLocal(
-        Store(), location, std::move(manifest), nullptr, true);
+        Store(), location, std::move(manifest), true);
   }
   auto ReadGrouped(bool pinned = false) {
     return storage_.impl_->LoadGroupedValue(

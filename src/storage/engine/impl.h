@@ -3792,8 +3792,10 @@ class StorageEngine::Impl {
   void ReleaseFlushedStagingBuffer(WorkerStore& store, BlockState& state,
                                    std::uint64_t block_id);
 
-  // Sharing is an explicit immutable-consumer contract. Maintenance and
-  // mutation preparation retain exclusive DMA/assembly ownership by default.
+  // Opt-in for consumers that can retain immutable results. kImmutable permits
+  // coalescing; no followers or failed admission still yields an exclusive
+  // buffer. Maintenance and mutation preparation keep exclusive ownership by
+  // default, so adding a read caller does not silently enable sharing for it.
   enum class ReadSharing { kExclusive, kImmutable };
   ReadFlightRegistry* ReadFlights(WorkerStore& store);
 
@@ -3834,14 +3836,14 @@ class StorageEngine::Impl {
                        WorkerStore::PartitionStore& partition,
                        std::uint8_t db_id, std::string_view key,
                        const Digest& digest, RecordLocation location,
-                       ExtentManifest extents, ReadLatencyTrace* trace,
+                       ExtentManifest extents,
                        GroupedObject::Handle grouped_snapshot,
-                       ReadSharing sharing);
+                       ReadSharing sharing, ReadLatencyTrace* trace);
     LoadValueAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
                        std::string_view key, RecordLocation location,
-                       std::uint64_t replication_epoch, ReadLatencyTrace* trace,
+                       std::uint64_t replication_epoch,
                        std::optional<std::uint64_t> expected_db_epoch,
-                       ReadSharing sharing);
+                       ReadSharing sharing, ReadLatencyTrace* trace);
     ~LoadValueAwaitable();
 
     bool await_ready() const noexcept {
@@ -4358,18 +4360,19 @@ class StorageEngine::Impl {
                                std::uint8_t db_id, std::string_view key,
                                const Digest& digest, RecordLocation location,
                                ExtentManifest extents,
-                               ReadLatencyTrace* trace = nullptr,
                                GroupedObject::Handle grouped_snapshot = nullptr,
-                               ReadSharing sharing = ReadSharing::kExclusive);
+                               ReadSharing sharing = ReadSharing::kExclusive,
+                               ReadLatencyTrace* trace = nullptr);
 
   // Used only for multi-step reads or an aborted direct read. A supplied
   // failure enters relocation resolution without reading the stale bytes again.
   Task<absl::StatusOr<LoadedValue>> LoadValueSlow(
       WorkerStore& key_store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, Digest digest,
-      RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
+      RecordLocation location, ExtentManifest extents,
       std::optional<absl::Status> failure = std::nullopt,
-      ReadSharing sharing = ReadSharing::kExclusive);
+      ReadSharing sharing = ReadSharing::kExclusive,
+      ReadLatencyTrace* trace = nullptr);
 
   // The synchronous decoder must consume its checked payload before the
   // lease and optional owner permit are released, or move the owning lease
@@ -4435,15 +4438,15 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
-      ExtentManifest extents, ReadLatencyTrace* trace,
-      bool grouped_payload = false);
+      ExtentManifest extents, bool grouped_payload = false,
+      ReadLatencyTrace* trace = nullptr);
 
   LoadValueAwaitable LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
-      ReadLatencyTrace* trace = nullptr,
       std::optional<std::uint64_t> expected_db_epoch = std::nullopt,
-      ReadSharing sharing = ReadSharing::kExclusive);
+      ReadSharing sharing = ReadSharing::kExclusive,
+      ReadLatencyTrace* trace = nullptr);
 
   std::uint64_t ForegroundBlocksForDevice(
       std::size_t device_index) const noexcept {
