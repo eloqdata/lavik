@@ -45,6 +45,7 @@
 #include "gtest/gtest.h"
 #include "lavik/command_table.h"
 #include "lavik/rdb.h"
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/format.h"
 #include "support/storage_memory.h"
 #include "support/test_data_path.h"
@@ -2992,21 +2993,25 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
   GTEST_SKIP() << "requires Debug or the explicitly test-instrumented module";
 #else
   const std::string value(1024 * 1024, 'g');
-  const std::string filler_value(16 * 1024 - 1, 'f');
+  const std::string filler_value(lavik::storage::kCollectionPromotionBytes - 1,
+                                 'f');
   std::vector<std::string> fillers;
-  // Fill ordinary record blocks with compact Strings; values at 16 KiB
-  // would promote and move their payloads into transaction blocks. Use more
-  // filler payload than the 9 MiB Hash so deletion leaves a source below the
-  // 50% live threshold even if TxCleaner promoted Hash pages into these blocks.
-  for (unsigned i = 0; i < 600; ++i)
+  // Keep filler Strings compact so they occupy ordinary record blocks. Scale
+  // their count with promotion size: one extra field's worth of payload over
+  // the Hash leaves a source below the 50% live threshold after deletion even
+  // if TxCleaner promoted Hash pages into these blocks.
+  const std::size_t filler_bytes = (fields_.size() + 1) * value.size();
+  const std::size_t filler_count =
+      (filler_bytes + filler_value.size() - 1) / filler_value.size();
+  for (std::size_t i = 0; i < filler_count; ++i)
     fillers.push_back(std::string("{large-hash-gc}:filler-") +
                       std::to_string(i));
   {
     ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2);
     RespClient client(port_);
     ASSERT_EQ(client.Command(WriteCommand(value)), ":10");
-    // Same hash slot puts the root beside filler payloads. Group children
-    // belong to transaction blocks and are relocated by the tx cleaner.
+    // The shared hash slot keeps fillers on the Hash owner's ordinary stream;
+    // TxCleaner can relocate Hash records into those same blocks.
     for (const auto& key : fillers)
       ASSERT_EQ(client.Command({"SET", key, filler_value}), "+OK");
     ASSERT_TRUE(WaitForDurability(client));
