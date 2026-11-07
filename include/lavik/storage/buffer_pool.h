@@ -80,9 +80,31 @@ class ReadBufferLease {
   ReadBufferLease() = default;
   ReadBufferLease(const ReadBufferLease&) = delete;
   ReadBufferLease& operator=(const ReadBufferLease&) = delete;
-  ReadBufferLease(ReadBufferLease&& other) noexcept;
-  ReadBufferLease& operator=(ReadBufferLease&& other) noexcept;
-  ~ReadBufferLease();
+  // Make empty moved-from carriers disappear along the asynchronous read
+  // chain; only an owning carrier needs the out-of-line return protocol.
+  [[gnu::always_inline]] ReadBufferLease(ReadBufferLease&& other) noexcept
+      : pool_(std::exchange(other.pool_, nullptr)),
+        data_(std::exchange(other.data_, nullptr)),
+        size_(other.size_),
+        headroom_bytes_(other.headroom_bytes_),
+        tailroom_bytes_(other.tailroom_bytes_),
+        release_token_(std::exchange(other.release_token_, 0)) {}
+  [[gnu::always_inline]] ReadBufferLease& operator=(
+      ReadBufferLease&& other) noexcept {
+    if (this != &other) {
+      if (pool_) Reset();
+      pool_ = std::exchange(other.pool_, nullptr);
+      data_ = std::exchange(other.data_, nullptr);
+      size_ = other.size_;
+      headroom_bytes_ = other.headroom_bytes_;
+      tailroom_bytes_ = other.tailroom_bytes_;
+      release_token_ = std::exchange(other.release_token_, 0);
+    }
+    return *this;
+  }
+  [[gnu::always_inline]] ~ReadBufferLease() {
+    if (pool_) Reset();
+  }
 
   bool valid() const noexcept { return data_ != nullptr; }
   // True only when the complete lease fits one registered region. A range

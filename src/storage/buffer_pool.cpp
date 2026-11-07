@@ -65,29 +65,6 @@ ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
   assert(release_token != 0);
 }
 
-ReadBufferLease::ReadBufferLease(ReadBufferLease&& other) noexcept
-    : pool_(std::exchange(other.pool_, nullptr)),
-      data_(std::exchange(other.data_, nullptr)),
-      size_(other.size_),
-      headroom_bytes_(other.headroom_bytes_),
-      tailroom_bytes_(other.tailroom_bytes_),
-      release_token_(std::exchange(other.release_token_, 0)) {}
-
-ReadBufferLease& ReadBufferLease::operator=(ReadBufferLease&& other) noexcept {
-  if (this != &other) {
-    Reset();
-    pool_ = std::exchange(other.pool_, nullptr);
-    data_ = std::exchange(other.data_, nullptr);
-    size_ = other.size_;
-    headroom_bytes_ = other.headroom_bytes_;
-    tailroom_bytes_ = other.tailroom_bytes_;
-    release_token_ = std::exchange(other.release_token_, 0);
-  }
-  return *this;
-}
-
-ReadBufferLease::~ReadBufferLease() { Reset(); }
-
 void ReadBufferLease::Reset() noexcept {
   if (pool_ != nullptr) {
     RegisteredBufferPool* pool = std::exchange(pool_, nullptr);
