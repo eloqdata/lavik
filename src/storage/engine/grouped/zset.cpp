@@ -1839,6 +1839,32 @@ StorageEngine::Impl::TryConcurrentSortedSetBatch(
   Members members;
   auto status = PrepareMembers(operation, &members);
   if (!status.ok()) co_return status;
+  // An unconditional batch wholly beyond one end of the ordered graph
+  // sends every distinct operand to the same endpoint. If the scores alone
+  // exceed a page, the fixed-topology attempt cannot succeed: avoid reading
+  // all member leaves before discovering that and retrying under key X.
+  // Use the deduplicated map, strict bounds, and no conditional/increment
+  // flags. The ordinary exclusive planner still validates and applies the
+  // full operation against its newly acquired view; this is only a hint.
+  if (operation.kind_ == SortedSetOperationKind::kAdd && !operation.nx_ &&
+      !operation.xx_ && !operation.gt_ && !operation.lt_ &&
+      !operation.increment_ && !operation.reject_existing_ &&
+      members.size() > kCollectionGroupTargetBytes / sizeof(double)) {
+    const auto& pages = object->ordered_directory().groups();
+    if (!pages.empty()) {
+      bool above = true, below = true;
+      for (const auto& entry : operation.entries_) {
+        above = above && entry.score_ > pages.back().max_score_;
+        below = below && entry.score_ < pages.front().min_score_;
+        if (!above && !below) break;
+      }
+      if (above || below) co_return std::nullopt;
+    }
+  }
+  LAVIK_FAULT_INJECT(
+      if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_CONCURRENT_BATCH_PROBE_KEY",
+                              key)) co_return absl::
+          UnavailableError("injected concurrent batch member probe failure"););
   // In addition to the input map, admit the member/ordered lock plans and
   // semantic deltas. Each member contributes at most two pages and four
   // neighbours; no payload-sized cache is retained while reading leaves.
