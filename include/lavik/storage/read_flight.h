@@ -72,6 +72,9 @@ struct ReadFlightStats {
 // All access is confined to the actual submitting worker. An accepted producer
 // owns its pin, mutable DMA lease and stable completion tag independently of
 // every waiter. Completed results are never kept in this index.
+// A stop request alone does not close admission. The runtime drains I/O and
+// destroys all request frames before finalization; TryJoin and Start must not
+// be called after that barrier.
 class ReadFlightRegistry {
  public:
   using ReleasePin = void (*)(void*, std::uint64_t, unsigned, bool) noexcept;

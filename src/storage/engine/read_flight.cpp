@@ -126,7 +126,7 @@ bool ReadFlightRegistry::Join(ReadFlight& flight, ReadFlightWaiter& waiter) {
 
 bool ReadFlightRegistry::TryJoin(const ReadFlightKey& key, std::size_t hash,
                                  ReadFlightWaiter& waiter) {
-  if (finalized_ || worker_.stop_requested()) return false;
+  assert(!finalized_);
   const auto found = map_.find(Lookup{key, hash});
   if (found != map_.end()) {
     waiter.known_missing_ = false;
@@ -140,7 +140,7 @@ bool ReadFlightRegistry::TryJoin(const ReadFlightKey& key, std::size_t hash,
 ReadFlightRegistry::Admission ReadFlightRegistry::Start(
     const ReadFlightKey& key, std::size_t hash, ReadBufferLease& lease,
     bool& owns_pin, ReadFlightWaiter& waiter) {
-  if (finalized_ || worker_.stop_requested()) return {Outcome::kBypass};
+  assert(!finalized_);
   // A miss remains valid while no producer has been inserted. Completions
   // only erase entries. This avoids a redundant lookup for immediate awaiting,
   // while retained requests recheck after any intervening publication. Never

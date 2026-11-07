@@ -357,6 +357,80 @@ TEST_F(ReadFlightTest, CancellationUnlinksMiddleHeadAndProducerIndependently) {
   EXPECT_EQ(pins_.normal, 1);
 }
 
+TEST_F(ReadFlightTest, StopRequestAllowsJoiningUntilCompletion) {
+  auto registry = Registry();
+  ASSERT_TRUE(registry);
+  const auto capacity = pool_.available_read_bytes();
+  Waiter leader, follower, delayed;
+  auto buffer = Buffer();
+  bool pin = true;
+  auto producer = registry->Start({}, 42, buffer, pin, leader);
+  ASSERT_EQ(producer.outcome, ReadFlightRegistry::Outcome::kStarted);
+  ASSERT_NE(producer.tag, nullptr);
+
+  worker_.RequestStop();
+  ASSERT_TRUE(registry->TryJoin({}, 42, follower));
+  auto redundant = Buffer();
+  bool redundant_pin = true;
+  auto joined = registry->Start({}, 42, redundant, redundant_pin, delayed);
+  ASSERT_EQ(joined.outcome, ReadFlightRegistry::Outcome::kJoined);
+  EXPECT_TRUE(redundant.valid());
+  EXPECT_TRUE(redundant_pin);
+  redundant.Reset();
+  producer.tag->Complete(worker_, 4096, 0);
+  EXPECT_EQ(registry->size(), 0);
+  EXPECT_EQ(pins_.normal, 1);
+  for (auto* waiter : {&leader, &follower, &delayed}) {
+    EXPECT_EQ(waiter->calls, 1);
+    EXPECT_TRUE(waiter->buffer.shared());
+    waiter->buffer.Reset();
+  }
+  // Returns during stop retain the shared allocation until the runtime has
+  // quiesced I/O and reclaimed all frames; they do not wake arena waiters.
+  EXPECT_GT(pool_.shared_read_bytes(), 0);
+  worker_.Shutdown();
+  registry->FinalizeQuiesced();
+  pool_.FinalizeReadSharing();
+  EXPECT_EQ(pool_.shared_read_bytes(), 0);
+  EXPECT_EQ(pool_.available_read_bytes(), capacity);
+}
+
+TEST_F(ReadFlightTest, StopRequestBeforeSubmissionAllowsQuiescedReclamation) {
+  auto registry = Registry();
+  ASSERT_TRUE(registry);
+  const auto capacity = pool_.available_read_bytes();
+  auto leader = std::make_unique<Waiter>();
+  auto follower = std::make_unique<Waiter>();
+  auto buffer = Buffer();
+  bool pin = true;
+  worker_.RequestStop();
+  EXPECT_FALSE(registry->TryJoin({}, 42, *leader));
+  auto producer = registry->Start({}, 42, buffer, pin, *leader);
+  ASSERT_EQ(producer.outcome, ReadFlightRegistry::Outcome::kStarted);
+  ASSERT_NE(producer.tag, nullptr);
+  EXPECT_FALSE(buffer.valid());
+  EXPECT_FALSE(pin);
+  ASSERT_TRUE(registry->TryJoin({}, 42, *follower));
+
+  // Model a completion suppressed by shutdown: backend quiescence and frame
+  // destruction precede finalization, which releases the producer once.
+  worker_.Shutdown();
+  leader.reset();
+  follower.reset();
+  EXPECT_EQ(registry->stats().cancellations, 2);
+  EXPECT_EQ(registry->size(), 1);
+  EXPECT_LT(pool_.available_read_bytes(), capacity);
+  registry->FinalizeQuiesced();
+  EXPECT_EQ(registry->size(), 0);
+  EXPECT_EQ(pins_.normal, 0);
+  EXPECT_EQ(pins_.quiesced, 1);
+  EXPECT_EQ(pool_.available_read_bytes(), capacity);
+  registry->FinalizeQuiesced();
+  registry.reset();
+  EXPECT_EQ(pins_.quiesced, 1);
+  EXPECT_EQ(pool_.available_read_bytes(), capacity);
+}
+
 TEST_F(ReadFlightTest, InsertionCounterWrapRechecksDelayedMisses) {
   auto registry = Registry();
   ASSERT_TRUE(registry);
