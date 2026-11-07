@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 EloqData Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared remote GETs under socket backpressure, disconnect, and recovery."""
+"""Shared GETs under socket backpressure, disconnect, and recovery."""
 
+import argparse
 import asyncio
 import json
 from pathlib import Path
 import socket
 import struct
-import sys
 import tempfile
 
 import defrag_payload_e2e as support
@@ -120,15 +120,19 @@ async def wait_retired(client):
 
 
 def main():
-    support.BINARY = str(Path(sys.argv[1]).resolve())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("binary")
+    parser.add_argument("--workers", type=int, default=2)
+    args = parser.parse_args()
+    support.BINARY = str(Path(args.binary).resolve())
     with tempfile.TemporaryDirectory(prefix="lavik-read-flight-e2e-") as directory:
         support.WORKDIR = Path(directory)
         with (support.WORKDIR / "data").open("wb") as f:
             f.truncate(512 * 1024 * 1024)
-        with support.server(2) as (admin, _):
+        with support.server(args.workers) as (admin, _):
             assert admin.batch([[b"SET", KEY, VALUE]]) == [b"OK"]
             drain(admin)
-        with support.server(2) as (admin, _):
+        with support.server(args.workers) as (admin, _):
             for resume in (True, False):
                 asyncio.run(traffic(admin.socket.getpeername()[1], admin, resume))
                 result = asyncio.run(wait_retired(admin))
@@ -146,7 +150,7 @@ def main():
                     }
                 )
             )
-        with support.server(2) as (admin, _):
+        with support.server(args.workers) as (admin, _):
             assert admin.batch([[b"GET", KEY]]) == [VALUE]
     print("read-flight backpressure/disconnect/recovery passed")
 

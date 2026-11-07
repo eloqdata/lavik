@@ -148,12 +148,12 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
     // to another child. Queued reads reacquire it for every relocation retry.
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
-      loaded = co_await LoadExternalValueLocal(store, location, extents,
-                                               detail.get(), true);
+      loaded = co_await LoadExternalValueLocal(store, location, extents, true,
+                                               detail.get());
     } else if (location.block_owner() == store.worker_->id()) {
-      loaded = co_await LoadValueLocal(store, db_id, key, location,
-                                       original.replication_epoch_,
-                                       detail.get(), original.db_epoch_);
+      loaded = co_await LoadValueLocal(
+          store, db_id, key, location, original.replication_epoch_,
+          original.db_epoch_, /*coalesce=*/false, detail.get());
     } else {
       const unsigned owner = location.block_owner();
       // Batched readers join before releasing their caller's key. Borrow it
@@ -178,8 +178,8 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
            db_epoch =
                original.db_epoch_]() -> Task<absl::StatusOr<LoadedValue>> {
             co_return co_await LoadValueLocal(*stores_[owner], db_id, read_key,
-                                              location, epoch, detail,
-                                              db_epoch);
+                                              location, epoch, db_epoch,
+                                              /*coalesce=*/false, detail);
           });
     }
     if (EffectiveRecordDbEpoch(partition, db_id) != original.db_epoch_ ||

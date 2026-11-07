@@ -1418,7 +1418,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     }
   } else if (exists && !replace) {
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     location, extents, read_trace.get());
+                                     location, extents, nullptr,
+                                     /*coalesce=*/false, read_trace.get());
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();

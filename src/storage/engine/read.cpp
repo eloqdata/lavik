@@ -346,28 +346,7 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
 
   ReadFlightRegistry* registry = nullptr;
   if (result.read_bytes_ <= local.buffers_.preferred_read_payload_bytes()) {
-    if (!local.read_flights_attempted_) [[unlikely]] {
-      local.read_flights_attempted_ = true;
-      local.read_flights_ = ReadFlightRegistry::TryCreate(
-          *local.worker_, local.buffers_, this,
-          [](void* context, std::uint64_t block_id, unsigned owner,
-             bool quiesced) noexcept {
-            auto& engine = *static_cast<Impl*>(context);
-            auto& block = engine.BlockStateAt(block_id);
-            if (quiesced) {
-              // Worker stores can already be gone at the all-worker cleanup
-              // barrier. The block directory survives until the engine dies;
-              // no maintenance notification or waiter wakeup is legal here.
-              const auto old =
-                  block.pins_.fetch_sub(1, std::memory_order_release);
-              assert((old & BlockState::kPinMask) != 0);
-              (void)old;
-            } else {
-              engine.UnpinRemoteBlock(block, owner, block_id);
-            }
-          });
-    }
-    registry = local.read_flights_.get();
+    registry = ReadFlights(local);
   }
   result.io_.emplace(result, *local.worker_, local.files_[file_id],
                      aligned_offset, registry);
@@ -394,6 +373,32 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
                                 result.trace_->buffer_acquired_ns_);
   }
   result.io_->SetBuffer();
+}
+
+ReadFlightRegistry* StorageEngine::Impl::ReadFlights(WorkerStore& store) {
+  if (!store.read_flights_attempted_) [[unlikely]] {
+    store.read_flights_attempted_ = true;
+    store.read_flights_ = ReadFlightRegistry::TryCreate(
+        *store.worker_, store.buffers_, this,
+        [](void* context, std::uint64_t block_id, unsigned owner,
+           bool quiesced) noexcept {
+          auto& engine = *static_cast<Impl*>(context);
+          auto& block = engine.BlockStateAt(block_id);
+          if (quiesced) {
+            // Stores may already be gone after the all-worker barrier. The
+            // directory survives; no maintenance wakeup is legal here.
+            const auto old =
+                block.pins_.fetch_sub(1, std::memory_order_release);
+            assert((old & BlockState::kPinMask) != 0);
+            (void)old;
+          } else if (bycorf::ThisWorker().id_ == owner) {
+            engine.UnpinBlock(*engine.stores_[owner], block, block_id);
+          } else {
+            engine.UnpinRemoteBlock(block, owner, block_id);
+          }
+        });
+  }
+  return store.read_flights_.get();
 }
 
 StorageEngine::RemoteReadAwaitable::TracedReadIo::TracedReadIo(
@@ -651,9 +656,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     }
 
     lookup_scope.End();
-    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     MaterializeIndexLocation(*found),
-                                     ExtentsFor(store, found), trace);
+    auto loaded = co_await LoadValue(
+        store, partition, db_id, key, digest, MaterializeIndexLocation(*found),
+        ExtentsFor(store, found), nullptr, /*coalesce=*/true, trace);
     if (optimistic_read && !loaded.ok() &&
         (loaded.status().code() == absl::StatusCode::kNotFound ||
          loaded.status().code() == absl::StatusCode::kAborted)) {
@@ -1129,8 +1134,9 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
   unlock.Unlock();
   lookup_scope.End();
 
-  auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                   location, extents, detail.get());
+  auto loaded =
+      co_await LoadValue(store, partition, db_id, key, digest, location,
+                         extents, nullptr, /*coalesce=*/false, detail.get());
   if (!loaded.ok()) co_return loaded.status();
   if (store.index_generations_[db_id] != index_generation ||
       DbEpoch(db_id) != db_epoch ||
@@ -1219,7 +1225,7 @@ std::size_t StorageEngine::Impl::DirectGetValueLimit() const noexcept {
 
 absl::Status StorageEngine::Impl::LoadedValue::MakeOwned(
     RegisteredBufferPool& pool) {
-  if (lease_.buffer_id() == 0) return absl::OkStatus();
+  if (!lease_.retains_read_arena()) return absl::OkStatus();
   auto output = pool.AllocateReadOutputBuffer(value_bytes_);
   if (!output.ok()) return output.status();
   const auto source = value();
@@ -1304,8 +1310,8 @@ StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
                                    std::uint8_t db_id, std::string_view key,
                                    Digest digest, RecordLocation location,
                                    ExtentManifest extents,
-                                   ReadLatencyTrace* trace,
-                                   std::optional<absl::Status> failure) {
+                                   std::optional<absl::Status> failure,
+                                   bool coalesce, ReadLatencyTrace* trace) {
   assert(!location.grouped());
   // The caller already resolved the key's partition for the index lookup.
   // Reuse it across retries instead of recomputing the Redis slot.
@@ -1331,22 +1337,23 @@ StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
       loaded = std::move(*failure);
       failure.reset();
     } else if (location.external()) {
-      loaded = co_await LoadExternalValueLocal(key_store, location,
-                                               std::move(extents), trace);
+      loaded = co_await LoadExternalValueLocal(
+          key_store, location, std::move(extents), false, trace);
     } else if (location.block_owner() == key_store.worker_->id()) {
-      loaded = co_await LoadValueLocal(key_store, db_id, key, location,
-                                       replication_epoch, trace, db_epoch);
+      loaded =
+          co_await LoadValueLocal(key_store, db_id, key, location,
+                                  replication_epoch, db_epoch, coalesce, trace);
     } else {
       const unsigned owner = location.block_owner();
       std::string owned_key(key);
       loaded = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, db_id, key = std::move(owned_key), location,
-           replication_epoch, db_epoch,
+           replication_epoch, db_epoch, coalesce,
            trace]() mutable -> Task<absl::StatusOr<LoadedValue>> {
             co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
                                               location, replication_epoch,
-                                              trace, db_epoch);
+                                              db_epoch, coalesce, trace);
           });
     }
     // Replica reset is partition-wide and does not take each key lock. Reject
@@ -1786,8 +1793,8 @@ Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
 StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                                             const RecordLocation& location,
                                             ExtentManifest extents,
-                                            ReadLatencyTrace* trace,
-                                            bool grouped_payload) {
+                                            bool grouped_payload,
+                                            ReadLatencyTrace* trace) {
   if (!location.external() || extents == nullptr) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value has no valid extent manifest");
@@ -1871,26 +1878,30 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
 StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
-    GroupedObject::Handle grouped_snapshot) {
+    RecordLocation location, ExtentManifest extents,
+    GroupedObject::Handle grouped_snapshot, bool coalesce,
+    ReadLatencyTrace* trace) {
   return LoadValueAwaitable(*this, store, partition, db_id, key, digest,
-                            location, std::move(extents), trace,
-                            std::move(grouped_snapshot));
+                            location, std::move(extents),
+                            std::move(grouped_snapshot), coalesce, trace);
 }
 
 StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValueLocal(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch) {
+    std::optional<std::uint64_t> expected_db_epoch, bool coalesce,
+    ReadLatencyTrace* trace) {
   return LoadValueAwaitable(*this, store, db_id, key, location,
-                            replication_epoch, trace, expected_db_epoch);
+                            replication_epoch, expected_db_epoch, coalesce,
+                            trace);
 }
 
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
-    GroupedObject::Handle grouped_snapshot)
+    RecordLocation location, ExtentManifest extents,
+    GroupedObject::Handle grouped_snapshot, bool coalesce,
+    ReadLatencyTrace* trace)
     : engine_(engine),
       store_(store),
       // Grouped snapshots have their own population/pin protocol.
@@ -1901,7 +1912,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
       trace_(trace),
       replication_epoch_(partition.replication_epoch_),
       expected_db_epoch_(engine.EffectiveRecordDbEpoch(partition, db_id)),
-      db_id_(db_id) {
+      db_id_(db_id),
+      coalesce_(coalesce) {
   if (location.grouped()) {
     // The grouped task owns its graph/version protocol. Keep its borrowed
     // digest in this awaitable, not in the constructor's argument lifetime.
@@ -1911,8 +1923,9 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
                                 GroupedValueEncoding::kLogicalStream, trace);
   } else if (location.external() ||
              location.block_owner() != store.worker_->id()) {
-    slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest, location,
-                                 std::move(extents), trace);
+    slow_ =
+        engine.LoadValueSlow(store, partition, db_id, key, digest, location,
+                             std::move(extents), std::nullopt, coalesce, trace);
   } else {
     PrepareLocal();
     if (ready_ && absl::IsAborted(ready_->status())) Retry(ready_->status());
@@ -1922,7 +1935,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch)
+    std::optional<std::uint64_t> expected_db_epoch, bool coalesce,
+    ReadLatencyTrace* trace)
     : engine_(engine),
       store_(store),
       key_(key),
@@ -1930,7 +1944,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
       trace_(trace),
       replication_epoch_(replication_epoch),
       expected_db_epoch_(expected_db_epoch),
-      db_id_(db_id) {
+      db_id_(db_id),
+      coalesce_(coalesce) {
   PrepareLocal();
 }
 
@@ -1940,6 +1955,34 @@ void StorageEngine::Impl::LoadValueAwaitable::Unpin() {
   auto* state = std::exchange(pinned_, nullptr);
   if (!state) return;
   engine_.UnpinBlock(store_, *state, location_.block_id());
+}
+
+ReadFlightKey StorageEngine::Impl::LoadValueAwaitable::FlightKey() const {
+  return {.engine = reinterpret_cast<std::uintptr_t>(&engine_),
+          .block = location_.block_id(),
+          .allocation_epoch = location_.allocation_epoch(),
+          .mutation_sequence = location_.mutation_sequence_,
+          .aligned_offset = aligned_offset_,
+          .read_bytes = read_bytes_,
+          .db_epoch = expected_db_epoch_.value_or(engine_.DbEpoch(db_id_)),
+          .replication_epoch = replication_epoch_,
+          .population_generation = population_generation_,
+          .file = store_.files_[file_id_].index_,
+          .record_offset = location_.record_offset(),
+          .record_bytes = location_.total_disk_bytes(),
+          .block_owner = static_cast<std::uint16_t>(location_.block_owner()),
+          .db = db_id_};
+}
+
+void StorageEngine::Impl::LoadValueAwaitable::Joined() {
+  // The independent producer retains the pin. Each waiter still validates
+  // its own record header and logical population after it is scheduled.
+  Unpin();
+  lease_.Reset();
+  if (trace_) [[unlikely]] {
+    trace_->disk_read_ = true;
+    trace_->flight_wait_start_ns_ = trace_->NowNanos();
+  }
 }
 
 void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
@@ -1962,9 +2005,38 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   record_headroom_ = absolute - aligned_offset_;
   read_bytes_ =
       (record_headroom_ + location_.total_disk_bytes() + mask) & ~mask;
+  // Bypass callers must not create or probe a registry, even if another read
+  // already has a Flight for this record. Admission survives retries and hops.
+  // Probe before taking scarce DMA capacity. A borrowed staging pointer is
+  // used only synchronously; buffer waiting below resolves it again.
+  auto* candidate = coalesce_
+                        ? engine_.FindBlockState(store_, location_.block_id())
+                        : nullptr;
+  const auto* staged =
+      candidate && location_.in_memory() && candidate->in_memory_
+          ? engine_.StagingFor(store_, *candidate)
+          : nullptr;
+  if (candidate && candidate->allocated_ && !candidate->freeing_ &&
+      candidate->allocation_epoch_ == location_.allocation_epoch() &&
+      (!staged || location_.record_offset() < staged->buffer_begin_) &&
+      read_bytes_ <= store_.buffers_.read_capacity_bytes()) {
+    flights_ = engine_.ReadFlights(store_);
+    if (flights_) {
+      population_generation_ =
+          partition_ ? store_.index_generations_[db_id_] : 0;
+      flight_hash_ = absl::Hash<ReadFlightKey>{}(FlightKey());
+      if (flights_->TryJoin(FlightKey(), flight_hash_, *this)) {
+        Joined();
+        return;
+      }
+    }
+  } else {
+    flights_ = nullptr;
+  }
   bool chunked = false;
   if (!lease_.valid()) {
-    if (trace_) trace_->buffer_acquire_start_ns_ = trace_->NowNanos();
+    if (trace_) [[unlikely]]
+      trace_->buffer_acquire_start_ns_ = trace_->NowNanos();
     auto acquired = store_.buffers_.TryAcquireReadBuffer(read_bytes_);
     if (!acquired.ok() && absl::IsResourceExhausted(acquired.status()) &&
         read_bytes_ <= engine_.direct_io_alignment_) {
@@ -1991,7 +2063,7 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
     }
     lease_ = std::move(*acquired);
   }
-  if (trace_) {
+  if (trace_) [[unlikely]] {
     trace_->buffer_acquired_ns_ = trace_->NowNanos();
     trace_->RecordBuffer(trace_->buffer_acquire_start_ns_,
                          trace_->buffer_acquired_ns_);
@@ -2019,7 +2091,7 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
       ready_.emplace(absl::InternalError("invalid in-memory location"));
       return;
     }
-    if (trace_) {
+    if (trace_) [[unlikely]] {
       trace_->io_submit_ns_ = trace_->buffer_acquired_ns_;
       trace_->io_complete_ns_ = trace_->buffer_acquired_ns_;
     }
@@ -2038,7 +2110,8 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   }
   state->PinLocal();
   pinned_ = state;
-  if (trace_) trace_->disk_read_ = true;
+  if (trace_) [[unlikely]]
+    trace_->disk_read_ = true;
   if (chunked) slow_ = ReadInChunks();
 }
 
@@ -2049,11 +2122,13 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
   // with the same decoder/checksum rules as a single read before publishing it.
   const auto buffer_start = trace_ ? trace_->NowNanos() : 0;
   auto acquired = co_await store_.buffers_.AcquireReadChunk();
-  if (trace_) trace_->RecordBuffer(buffer_start, trace_->NowNanos());
+  if (trace_) [[unlikely]]
+    trace_->RecordBuffer(buffer_start, trace_->NowNanos());
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   if (PopulationChanged()) co_return absl::NotFoundError("key not found");
-  if (trace_) trace_->io_submit_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    trace_->io_submit_ns_ = trace_->NowNanos();
   for (std::size_t offset = 0; offset < read_bytes_;) {
     auto buffer = chunk.io_buffer();
     buffer.size_ = std::min(buffer.size_, read_bytes_ - offset);
@@ -2068,8 +2143,10 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
               "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
           if (!delayed.ok()) co_return delayed;
         });
-    if (trace_) trace_->io_complete_ns_ = trace_->NowNanos();
-    if (trace_) trace_->RecordIo(io_start, trace_->io_complete_ns_);
+    if (trace_) [[unlikely]]
+      trace_->io_complete_ns_ = trace_->NowNanos();
+    if (trace_) [[unlikely]]
+      trace_->RecordIo(io_start, trace_->io_complete_ns_);
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
@@ -2089,9 +2166,9 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
       chunk.Reset();
       Unpin();
       lease_.Reset();
-      co_return co_await engine_.LoadValueSlow(store_, *partition_, db_id_,
-                                               key_, digest_, location_, {},
-                                               trace_, parsed.status());
+      co_return co_await engine_.LoadValueSlow(
+          store_, *partition_, db_id_, key_, digest_, location_, {},
+          parsed.status(), coalesce_, trace_);
     }
     co_return parsed.status();
   }
@@ -2108,12 +2185,14 @@ void StorageEngine::Impl::LoadValueAwaitable::Retry(absl::Status failure) {
   assert(partition_ && absl::IsAborted(failure));
   Unpin();
   lease_.Reset();
+  completed_buffer_.Reset();
   ready_.reset();
   // Inline reads have no extent manifest. Seed the failure so the slow path
   // resolves the index before any further I/O and preserves corruption errors
   // when the index still endorses the failed physical record.
   slow_ = engine_.LoadValueSlow(store_, *partition_, db_id_, key_, digest_,
-                                location_, {}, trace_, std::move(failure));
+                                location_, {}, std::move(failure), coalesce_,
+                                trace_);
 }
 
 void StorageEngine::Impl::LoadValueAwaitable::FinishBufferWait() {
@@ -2163,19 +2242,44 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
       store_.worker_->RegisterBackground(child);
     return child;
   }
-  if (ready_) return awaiting;
+  if (ready_ || flight_completed()) return awaiting;
+  if (flight_attached()) {
+    Suspend(awaiting, absl::OkStatus());
+    return std::noop_coroutine();
+  }
   auto buffer = lease_.io_buffer();
   buffer.size_ = read_bytes_;
-  if (trace_) trace_->io_submit_ns_ = trace_->NowNanos();
+  const bool fixed = lease_.registered();
+  bycorf::IoCompletion* tag = this;
+  auto* pinned = pinned_;
+  bool owns_pin = pinned != nullptr;
+  if (flights_) {
+    const auto admission =
+        flights_->Start(FlightKey(), flight_hash_, lease_, owns_pin, *this);
+    if (admission.outcome == ReadFlightRegistry::Outcome::kJoined) {
+      Joined();
+      Suspend(awaiting, absl::OkStatus());
+      return std::noop_coroutine();
+    }
+    if (admission.outcome == ReadFlightRegistry::Outcome::kStarted) {
+      tag = admission.tag;
+      pinned_ = nullptr;
+    }
+  }
+  if (trace_) [[unlikely]]
+    trace_->io_submit_ns_ = trace_->NowNanos();
   auto status =
-      lease_.registered()
-          ? store_.worker_->SubmitReadFixed(store_.files_[file_id_], buffer,
-                                            aligned_offset_, this)
-          : store_.worker_->SubmitRead(store_.files_[file_id_],
-                                       std::span(buffer.data_, buffer.size_),
-                                       aligned_offset_, this);
+      fixed ? store_.worker_->SubmitReadFixed(store_.files_[file_id_], buffer,
+                                              aligned_offset_, tag)
+            : store_.worker_->SubmitRead(store_.files_[file_id_],
+                                         std::span(buffer.data_, buffer.size_),
+                                         aligned_offset_, tag);
+  if (!status.ok() && tag != this) {
+    flights_->Reject(tag, lease_, owns_pin);
+    pinned_ = pinned;
+  }
   if (Suspend(awaiting, status)) return std::noop_coroutine();
-  if (trace_) {
+  if (trace_) [[unlikely]] {
     trace_->io_complete_ns_ = trace_->NowNanos();
     trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
   }
@@ -2189,21 +2293,41 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
 void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
                                                        int bytes,
                                                        unsigned flags) {
-  if (trace_) {
-    trace_->io_complete_ns_ = trace_->NowNanos();
-    trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
-  }
   if (bytes >= 0) worker.RecordStorageReadCompletion(bytes);
+  FinishCompletion(worker, bytes, flags);
+}
+
+void StorageEngine::Impl::LoadValueAwaitable::ReceiveRead(
+    bycorf::Worker& worker, ReadResultBuffer buffer, int bytes,
+    unsigned flags) {
+  completed_buffer_ = std::move(buffer);
+  FinishCompletion(worker, bytes, flags);
+}
+
+void StorageEngine::Impl::LoadValueAwaitable::FinishCompletion(
+    bycorf::Worker& worker, int bytes, unsigned flags) {
+  if (trace_) [[unlikely]] {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    if (trace_->flight_wait_start_ns_)
+      trace_->RecordFlightWait(trace_->flight_wait_start_ns_,
+                               trace_->io_complete_ns_);
+    else
+      trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   if (partition_ && bytes >= 0 &&
       static_cast<std::size_t>(bytes) == read_bytes_) {
     // Only metadata is examined on the completion poller. CRC and large-value
     // copies stay in the caller's scheduled slice. A stale identity must select
     // the retry continuation before the caller's co_await can finish.
-    auto parsed = ParseRecord(lease_.io_buffer().data_ + record_headroom_);
+    auto parsed =
+        ParseRecord((completed_buffer_.valid() ? completed_buffer_.io_data()
+                                               : lease_.io_buffer().data_) +
+                    record_headroom_);
     if (parsed.ok())
       payload_ = *parsed;
     else if (absl::IsAborted(parsed.status()) && !PopulationChanged()) {
       Retry(parsed.status());
+      if (!awaiting_) return;
       auto child =
           std::move(slow_).operator co_await().await_suspend(awaiting_);
       // CQEs are polled outside the parent's task class. Preserve background
@@ -2229,7 +2353,9 @@ StorageEngine::Impl::LoadValueAwaitable::await_resume() {
   if (!read.ok()) return read.status();
   if (static_cast<std::size_t>(*read) != read_bytes_)
     return absl::InternalError("short compact record read");
-  const auto* data = lease_.io_buffer().data_ + record_headroom_;
+  const auto* data = (completed_buffer_.valid() ? completed_buffer_.io_data()
+                                                : lease_.io_buffer().data_) +
+                     record_headroom_;
   if (!payload_) {
     auto parsed = ParseRecord(data);
     if (!parsed.ok()) return parsed.status();
@@ -2282,12 +2408,21 @@ StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
   if (!payload.no_crc_ &&
       Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)
     return absl::InternalError("record value checksum mismatch");
+  if (completed_buffer_.valid()) {
+    const auto offset =
+        static_cast<std::size_t>(value - completed_buffer_.bytes().data());
+    if (trace_) [[unlikely]]
+      trace_->decode_done_ns_ = trace_->NowNanos();
+    return LoadedValue{std::move(completed_buffer_), offset, payload.bytes_,
+                       payload.txid_};
+  }
   if (staged || payload.bytes_ > engine_.DirectGetValueLimit()) {
     std::memmove(lease_.io_buffer().data_, value, payload.bytes_);
     value = lease_.io_buffer().data_;
   }
   const auto offset = static_cast<std::size_t>(value - lease_.bytes().data());
-  if (trace_) trace_->decode_done_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    trace_->decode_done_ns_ = trace_->NowNanos();
   return LoadedValue{std::move(lease_), offset, payload.bytes_, payload.txid_};
 }
 
