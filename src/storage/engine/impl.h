@@ -3893,7 +3893,26 @@ class StorageEngine::Impl {
     };
 
     void PrepareLocal();
-    ReadFlightKey FlightKey() const;
+    // Hashing needs only the physical hash fields. Visible construction lets
+    // the compiler discard unused comparison fields on a hash-only probe.
+    [[gnu::always_inline]] ReadFlightKey FlightKey() const {
+      return {
+          .engine = reinterpret_cast<std::uintptr_t>(&engine_),
+          .block = location_.block_id(),
+          .allocation_epoch = location_.allocation_epoch(),
+          .mutation_sequence = location_.mutation_sequence_,
+          .aligned_offset = aligned_offset_,
+          .read_bytes = read_bytes_,
+          .db_epoch = expected_db_epoch_ ? *expected_db_epoch_
+                                         : engine_.DbEpoch(db_id_),
+          .replication_epoch = replication_epoch_,
+          .population_generation = population_generation_,
+          .file = store_.files_[file_id_].index_,
+          .record_offset = location_.record_offset(),
+          .record_bytes = location_.total_disk_bytes(),
+          .block_owner = static_cast<std::uint16_t>(location_.block_owner()),
+          .db = db_id_};
+    }
     void Joined();
     void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer&& buffer,
                      int result, unsigned flags) override;
