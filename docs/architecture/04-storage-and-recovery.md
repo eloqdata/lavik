@@ -782,20 +782,22 @@ population admission checks.
 
 Eligible single-chunk reads explicitly admitted for coalescing join a bounded
 in-flight registry on the actual submitting worker. Remote compact reads use
-their connection worker; ordinary GET and read-only compact owner calls use
-the physical block owner, including after relocation retry. Staging, chunked
-assembly, mutation preparation and maintenance bypass the Flight registry.
-This admission choice is preserved across buffer waits, owner routing and
-relocation retry; stored physical versions are immutable regardless of
-admission. Exact physical record identity and population fences determine
-sharing; workers never share a registry. Remote compact reads do not add a
-key-owner hop. The producer owns its pin, DMA buffer and stable completion
-object independently of request frames. Cancellation detaches a waiter without
-cancelling that producer. Completion removes the entry before waking
-consumers, so the registry never caches completed results. Every consumer
-validates its own record and population context before exposing bytes.
-Admission exhaustion or metadata allocation failure preserves the exclusive
-read path.
+their connection worker; ordinary GET, read-only compact owner calls and
+group/page loads use the physical block owner, including after relocation
+retry. Staging, chunked assembly and ordinary compact mutation/maintenance
+readers bypass the Flight registry. This admission choice is preserved across
+buffer waits, owner routing and relocation retry; stored physical versions are
+immutable regardless of admission. Group/page snapshot loads may also serve
+mutation preparation; those consumers edit owned decoded or re-encoded
+outputs, never shared bytes. Exact physical record identity and population
+fences determine sharing; workers never share a registry. Remote compact reads
+do not add a key-owner hop. The producer owns its pin, DMA buffer and stable
+completion object independently of request frames. Cancellation detaches a
+waiter without cancelling that producer. Completion removes the entry before
+waking consumers, so the registry never caches completed results. Every
+consumer validates its own record and population context before exposing
+bytes. Admission exhaustion or metadata allocation failure preserves the
+exclusive read path.
 
 A result with one remaining consumer retains an exclusive lease and GET adds
 bulk framing in that buffer. Multiple consumers receive immutable handles over
