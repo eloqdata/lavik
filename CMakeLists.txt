@@ -2256,6 +2256,14 @@ endforeach()
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/read_flight_e2e.py
               $<TARGET_FILE:lavik> --workers 1)
     set_tests_properties(lavik_local_read_flight_e2e PROPERTIES TIMEOUT 180)
+    foreach(workers IN ITEMS 1 2)
+      add_test(NAME lavik_mget_read_flight_e2e_${workers}
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/mget_read_flight_e2e.py
+                $<TARGET_FILE:lavik> --workers ${workers})
+      set_tests_properties(lavik_mget_read_flight_e2e_${workers}
+        PROPERTIES TIMEOUT 180)
+    endforeach()
 
     add_test(
       NAME lavik_defrag_payload_e2e

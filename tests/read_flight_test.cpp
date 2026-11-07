@@ -24,7 +24,7 @@ struct Waiter : ReadFlightWaiter {
   int result = 0;
   unsigned calls = 0;
   std::function<void()> on_receive;
-  void ReceiveRead(bycorf::Worker&, ReadResultBuffer value, int bytes,
+  void ReceiveRead(bycorf::Worker&, ReadResultBuffer&& value, int bytes,
                    unsigned) override {
     buffer = std::move(value);
     result = bytes;
@@ -461,6 +461,38 @@ TEST_F(ReadFlightTest, InsertionCounterWrapRechecksDelayedMisses) {
     EXPECT_EQ(delayed.calls, 1);
     EXPECT_EQ(registry->size(), 0);
   }
+}
+
+TEST_F(ReadFlightTest, DirectSlotReuseCannotHideOlderCollidingProducers) {
+  auto registry = Registry();
+  ASSERT_TRUE(registry);
+  const auto allocations = registry->map_allocations();
+  Waiter first, collision, replacement, follower;
+  auto a = Buffer(), b = Buffer(), c = Buffer();
+  bool pa = true, pb = true, pc = true;
+  const ReadFlightKey one{.block = 1}, two{.block = 2}, three{.block = 3};
+  auto original = registry->Start(one, 42, a, pa, first);
+  auto overflow = registry->Start(two, 42, b, pb, collision);
+  ASSERT_NE(original.tag, nullptr);
+  ASSERT_NE(overflow.tag, nullptr);
+  EXPECT_EQ(registry->size(), 2);
+  original.tag->Complete(worker_, 4096, 0);
+  first.buffer.Reset();
+  // The primary slot is now vacant, but the colliding key is still present.
+  EXPECT_TRUE(registry->TryJoin(two, 42, follower));
+  auto next = registry->Start(three, 42, c, pc, replacement);
+  ASSERT_NE(next.tag, nullptr);
+  EXPECT_EQ(registry->size(), 2);
+  // Synchronous rejection of the replacement must leave overflow reachable.
+  registry->Reject(next.tag, c, pc);
+  EXPECT_TRUE(c.valid());
+  EXPECT_TRUE(pc);
+  EXPECT_EQ(registry->size(), 1);
+  overflow.tag->Complete(worker_, 4096, 0);
+  EXPECT_EQ(collision.calls, 1);
+  EXPECT_EQ(follower.calls, 1);
+  EXPECT_EQ(registry->size(), 0);
+  EXPECT_EQ(registry->map_allocations(), allocations);
 }
 
 TEST_F(ReadFlightTest, OptionalMetadataAdmissionFailureBypasses) {

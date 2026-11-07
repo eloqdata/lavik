@@ -782,22 +782,22 @@ population admission checks.
 
 Eligible single-chunk reads explicitly admitted for coalescing join a bounded
 in-flight registry on the actual submitting worker. Remote compact reads use
-their connection worker; ordinary GET, read-only compact owner calls and
-group/page loads use the physical block owner, including after relocation
-retry. Staging, chunked assembly and ordinary compact mutation/maintenance
-readers bypass the Flight registry. This admission choice is preserved across
-buffer waits, owner routing and relocation retry; stored physical versions are
-immutable regardless of admission. Group/page snapshot loads may also serve
-mutation preparation; those consumers edit owned decoded or re-encoded
-outputs, never shared bytes. Exact physical record identity and population
-fences determine sharing; workers never share a registry. Remote compact reads
-do not add a key-owner hop. The producer owns its pin, DMA buffer and stable
-completion object independently of request frames. Cancellation detaches a
-waiter without cancelling that producer. Completion removes the entry before
-waking consumers, so the registry never caches completed results. Every
-consumer validates its own record and population context before exposing
-bytes. Admission exhaustion or metadata allocation failure preserves the
-exclusive read path.
+their connection worker; ordinary GET, MGET waves, read-only compact owner
+calls and group/page loads use the physical block owner, including after
+relocation retry. Staging, chunked assembly and ordinary compact
+mutation/maintenance readers bypass the Flight registry. This admission choice
+is preserved across buffer waits, owner routing and relocation retry; stored
+physical versions are immutable regardless of admission. Group/page snapshot
+loads may also serve mutation preparation; those consumers edit owned decoded
+or re-encoded outputs, never shared bytes. Exact physical record identity and
+population fences determine sharing; workers never share a registry. Remote
+compact reads do not add a key-owner hop. The producer owns its pin, DMA
+buffer and stable completion object independently of request frames.
+Cancellation detaches a waiter without cancelling that producer. Completion
+removes the entry before waking consumers, so the registry never caches
+completed results. Every consumer validates its own record and population
+context before exposing bytes. Admission exhaustion or metadata allocation
+failure preserves the exclusive read path.
 
 A result with one remaining consumer retains an exclusive lease and GET adds
 bulk framing in that buffer. Multiple consumers receive immutable handles over
@@ -847,9 +847,10 @@ an aligned lease. `LoadValue` and its single-location `LoadValueLocal` share an
 awaitable embedded in the caller's task. Local inline reads, including staged
 copies, use that task directly. Buffer contention retains the pool's FIFO
 handoff and schedules an owner-local continuation under the caller's task class;
-it does not require a waiter coroutine. The awaitable owns the disk-read pin
-and buffer through completion and validates record identity, checksums, and
-population before returning it. Grouped reads enter their graph reader directly;
+it does not require a waiter coroutine. An exclusive awaitable retains its pin
+and buffer through completion; an admitted immutable read transfers them to
+the independent producer. Each awaitable validates record identity, checksums,
+and population before returning its result. Grouped reads enter their graph reader directly;
 cross-owner, external, and relocation flows use lazy helper tasks. A stale
 logical read resolves the current same-mutation location before resuming its
 caller, while a single-location read returns the stale status to its enclosing
@@ -859,9 +860,14 @@ Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
 locks. It classifies index entries in one coroutine and issues ordinary-size
 local inline records in waves paced by nonblocking arena acquisition. When a
 range cannot fit, an existing wave drains first; a record that cannot fit an
-empty wave falls back to the complete reader and its chunked path. One completion barrier covers every I/O in a wave, and all
-leases are returned before a chunked fallback, relocation retry, or the next
-wave can suspend. Staged, remote, external, indirect-key, and stale-validation
+empty wave falls back to the complete reader and its chunked path. Eligible
+entries join the submitting worker's immutable read registry, including reads
+started by GET. Each wave has an explicit entry bound because shared followers
+do not consume arena ranges. One completion barrier covers all producers and
+followers, including synchronous submission errors. Every entry independently
+checks its logical identity and population after completion, and all leases
+are returned before a chunked fallback, relocation retry, or the next wave can
+suspend. Staged, remote, external, indirect-key, and stale-validation
 cases fall back to the complete `GetLocked` state machine, preserving the ordinary
 identity and relocation checks without one coroutine per key.
 

@@ -260,12 +260,14 @@ specified in [Storage reads and pins](04-storage-and-recovery.md#reads-and-pins)
 MGET acquires all requested keys in one shared-lock transaction and preserves
 their argument positions in the assembled reply. Each participating shard
 passes its local keys to `StorageEngine::BatchGetLocked`. Ordinary-size compact
-on-disk values are submitted together in waves paced by that worker's available
-fixed read buffers; oversized reads use aligned overflow leases. One awaiter
-resumes only after every submitted read in the wave completes. The wave
-releases all leases before relocation retries or the next wave, while external,
-in-memory, remote-owner, or stale-location cases use the complete single-key
-fallback path.
+on-disk values use bounded waves on the submitting worker, joining matching
+physical reads before acquiring another arena range. The wave bounds logical
+entries as well as arena usage because shared followers need no new range.
+One completion barrier covers both producers and followers; each entry then
+validates its own logical context. All result handles are released before a
+relocation retry or the next wave can suspend. Oversized, external, in-memory,
+remote-owner, and stale-location cases use the complete single-key reader,
+including its bounded chunked path when a full record cannot fit the arena.
 
 Top-level blocking List and Sorted Set writes and `XREADGROUP` release database
 admission while waiting and reacquire it for each concrete attempt. In

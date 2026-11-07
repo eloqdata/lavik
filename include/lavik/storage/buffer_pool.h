@@ -142,7 +142,7 @@ static_assert(sizeof(ReadBufferLease) == 32);
 class ReadResultBuffer {
  public:
   ReadResultBuffer() = default;
-  ReadResultBuffer(ReadBufferLease lease) noexcept;
+  ReadResultBuffer(ReadBufferLease&& lease) noexcept;
   ReadResultBuffer(const ReadResultBuffer&) = delete;
   ReadResultBuffer& operator=(const ReadResultBuffer&) = delete;
   ReadResultBuffer(ReadResultBuffer&& other) noexcept;
@@ -280,8 +280,9 @@ class RegisteredBufferPool {
     return available_read_bytes() / options_.read_slot_bytes_;
   }
   std::size_t read_capacity_bytes() const noexcept { return read_arena_.size_; }
-  // Sharing is restricted to one preferred read chunk, leaving large-record
-  // admission and streaming on their existing exclusive paths.
+  // Remote compact sharing is limited to this preferred chunk. Owner-local
+  // immutable reads may share any complete record that fits the fixed arena;
+  // chunked assembly retains its existing exclusive path.
   std::size_t preferred_read_payload_bytes() const noexcept {
     return options_.read_payload_bytes();
   }

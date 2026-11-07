@@ -337,9 +337,19 @@ struct StorageReplicationLogMetrics {
   bool backpressured_ = false;
 };
 
+// Copied on the submitting worker during the existing diagnostics visit.
+// Hot-path counters remain worker-local; collection adds no shared atomics.
+struct StorageReadFlightMetrics {
+  unsigned worker_id_ = 0;
+  ReadFlightStats stats_;
+  std::uint64_t pending_ = 0;
+  std::uint64_t shared_bytes_ = 0;
+};
+
 struct StorageMetricsSnapshot {
   std::vector<StorageDeviceMetrics> devices_;
   std::vector<StorageReplicationLogMetrics> replication_logs_;
+  std::vector<StorageReadFlightMetrics> read_flights_;
   StorageDiagnosticsSnapshot diagnostics_;
 };
 
@@ -554,7 +564,7 @@ class DiskValue {
   // Exclusive offsets describe an already framed RESP reply. Shared offsets
   // describe only immutable payload; network_parts supplies each sender's
   // header. Keeping the result handle avoids converting exclusive leases twice.
-  DiskValue(ReadResultBuffer buffer, std::size_t offset,
+  DiskValue(ReadResultBuffer&& buffer, std::size_t offset,
             std::size_t size) noexcept
       : lease_(std::move(buffer)),
         network_offset_(static_cast<std::uint32_t>(offset)),
@@ -2242,11 +2252,11 @@ class StorageEngine {
   std::unique_ptr<Impl> impl_;
 };
 
-// Owns a remote block pin and the I/O completion inline in the caller's frame.
-// No child coroutine or separately allocated continuation is needed. Like the
-// runtime's one-shot I/O awaitables, it cannot move after publishing its
-// address to the device, and shutdown must drain I/O before destroying its
-// parent.
+// Embeds the connection-worker continuation without a child coroutine. An
+// admitted flight owns its pin, DMA lease and device completion independently;
+// destroying a waiter detaches it without cancelling that producer. Exclusive
+// bypass keeps the inline completion and its existing drain-before-frame-
+// destruction contract. Neither mode permits moving a published awaitable.
 class StorageEngine::RemoteReadAwaitable {
  public:
   using Result = std::optional<absl::StatusOr<CompactReadValue>>;
@@ -2289,8 +2299,10 @@ class StorageEngine::RemoteReadAwaitable {
   std::uint64_t generation_ = 0;
   std::uint64_t db_epoch_ = 0;
   std::uint64_t replication_epoch_ = 0;
-  std::size_t record_headroom_ = 0;
-  std::size_t read_bytes_ = 0;
+  // A compact record and its alignment padding fit inside one storage block.
+  // Keep these bounded lengths narrow in every connection's request frame.
+  std::uint32_t record_headroom_ = 0;
+  std::uint32_t read_bytes_ = 0;
   std::uint16_t slot_ = 0;
   std::uint8_t db_id_ = 0;
   ValueType type_ = ValueType::kString;
@@ -2317,7 +2329,7 @@ class StorageEngine::RemoteReadAwaitable {
    private:
     friend class RemoteGetTestPeer;
     ReadFlightKey Key() const;
-    void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer buffer,
+    void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer&& buffer,
                      int result, unsigned flags) override;
     void FinishTrace();
     void Joined();
@@ -2326,9 +2338,9 @@ class StorageEngine::RemoteReadAwaitable {
     std::size_t hash_ = 0;
     bycorf::Worker& worker_;
     bycorf::FixedFile file_;
+    bool fixed_ = false;
     bycorf::FixedBuffer buffer_{};
     std::uint64_t offset_;
-    bool fixed_ = false;
     ReadLatencyTrace* trace_;
   };
   ReadLatencyTrace* trace_;

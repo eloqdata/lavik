@@ -39,14 +39,18 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
       diagnostics ? diagnostics : (trace ? trace->diagnostics_ : nullptr);
   auto detail =
       trace || observer ? std::make_unique<ReadLatencyTrace>() : nullptr;
-  if (detail) detail->diagnostics_ = observer;
+  if (detail) [[unlikely]]
+    detail->diagnostics_ = observer;
   absl::Cleanup merge_trace = [&] {
     // Online intervals already reached the root; merge standalone observers
     // only.
-    if (!trace || observer) return;
+    if (!trace || observer) [[likely]]
+      return;
     trace->buffer_timing_.Merge(detail->buffer_timing_);
     trace->io_timing_.Merge(detail->io_timing_);
-    trace->disk_read_ |= detail->disk_read_ || detail->io_timing_.count != 0;
+    trace->flight_wait_timing_.Merge(detail->flight_wait_timing_);
+    trace->disk_read_ |= detail->disk_read_ || detail->io_timing_.count != 0 ||
+                         detail->flight_wait_timing_.count != 0;
     trace->io_submit_ns_ = trace->io_timing_.first_ns;
     trace->io_complete_ns_ = trace->io_timing_.last_ns;
   };
@@ -554,7 +558,8 @@ StorageEngine::Impl::LoadGroupedStringValue(
     co_return absl::DataLossError("grouped String aggregate mismatch");
   const auto offset =
       static_cast<std::size_t>(output.data_ - buffer->bytes().data());
-  if (trace) trace->decode_done_ns_ = trace->NowNanos();
+  if (trace) [[unlikely]]
+    trace->decode_done_ns_ = trace->NowNanos();
   co_return LoadedValue{std::move(*buffer), offset, written};
 }
 

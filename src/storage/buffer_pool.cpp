@@ -102,7 +102,7 @@ void ReadBufferLease::Reset() noexcept {
   release_token_ = 0;
 }
 
-ReadResultBuffer::ReadResultBuffer(ReadBufferLease lease) noexcept
+ReadResultBuffer::ReadResultBuffer(ReadBufferLease&& lease) noexcept
     : pool_(std::exchange(lease.pool_, nullptr)),
       data_(std::exchange(lease.data_, nullptr)),
       size_(lease.size_),
