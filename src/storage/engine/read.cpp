@@ -109,7 +109,8 @@ void BatchReadOperation::Joined() {
   joined_ = true;
   release_pin_(pin_context_);
   lease_->Reset();
-  if (trace_) io_start_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    io_start_ns_ = trace_->NowNanos();
 }
 
 bool BatchReadOperation::TryJoin() {
@@ -131,7 +132,8 @@ absl::Status BatchReadOperation::Submit() {
     if (admission.outcome == ReadFlightRegistry::Outcome::kStarted)
       tag = admission.tag;
   }
-  if (trace_) io_start_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    io_start_ns_ = trace_->NowNanos();
   auto status =
       registered_
           ? worker_->SubmitReadFixed(file_, buffer_, offset_, tag)
@@ -139,7 +141,8 @@ absl::Status BatchReadOperation::Submit() {
                                 offset_, tag);
   if (!status.ok()) {
     if (tag != this) flights_->Reject(tag, *lease_, *owns_pin_);
-    if (trace_) trace_->RecordIo(io_start_ns_, trace_->NowNanos());
+    if (trace_) [[unlikely]]
+      trace_->RecordIo(io_start_ns_, trace_->NowNanos());
   }
   return status;
 }
@@ -147,7 +150,7 @@ absl::Status BatchReadOperation::Submit() {
 void BatchReadOperation::Finish(Worker& worker, int result) {
   result_ = result;
   completed_ = true;
-  if (trace_) {
+  if (trace_) [[unlikely]] {
     if (joined_)
       trace_->RecordFlightWait(io_start_ns_, trace_->NowNanos());
     else
@@ -346,7 +349,7 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   auto reader = index.TryRead(digest);
   if (!reader) return;
   const auto* entry = std::as_const(index).Find(digest, key);
-  if (result.trace_ && !result.trace_->diagnostics_)
+  if (result.trace_ && !result.trace_->diagnostics_) [[unlikely]]
     result.trace_->lookup_done_ns_ = result.trace_->NowNanos();
   if (!result.Current(*this)) return;
   if (entry && !entry->key_complete()) return;
@@ -425,7 +428,7 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
 
   // Admission is only an optimization. If the local arena cannot fit the
   // record immediately, let the owner reader stream it or wait for a chunk.
-  if (result.trace_) {
+  if (result.trace_) [[unlikely]] {
     result.trace_->buffer_acquire_start_ns_ = result.trace_->NowNanos();
   }
   auto acquired = local.buffers_.TryAcquireReadBuffer(result.read_bytes_);
@@ -438,7 +441,7 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
     return;
   }
   result.lease_ = std::move(*acquired);
-  if (result.trace_) {
+  if (result.trace_) [[unlikely]] {
     result.trace_->buffer_acquired_ns_ = result.trace_->NowNanos();
     result.trace_->RecordBuffer(result.trace_->buffer_acquire_start_ns_,
                                 result.trace_->buffer_acquired_ns_);
@@ -627,7 +630,8 @@ StorageEngine::RemoteReadAwaitable::await_resume() {
   auto loaded =
       engine.DecodeRemoteValue(std::move(buffer), db_id_, key_, location_,
                                replication_epoch_, record_headroom_, db_epoch_);
-  if (trace_) trace_->decode_done_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    trace_->decode_done_ns_ = trace_->NowNanos();
   if (!Current(engine) || (!loaded.ok() && absl::IsAborted(loaded.status())))
     return std::nullopt;
   if (!loaded.ok()) return loaded.status();
@@ -664,7 +668,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
          *routed_partition_id == RedisSlot(key));
   tx::TxShard::Guard key_lock;
   if (acquire_key_lock) {
-    if (trace && !trace->diagnostics_)
+    if (trace && !trace->diagnostics_) [[unlikely]]
       trace->key_lock_start_ns_ = trace->NowNanos();
     TraceSpanScope key_wait(trace ? trace->diagnostics_ : nullptr,
                             TraceStage::kKeyLock);
@@ -672,7 +676,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
         db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
         lavik::storage::RedisSlot(key));
   }
-  if (acquire_key_lock && trace && !trace->diagnostics_)
+  if (acquire_key_lock && trace && !trace->diagnostics_) [[unlikely]]
     trace->key_lock_acquired_ns_ = trace->NowNanos();
   WorkerStore& store = CurrentStore();
   auto& partition = routed_partition_id.has_value()
@@ -703,7 +707,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       found = *resolved;
     }
     if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
-      if (trace != nullptr && !trace->diagnostics_) {
+      if (trace != nullptr && !trace->diagnostics_) [[unlikely]] {
         trace->lookup_done_ns_ = trace->NowNanos();
       }
       // GET maps absence to nil by code, so avoid allocating a diagnostic
@@ -714,7 +718,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     if (!readable.ok()) co_return readable;
     if (IsExpiredNow(*found)) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
-      if (trace != nullptr && !trace->diagnostics_) {
+      if (trace != nullptr && !trace->diagnostics_) [[unlikely]] {
         trace->lookup_done_ns_ = trace->NowNanos();
       }
       co_return absl::NotFoundError("");
@@ -722,7 +726,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     if (found->value_.value_type() != ValueType::kString) {
       co_return WrongTypeError();
     }
-    if (trace != nullptr && !trace->diagnostics_) {
+    if (trace != nullptr && !trace->diagnostics_) [[unlikely]] {
       trace->lookup_done_ns_ = trace->NowNanos();
     }
 
@@ -902,7 +906,8 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
                                                    record_headroom, read_bytes);
       auto& operation = pending->operation_;
       operation.trace_ = detail.get();
-      if (detail) detail->disk_read_ = true;
+      if (detail) [[unlikely]]
+        detail->disk_read_ = true;
       operation.worker_ = store.worker_;
       operation.file_ = store.files_[file_id];
       operation.offset_ = aligned_offset;
@@ -1606,7 +1611,8 @@ void StorageEngine::Impl::ReadExtentAwaitable::PrepareBuffer() {
       });
   if (acquired.ok()) {
     lease_ = std::move(*acquired);
-    if (trace_) trace_->RecordBuffer(started, trace_->NowNanos());
+    if (trace_) [[unlikely]]
+      trace_->RecordBuffer(started, trace_->NowNanos());
   } else if (absl::IsResourceExhausted(acquired.status()) &&
              store_.buffers_.read_capacity_bytes() != 0) {
     // Stream through a smaller arena range without any dynamic DMA allocation.
@@ -1644,7 +1650,8 @@ bool StorageEngine::Impl::ReadExtentAwaitable::SubmitRead(
   auto buffer = lease_.io_buffer();
   buffer.size_ = read_bytes_;
   const auto [file_id, offset] = engine_.FileOffset(ref_.block_id_);
-  if (trace_) io_start_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    io_start_ns_ = trace_->NowNanos();
   return Suspend(
       awaiting, lease_.registered()
                     ? store_.worker_->SubmitReadFixed(store_.files_[file_id],
@@ -1658,7 +1665,8 @@ absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
   if (remote_) return remote_->await_resume();
   if (ready_) return std::move(*ready_);
   if (chunked_.valid()) return std::move(chunked_).TakeResult();
-  if (trace_) trace_->RecordIo(io_start_ns_, trace_->NowNanos());
+  if (trace_) [[unlikely]]
+    trace_->RecordIo(io_start_ns_, trace_->NowNanos());
   auto read =
       Resume(lease_.registered() ? "fixed-buffer read failed" : "read failed");
   if (!read.ok()) return read.status();
@@ -1699,7 +1707,8 @@ bool StorageEngine::Impl::ReadExtentAwaitable::DecodeHeader(
 Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
   const auto buffer_start = trace_ ? trace_->NowNanos() : 0;
   auto acquired = co_await store_.buffers_.AcquireReadChunk();
-  if (trace_) trace_->RecordBuffer(buffer_start, trace_->NowNanos());
+  if (trace_) [[unlikely]]
+    trace_->RecordBuffer(buffer_start, trace_->NowNanos());
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   const auto capacity = chunk.io_buffer().size_;
@@ -1715,13 +1724,14 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
         *store_.worker_, store_.files_[file_id], buffer, chunk.registered(),
         block_offset + offset);
     LAVIK_FAULT_INJECT(
-        if (trace_ &&
-            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+        if (trace_ && LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION",
+                                          "1")) [[unlikely]] {
           auto delayed = co_await fault_injection::PauseWhileFileExists(
               "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
           if (!delayed.ok()) co_return delayed;
         });
-    if (trace_) trace_->RecordIo(io_start, trace_->NowNanos());
+    if (trace_) [[unlikely]]
+      trace_->RecordIo(io_start, trace_->NowNanos());
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
@@ -1755,13 +1765,14 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
         *store_.worker_, store_.files_[file_id], buffer, chunk.registered(),
         block_offset + kBlockHeaderBytes + offset);
     LAVIK_FAULT_INJECT(
-        if (trace_ &&
-            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+        if (trace_ && LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION",
+                                          "1")) [[unlikely]] {
           auto delayed = co_await fault_injection::PauseWhileFileExists(
               "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
           if (!delayed.ok()) co_return delayed;
         });
-    if (trace_) trace_->RecordIo(io_start, trace_->NowNanos());
+    if (trace_) [[unlikely]]
+      trace_->RecordIo(io_start, trace_->NowNanos());
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
@@ -1934,7 +1945,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external string length does not match metadata");
   }
-  if (trace != nullptr) {
+  if (trace != nullptr) [[unlikely]] {
     trace->buffer_acquire_start_ns_ = trace->NowNanos();
   }
   // Extents are read into their own I/O leases and copied here. The output
@@ -1950,13 +1961,13 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "external value exceeds read buffer capacity");
   }
-  if (trace != nullptr) {
+  if (trace != nullptr) [[unlikely]] {
     trace->buffer_acquired_ns_ = trace->NowNanos();
     trace->RecordBuffer(trace->buffer_acquire_start_ns_,
                         trace->buffer_acquired_ns_);
     trace->disk_read_ = true;
   }
-  if (trace != nullptr) {
+  if (trace != nullptr) [[unlikely]] {
     trace->io_submit_ns_ = trace->NowNanos();
   }
   // Validate the complete manifest before reading into the output buffer.
@@ -1986,7 +1997,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value length does not match manifest");
   }
-  if (trace != nullptr) {
+  if (trace != nullptr) [[unlikely]] {
     trace->io_complete_ns_ = trace->NowNanos();
 
     trace->decode_done_ns_ = trace->io_complete_ns_;
@@ -2258,8 +2269,8 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
         *store_.worker_, store_.files_[file_id_], buffer, chunk.registered(),
         aligned_offset_ + offset);
     LAVIK_FAULT_INJECT(
-        if (trace_ &&
-            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+        if (trace_ && LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION",
+                                          "1")) [[unlikely]] {
           auto delayed = co_await fault_injection::PauseWhileFileExists(
               "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
           if (!delayed.ok()) co_return delayed;
