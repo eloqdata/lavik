@@ -76,13 +76,15 @@ ReadFlightRegistry::ReadFlightRegistry(bycorf::Worker& worker,
 std::unique_ptr<ReadFlightRegistry> ReadFlightRegistry::TryCreate(
     bycorf::Worker& worker, RegisteredBufferPool& pool, void* context,
     ReleasePin unpin, std::size_t capacity) noexcept {
-  if (capacity > kCapacity) return {};
+  if (capacity > kCapacity) [[unlikely]]
+    return {};
   // Reserve conservatively for the pointer table's power-of-two backing, then
   // charge its observed allocation. Failure only disables this optimization.
   const auto bound =
       sizeof(ReadFlightRegistry) + capacity * (sizeof(ReadFlight) + 64) + 128;
   auto reservation = TryReserveMemory(bound);
-  if (!reservation) return {};
+  if (!reservation) [[unlikely]]
+    return {};
   try {
     auto result = std::unique_ptr<ReadFlightRegistry>(
         new ReadFlightRegistry(worker, pool, context, unpin, capacity));

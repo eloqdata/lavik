@@ -202,13 +202,15 @@ SharedReadReservation RegisteredBufferPool::TryReserveSharedRead(
       bytes == 0 || bytes > read_arena_.size_ / 4 ||
       shared_read_bytes_ > read_arena_.size_ / 4 - bytes)
     return result;
-  if (!shared_reads_) {
+  if (!shared_reads_) [[unlikely]] {
     constexpr auto metadata_bytes = sizeof(SharedReadState) * kSharedReadSlots;
     auto reservation = TryReserveMemory(metadata_bytes);
-    if (!reservation) return result;
+    if (!reservation) [[unlikely]]
+      return result;
     auto states = std::unique_ptr<SharedReadState[]>(
         new (std::nothrow) SharedReadState[kSharedReadSlots]);
-    if (!states) return result;
+    if (!states) [[unlikely]]
+      return result;
     for (unsigned i = 0; i < kSharedReadSlots; ++i)
       states[i].next_free_ = i + 1;
     shared_reads_ = std::move(states);
@@ -239,7 +241,8 @@ SharedReadReservation RegisteredBufferPool::TryReserveSharedRead(
 
 RegisteredBufferPool::SharedReadState* RegisteredBufferPool::SharedState(
     std::uint64_t ticket) noexcept {
-  if (!shared_reads_ || read_sharing_finalized_) return nullptr;
+  if (!shared_reads_ || read_sharing_finalized_) [[unlikely]]
+    return nullptr;
   auto& state = shared_reads_[(ticket >> 5) & (kSharedReadSlots - 1)];
   return state.active_ && state.generation_ == (ticket >> 15) ? &state
                                                               : nullptr;
@@ -261,7 +264,8 @@ void RegisteredBufferPool::RetireSharedRead(SharedReadState& state,
 
 void RegisteredBufferPool::CancelSharedRead(std::uint64_t ticket) noexcept {
   auto* state = SharedState(ticket);
-  if (!state) return;
+  if (!state) [[unlikely]]
+    return;
   assert(!state->lease_.valid() && !state->live_consumers_);
   RetireSharedRead(*state, (ticket >> 5) & (kSharedReadSlots - 1));
 }
@@ -287,6 +291,7 @@ std::optional<ReadResultBuffer> RegisteredBufferPool::CloneSharedRead(
     const ReadResultBuffer& source) noexcept {
   const auto& current = bycorf::ThisWorker();
   if (current.cross_core_ != cross_core_ || current.id_ != owner_worker_)
+      [[unlikely]]
     return std::nullopt;
   const auto ticket = source.return_ticket_ & ~ReadResultBuffer::kSharedBit;
   auto* state = SharedState(ticket);
@@ -325,7 +330,8 @@ void RegisteredBufferPool::ReleaseSharedReadLocal(
     std::uint64_t ticket) noexcept {
   auto* state = SharedState(ticket);
   const auto consumer = std::uint32_t{1} << (ticket & 31);
-  if (!state || !(state->live_consumers_ & consumer)) return;
+  if (!state || !(state->live_consumers_ & consumer)) [[unlikely]]
+    return;
   state->live_consumers_ &= ~consumer;
   // Frame reclamation after stop must not wake an arena waiter whose frame
   // has already been destroyed. Finalization reclaims these leases after the

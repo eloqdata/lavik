@@ -346,7 +346,7 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
 
   ReadFlightRegistry* registry = nullptr;
   if (result.read_bytes_ <= local.buffers_.preferred_read_payload_bytes()) {
-    if (!local.read_flights_attempted_) {
+    if (!local.read_flights_attempted_) [[unlikely]] {
       local.read_flights_attempted_ = true;
       local.read_flights_ = ReadFlightRegistry::TryCreate(
           *local.worker_, local.buffers_, this,
@@ -431,7 +431,8 @@ void StorageEngine::RemoteReadAwaitable::TracedReadIo::Joined() {
   // own captured logical context and must validate it again after completion.
   read_.pin_.Reset();
   read_.lease_.Reset();
-  if (trace_) trace_->flight_wait_start_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    trace_->flight_wait_start_ns_ = trace_->NowNanos();
 }
 bool StorageEngine::RemoteReadAwaitable::TracedReadIo::TryJoin() {
   if (!registry_ || !registry_->TryJoin(Key(), hash_, *this)) return false;
@@ -459,7 +460,7 @@ bool StorageEngine::RemoteReadAwaitable::TracedReadIo::await_suspend(
     if (admission.outcome == ReadFlightRegistry::Outcome::kStarted)
       tag = admission.tag;
   }
-  if (trace_) {
+  if (trace_) [[unlikely]] {
     trace_->disk_read_ = true;
     trace_->io_submit_ns_ = trace_->NowNanos();
   }
@@ -467,7 +468,7 @@ bool StorageEngine::RemoteReadAwaitable::TracedReadIo::await_suspend(
                        : worker_.SubmitRead(
                              file_, std::span(buffer_.data_, buffer_.size_),
                              offset_, tag);
-  if (!status.ok()) {
+  if (!status.ok()) [[unlikely]] {
     if (tag != this) registry_->Reject(tag, read_.lease_, read_.pin_.owns_);
     FinishTrace();
   }
@@ -475,7 +476,8 @@ bool StorageEngine::RemoteReadAwaitable::TracedReadIo::await_suspend(
 }
 
 void StorageEngine::RemoteReadAwaitable::TracedReadIo::FinishTrace() {
-  if (!trace_) return;
+  if (!trace_) [[likely]]
+    return;
   trace_->io_complete_ns_ = trace_->NowNanos();
   if (trace_->flight_wait_start_ns_) {
     trace_->RecordFlightWait(trace_->flight_wait_start_ns_,

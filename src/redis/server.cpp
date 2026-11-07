@@ -1298,7 +1298,8 @@ Task<absl::Status> WriteOrBatchReplySlow(TcpStream& stream,
     }
   }
 
-  if (online_trace) online_trace.get()->send_ns_ = LatencyMonotonicNanos();
+  if (online_trace) [[unlikely]]
+    online_trace.get()->send_ns_ = LatencyMonotonicNanos();
   TraceSpanScope send(online_trace.get(), TraceStage::kSocketSend);
   absl::Status status =
       co_await ResponseWriteAwaiter(stream.WriteAll(std::span<const std::byte>(
@@ -1919,7 +1920,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     CommandRequest request =
         BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
     request.latency_trace_ = buffered.trace_.get();
-    if (request.latency_trace_) {
+    if (request.latency_trace_) [[unlikely]] {
       BindOnlineTraceCommand(request.latency_trace_, request);
       request.latency_trace_->dispatch_ns_ = LatencyMonotonicNanos();
     }
@@ -1934,7 +1935,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       RecordCommandResult(static_cast<std::size_t>(request.kind_),
                           ctx.reply_builder_.outcome(),
                           bycorf::ReadCycleCounter() - execution_start);
-      if (request.latency_trace_)
+      if (request.latency_trace_) [[unlikely]]
         request.latency_trace_->dispatch_done_ns_ = LatencyMonotonicNanos();
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies,
@@ -1948,7 +1949,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           CommandErrorReason::kNoAuth, "NOAUTH Authentication required.");
       RecordCommandResult(CommandResultId(request),
                           ctx.reply_builder_.outcome(), 0);
-      if (request.latency_trace_)
+      if (request.latency_trace_) [[unlikely]]
         request.latency_trace_->dispatch_done_ns_ = LatencyMonotonicNanos();
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies,
@@ -1985,7 +1986,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           CommandErrorReason::kShutdown, "ERR server is shutting down");
       RecordCommandResult(CommandResultId(request),
                           ctx.reply_builder_.outcome(), 0);
-      if (request.latency_trace_)
+      if (request.latency_trace_) [[unlikely]]
         request.latency_trace_->dispatch_done_ns_ = LatencyMonotonicNanos();
       absl::Status write_status =
           co_await FlushReplyBatch(stream, &pending_replies);
@@ -2047,7 +2048,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
     // Dispatch may move a QUEUED request and deliberately clear its borrowed
     // pointer. The network batch still owns this request's completion lease.
-    if (buffered.trace_) {
+    if (buffered.trace_) [[unlikely]] {
       buffered.trace_.get()->dispatch_done_ns_ = LatencyMonotonicNanos();
       buffered.trace_.get()->queued_ =
           ctx.reply_builder_.outcome().result_ == CommandResult::kQueued;
@@ -2096,7 +2097,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         write_status = co_await FlushReplyBatch(stream, &pending_replies);
       }
       if (write_status.ok()) {
-        if (buffered.trace_)
+        if (buffered.trace_) [[unlikely]]
           buffered.trace_.get()->send_ns_ = LatencyMonotonicNanos();
         TraceSpanScope send(buffered.trace_.get(), TraceStage::kSocketSend);
         if (!reply.disk_value_.shared()) {
@@ -2120,7 +2121,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         write_status = co_await FlushReplyBatch(stream, &pending_replies);
       }
       if (write_status.ok()) {
-        if (buffered.trace_)
+        if (buffered.trace_) [[unlikely]]
           buffered.trace_.get()->send_ns_ = LatencyMonotonicNanos();
         write_status = co_await WriteReplyContinuation(
             stream, reply.encoded_, *reply.continuation_, stall,
