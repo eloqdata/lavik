@@ -669,6 +669,101 @@ TEST(GroupedSortedSetWriteE2e, EncodedPointEditsPreserveExpiryAndDemote) {
   EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
 }
 
+TEST(GroupedSortedSetWriteE2e, OversizedEndBatchSkipsConcurrentProbe) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires concurrent batch probe failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "oversized-end-batch";
+  std::map<std::string, double> expected;
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_CONCURRENT_BATCH_PROBE_KEY",
+                            key.c_str());
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    ASSERT_EQ(client.Command({"PEXPIRE", key, "600000"}).text_, "1");
+    for (const bool upper : {true, false}) {
+      std::vector<std::string> add{"ZADD", key};
+      for (unsigned i = 0; i < 2048; ++i) {
+        const auto member = DenseZSetMember((upper ? 10000 : 20000) + i);
+        const auto score = upper ? 100000.0 + i : -100000.0 - i;
+        expected[member] = score;
+        add.insert(add.end(), {std::to_string(score), member});
+      }
+      ASSERT_EQ(client.Command(add).text_, "2048");
+    }
+    // Thousands of operands for two identities do not prove page overflow.
+    std::vector<std::string> duplicates{"ZADD", key};
+    for (unsigned i = 0; i < 2048; ++i)
+      duplicates.insert(duplicates.end(), {"300000", DenseZSetMember(i % 2)});
+    EXPECT_NE(client.Command(duplicates).text_.find("batch member probe"),
+              std::string::npos);
+    // Conditional updates and exact score-boundary ties keep the normal
+    // probe path. The injected error must leave both indexes unchanged.
+    for (const auto flag : {"NX", "XX", "GT", "LT", ""}) {
+      std::vector<std::string> control{"ZADD", key};
+      if (*flag) control.push_back(flag);
+      for (unsigned i = 0; i < 2048; ++i)
+        control.insert(control.end(), {*flag ? "300000" : "102047",
+                                       DenseZSetMember(30000 + i)});
+      const auto failed = client.Command(control);
+      ASSERT_EQ(failed.kind_, '-');
+      EXPECT_NE(failed.text_.find("batch member probe"), std::string::npos);
+    }
+    ExpectDenseZSet(client, key, expected);
+    EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e, EndBatchUpdatesAndDuplicatesRecover) {
+  PrivateDisk disk;
+  const std::string key = "end-batch-semantics";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 4096; ++i) {
+      const auto member = DenseZSetMember(i);
+      expected[member] = i;
+      seed.insert(seed.end(), {std::to_string(i), member});
+    }
+    ASSERT_EQ(client.Command(seed).text_, "4096");
+    std::vector<std::string> move{"ZADD", key};
+    for (unsigned i = 0; i < 2048; ++i) {
+      const auto member = DenseZSetMember(i);
+      expected[member] = 100000 + i;
+      move.insert(move.end(), {std::to_string(100000 + i), member});
+    }
+    move.insert(move.end(), {"200000", DenseZSetMember(0)});
+    expected[DenseZSetMember(0)] = 200000;
+    ASSERT_EQ(client.Command(move).text_, "0");
+    std::vector<std::string> skipped{"ZADD", key, "NX"};
+    for (unsigned i = 0; i < 2048; ++i)
+      skipped.insert(skipped.end(), {"300000", DenseZSetMember(i)});
+    ASSERT_EQ(client.Command(skipped).text_, "0");
+    std::vector<std::string> update{"ZADD", key, "XX", "CH"};
+    for (unsigned i = 0; i < 2048; ++i) {
+      const auto member = DenseZSetMember(i % 2 ? 10000 + i : i);
+      update.insert(update.end(), {std::to_string(400000 + i), member});
+      if (i % 2 == 0) expected[member] = 400000 + i;
+    }
+    ASSERT_EQ(client.Command(update).text_, "1024");
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
 TEST(GroupedSortedSetWriteE2e, DensePointSourceAvoidsSecondPlanRead) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires ordered plan read failure injection";
