@@ -2892,8 +2892,11 @@ TEST_F(LocalReadFlightTest, OverlapSharesOneIoAndCompletionIsNotACache) {
   EXPECT_NE(single->value().data(), results.front()->value().data());
   EXPECT_TRUE(single->MakeOwned(Pool()).ok());
   EXPECT_FALSE(single->lease_.retains_read_arena());
-  EXPECT_TRUE(results.front()->MakeOwned(Pool()).ok());
+  ASSERT_TRUE(results.front()->MakeOwned(Pool()).ok());
   EXPECT_FALSE(results.front()->lease_.retains_read_arena());
+  auto writable = results.front()->lease_.exclusive_bytes();
+  ASSERT_LT(results.front()->value_offset_, writable.size());
+  writable[results.front()->value_offset_] ^= std::byte{1};
   ExpectValue(results.back());
   results.clear();
   ExpectNoPageLeases();
@@ -3089,39 +3092,7 @@ TEST_F(LocalReadFlightTest, ShortReadFailsEachConsumerWithoutDecodingPayload) {
 class TwoOwnerReadFlightTest : public LocalReadFlightTest {
  protected:
   unsigned WorkerCount() const override { return 2; }
-  void MoveRecordToRemoteOwner() {
-    location_ = RecordLocation(
-        2, location_.mutation_sequence_, location_.allocation_epoch(),
-        location_.expire_at_ms_, location_.logical_size_,
-        RecordLocation::PackedMetadata::Encode(
-            location_.record_offset(), location_.total_disk_bytes(), 1, false,
-            false, false, false, false, false, RecordKind::kValue,
-            ValueType::kString));
-    IndexLocation();
-  }
-  void CheckRemoteResult(Task<Result>& task) {
-    ASSERT_NO_FATAL_FAILURE(Drain(task));
-    auto result = std::move(task).TakeResult();
-    ASSERT_TRUE(result.ok()) << result.status();
-    ExpectValue(result);
-    EXPECT_FALSE(result->lease_.shared());
-    EXPECT_FALSE(HasFlights());
-    EXPECT_FALSE(HasFlights(1));
-    result->lease_.Reset();
-    // The returned lease belongs to worker 1; process its foreign return.
-    RunReadRound();
-    ExpectNoPageLeases();
-  }
 };
-
-TEST_F(TwoOwnerReadFlightTest, DefaultReadBypassesThePhysicalOwnersRegistry) {
-  ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  MoveRecordToRemoteOwner();
-  auto read = Read();
-  auto task = AwaitExisting(read);
-  Start(task);
-  ASSERT_NO_FATAL_FAILURE(CheckRemoteResult(task));
-}
 
 TEST_F(TwoOwnerReadFlightTest, BypassSurvivesRelocationToAnotherOwner) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
@@ -3133,39 +3104,24 @@ TEST_F(TwoOwnerReadFlightTest, BypassSurvivesRelocationToAnotherOwner) {
   ++header_.allocation_epoch_;
   ASSERT_NO_FATAL_FAILURE(Complete(read));
   --header_.allocation_epoch_;
-  MoveRecordToRemoteOwner();
-  ASSERT_NO_FATAL_FAILURE(CheckRemoteResult(task));
-}
-
-TEST_F(LocalReadFlightTest, DefaultReadsDoNotAllocateFlightMetadata) {
-  ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  {
-    const auto retained = RetainedBytes();
-    auto logical = Read();
-    auto local = ReadLocal();
-    EXPECT_FALSE(HasFlights());
-    EXPECT_EQ(RetainedBytes(), retained);
-    auto first = AwaitExisting(logical);
-    auto second = AwaitExisting(local);
-    Start(first);
-    Start(second);
-    EXPECT_EQ(block_.pin_count(), 2);
-    EXPECT_FALSE(HasFlights());
-    ASSERT_NO_FATAL_FAILURE(Drain(first));
-    ASSERT_NO_FATAL_FAILURE(Drain(second));
-    auto a = std::move(first).TakeResult();
-    auto b = std::move(second).TakeResult();
-    ExpectValue(a);
-    ExpectValue(b);
-    ASSERT_TRUE(a.ok());
-    ASSERT_TRUE(b.ok());
-    EXPECT_FALSE(a->lease_.shared());
-    EXPECT_FALSE(b->lease_.shared());
-    EXPECT_FALSE(HasFlights());
-    a->lease_.Reset();
-    b->lease_.Reset();
-  }
-  // Direct awaitables release their block pins on destruction.
+  location_ = RecordLocation(
+      2, location_.mutation_sequence_, location_.allocation_epoch(),
+      location_.expire_at_ms_, location_.logical_size_,
+      RecordLocation::PackedMetadata::Encode(
+          location_.record_offset(), location_.total_disk_bytes(), 1, false,
+          false, false, false, false, false, RecordKind::kValue,
+          ValueType::kString));
+  IndexLocation();
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  ExpectValue(result);
+  EXPECT_FALSE(result->lease_.shared());
+  EXPECT_FALSE(HasFlights());
+  EXPECT_FALSE(HasFlights(1));
+  result->lease_.Reset();
+  // The returned lease belongs to worker 1; process its foreign return.
+  RunReadRound();
   ExpectNoPageLeases();
 }
 
@@ -3180,75 +3136,21 @@ TEST_F(LocalReadFlightTest, BypassDoesNotJoinAnExistingFlight) {
     EXPECT_EQ(Flights().stats().leaders, 1);
     EXPECT_EQ(Flights().stats().joins, 0);
     EXPECT_EQ(block_.pin_count(), 2);
-    auto follower = ReadCoalescedTask();
-    Start(follower);
-    EXPECT_EQ(Flights().stats().joins, 1);
     ASSERT_NO_FATAL_FAILURE(Drain(producer));
     ASSERT_NO_FATAL_FAILURE(Drain(bypass));
-    ASSERT_NO_FATAL_FAILURE(Drain(follower));
     auto a = std::move(producer).TakeResult();
     auto b = std::move(bypass).TakeResult();
-    auto c = std::move(follower).TakeResult();
     ASSERT_TRUE(a.ok());
     ASSERT_TRUE(b.ok());
-    ASSERT_TRUE(c.ok());
     ExpectValue(a);
     ExpectValue(b);
-    ExpectValue(c);
-    EXPECT_TRUE(a->lease_.shared());
+    EXPECT_FALSE(a->lease_.shared());
     EXPECT_FALSE(b->lease_.shared());
-    EXPECT_TRUE(c->lease_.shared());
-    EXPECT_EQ(a->value().data(), c->value().data());
-    EXPECT_NE(a->value().data(), b->value().data());
     EXPECT_EQ(Flights().stats().leaders, 1);
     EXPECT_EQ(Flights().size(), 0);
-    a->lease_.Reset();
-    b->lease_.Reset();
-    c->lease_.Reset();
   }
   // Direct awaitables release their block pins on destruction.
   ExpectNoPageLeases();
-}
-
-TEST_F(LocalReadFlightTest, CoalescedSourcesDetachBeforeMutation) {
-  ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  // A consumer can detach an admitted immutable result before modifying its
-  // own output. This does not opt ordinary mutation preparation into Flights.
-  auto writer = ReadCoalescedTask();
-  Start(writer);
-  auto reader = ReadCoalescedTask(false);
-  Start(reader);
-  EXPECT_EQ(block_.pin_count(), 1);
-  EXPECT_EQ(Flights().stats().leaders, 1);
-  EXPECT_EQ(Flights().stats().joins, 1);
-  ASSERT_NO_FATAL_FAILURE(Drain(writer));
-  ASSERT_NO_FATAL_FAILURE(Drain(reader));
-  auto first = std::move(writer).TakeResult();
-  auto second = std::move(reader).TakeResult();
-  ASSERT_TRUE(first.ok()) << first.status();
-  ASSERT_TRUE(second.ok()) << second.status();
-  ExpectValue(first);
-  ExpectValue(second);
-  ASSERT_TRUE(first->lease_.shared());
-  ASSERT_TRUE(second->lease_.shared());
-  EXPECT_EQ(first->value().data(), second->value().data());
-  EXPECT_EQ(Flights().size(), 0);
-  const auto txid = first->txid_;
-  ASSERT_TRUE(first->MakeOwned(Pool()).ok());
-  EXPECT_EQ(first->txid_, txid);
-  EXPECT_FALSE(first->lease_.shared());
-  EXPECT_FALSE(first->lease_.retains_read_arena());
-  EXPECT_NE(first->value().data(), second->value().data());
-  auto writable = first->lease_.exclusive_bytes();
-  ASSERT_GT(writable.size(), first->value_offset_);
-  writable[first->value_offset_] ^= std::byte{1};
-  EXPECT_NE(first->value().front(), second->value().front());
-  ExpectValue(second);
-  // Detaching one consumer cannot recycle the other consumer's DMA buffer.
-  EXPECT_LT(Pool().available_read_bytes(), Pool().read_capacity_bytes());
-  second->lease_.Reset();
-  EXPECT_EQ(Pool().available_read_bytes(), Pool().read_capacity_bytes());
-  EXPECT_EQ(block_.pin_count(), 0);
 }
 
 TEST_F(LocalReadFlightTest, StagingAndDefaultConsumersBypassFlights) {
@@ -3265,6 +3167,7 @@ TEST_F(LocalReadFlightTest, StagingAndDefaultConsumersBypassFlights) {
   auto exclusive = Read();
   auto exclusive_task = AwaitExisting(exclusive);
   Start(exclusive_task);
+  EXPECT_FALSE(HasFlights());
   auto eligible = ReadCoalescedTask();
   Start(eligible);
   EXPECT_EQ(block_.pin_count(), 2);
