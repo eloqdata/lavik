@@ -145,6 +145,77 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   bool HasFlights(unsigned owner = 0) {
     return storage_.impl_->stores_[owner]->read_flights_ != nullptr;
   }
+  ReadFlightStats FlightStats(unsigned owner) {
+    auto* registry = storage_.impl_->stores_[owner]->read_flights_.get();
+    return registry ? registry->stats() : ReadFlightStats{};
+  }
+  auto ReadHashPayload(std::size_t page, GroupedObject::Handle view = nullptr,
+                       bool group_locked = false, bool pinned = false) {
+    const auto& header = grouped_headers_[page];
+    return storage_.impl_->LoadHashGroupPayload(
+        Store(), Store().partitions_[0], 0, key_, digest_,
+        view ? std::move(view) : grouped_,
+        {header.group_prefix_, header.group_prefix_bits_}, pinned,
+        group_locked);
+  }
+  auto ReadZsetPayload(std::uint64_t page) {
+    return storage_.impl_->LoadSortedSetPage(Store(), Store().partitions_[0], 0,
+                                             key_, digest_, grouped_, page);
+  }
+  void PublishNewRootSequence() {
+    auto version = grouped_->version();
+    ++version.root_.mutation_sequence_;
+    auto next = GroupedObject::PrepareMetadataUpdate(grouped_, version);
+    ASSERT_TRUE(next.ok()) << next.status();
+    ASSERT_TRUE(GroupedObject::FinalizeRoot(*next, version).ok());
+    location_ = version.root_;
+    PublishGroupedCollection(std::move(*next));
+  }
+  absl::StatusOr<GroupedObject::Handle> DifferentHashIncarnation() {
+    auto root = grouped_->directory().root();
+    ++root.incarnation_;
+    std::vector<RecoveredGroupedRecord> records;
+    std::vector<GroupedRecordLocation> locations;
+    for (const auto& [prefix, old] : grouped_->directory().groups()) {
+      auto record = old;
+      record.incarnation_ = root.incarnation_;
+      records.push_back(record);
+      locations.push_back(
+          {.id_ = record.id_,
+           .location_ = storage_.impl_->MaterializeIndexLocation(
+               *grouped_->FindGroup(record.id_))});
+    }
+    auto directory = HashGroupDirectory::Recover(
+        root, grouped_->directory().command_sequence(), records, {});
+    if (!directory.ok()) return directory.status();
+    return GroupedObject::Create(grouped_->version(), std::move(*directory),
+                                 locations);
+  }
+  void HoldGraphPins(bool hold) {
+    for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+      auto& worker = owner == 0 ? worker_ : remote_worker_;
+      bycorf::SetThisWorker(owner, &cross_core_, &worker);
+      if (hold)
+        blocks_[owner].PinLocal();
+      else
+        storage_.impl_->UnpinBlock(*storage_.impl_->stores_[owner],
+                                   blocks_[owner], owner + 1);
+    }
+    bycorf::SetThisWorker(0, &cross_core_, &worker_);
+  }
+  void WarmFlightMetadata() {
+    // Existing fixtures measure per-read scratch against steady worker-local
+    // metadata. Cold admission/failure is covered by the registry/local tests.
+    for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+      auto& worker = owner == 0 ? worker_ : remote_worker_;
+      bycorf::SetThisWorker(owner, &cross_core_, &worker);
+      ASSERT_NE(storage_.impl_->ReadFlights(*storage_.impl_->stores_[owner]),
+                nullptr);
+      auto reservation = Pool(owner).TryReserveSharedRead(12 * kKiB);
+    }
+    bycorf::SetThisWorker(0, &cross_core_, &worker_);
+  }
+
   void ChangePopulation() { ++Store().partitions_[0].replication_epoch_; }
   auto ReadLocal() {
     return storage_.impl_->LoadValueLocal(Store(), 0, key_, location_, 1);
@@ -956,6 +1027,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     // Keep the graph and its locations unchanged while evicting its staging
     // image. Every subsequent page must acquire a slot and complete real I/O.
     block_.in_memory_ = false;
+    WarmFlightMetadata();
   }
   ExtentRef ExtentReference(bool no_crc = false, unsigned owner = 0) {
     return {owner + 1, 7, static_cast<std::uint32_t>(value_.size()),
@@ -3182,5 +3254,168 @@ TEST_F(LocalReadFlightTest, StagingAndDefaultConsumersBypassFlights) {
   EXPECT_FALSE(first->lease_.shared());
   EXPECT_FALSE(second->lease_.shared());
 }
+
+}  // namespace lavik::storage
+
+namespace lavik::storage {
+
+class GroupPageFlightTest : public LoadValueAwaitableTestPeer,
+                            public testing::WithParamInterface<unsigned> {
+ protected:
+  std::size_t ReadBufferCount() const override { return 32; }
+  unsigned WorkerCount() const override { return 2; }
+  void SubmitRemote() {
+    // Drain posted task bridges, then submit, without polling their read CQEs.
+    bycorf::SetThisWorker(1, &cross_core_, &remote_worker_);
+    remote_worker_.RunOnce(false);
+    bycorf::SetThisWorker(0, &cross_core_, &worker_);
+  }
+  void DrainReturns() {
+    for (unsigned i = 0; i != 3; ++i) RunReadRound();
+  }
+};
+
+TEST_P(GroupPageFlightTest, HashPayloadIsSharedAtItsPhysicalOwner) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(ValueType::kHash));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  const unsigned owner = GetParam();
+  auto first = ReadHashPayload(owner);
+  auto second = ReadHashPayload(owner);
+  Start(first);
+  Start(second);
+  if (owner) SubmitRemote();
+  EXPECT_EQ(FlightStats(owner).leaders, 1);
+  EXPECT_EQ(FlightStats(owner).joins, 1);
+  EXPECT_EQ(FlightStats(1 - owner).leaders, 0);
+  EXPECT_EQ(blocks_[owner].pin_count(), 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  auto a = std::move(first).TakeResult();
+  auto b = std::move(second).TakeResult();
+  ASSERT_TRUE(a.ok()) << a.status();
+  ASSERT_TRUE(b.ok()) << b.status();
+  EXPECT_TRUE(a->loaded_.lease_.shared());
+  EXPECT_EQ(a->loaded_.value().data(), b->loaded_.value().data());
+  EXPECT_EQ(
+      std::string_view(reinterpret_cast<const char*>(a->loaded_.value().data()),
+                       a->loaded_.value().size()),
+      grouped_payloads_[owner]);
+  a->loaded_.lease_.Reset();
+  if (owner) EXPECT_GT(Pool(owner).shared_read_bytes(), 0);
+  b->loaded_.lease_.Reset();
+  DrainReturns();
+  EXPECT_EQ(Pool(owner).shared_read_bytes(), 0);
+  ExpectNoPageLeases();
+}
+
+TEST_P(GroupPageFlightTest,
+       OrderedPageKeepsSeparateDecodedViewsAndSharedBytes) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset(4));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  const unsigned owner = GetParam();
+  auto first = ReadZsetPayload(owner + 1);
+  auto second = ReadZsetPayload(owner + 1);
+  Start(first);
+  Start(second);
+  if (owner) SubmitRemote();
+  EXPECT_EQ(FlightStats(owner).leaders, 1);
+  EXPECT_EQ(FlightStats(owner).joins, 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  auto a = std::move(first).TakeResult();
+  auto b = std::move(second).TakeResult();
+  ASSERT_TRUE(a.ok()) << a.status();
+  ASSERT_TRUE(b.ok()) << b.status();
+  EXPECT_TRUE(a->loaded_.lease_.shared());
+  EXPECT_EQ(a->loaded_.value().data(), b->loaded_.value().data());
+  EXPECT_NE(a->entries_.data(), b->entries_.data());
+  EXPECT_EQ(a->entries_.size(), b->entries_.size());
+  a->loaded_.lease_.Reset();
+  b->loaded_.lease_.Reset();
+  DrainReturns();
+  ExpectNoPageLeases();
+}
+
+TEST_P(GroupPageFlightTest, UnrelatedRootSequenceDoesNotSplitAnUnchangedGroup) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(ValueType::kHash));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  const unsigned owner = GetParam();
+  auto old = grouped_;
+  auto first = ReadHashPayload(owner, old, true);
+  Start(first);
+  // Simulate a publication under a disjoint group hold. The target leaf's
+  // mutation and physical identity remain unchanged, as required by IS/IX.
+  ASSERT_NO_FATAL_FAILURE(PublishNewRootSequence());
+  EXPECT_NE(old->version().root_.mutation_sequence_,
+            grouped_->version().root_.mutation_sequence_);
+  auto second = ReadHashPayload(owner, grouped_, true);
+  Start(second);
+  if (owner) SubmitRemote();
+  EXPECT_EQ(FlightStats(owner).leaders, 1);
+  EXPECT_EQ(FlightStats(owner).joins, 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  auto a = std::move(first).TakeResult();
+  auto b = std::move(second).TakeResult();
+  ASSERT_TRUE(a.ok()) << a.status();
+  ASSERT_TRUE(b.ok()) << b.status();
+  EXPECT_EQ(a->loaded_.value().data(), b->loaded_.value().data());
+  a->loaded_.lease_.Reset();
+  b->loaded_.lease_.Reset();
+  DrainReturns();
+  ExpectNoPageLeases();
+}
+
+TEST_P(GroupPageFlightTest, SharedBytesStillValidateEachGraphEnvelope) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(ValueType::kHash));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto mismatched = DifferentHashIncarnation();
+  ASSERT_TRUE(mismatched.ok()) << mismatched.status();
+  // Snapshot loading skips the current root lookup only while its caller
+  // retains physical graph pins. Give the second consumer an inconsistent
+  // snapshot envelope over the same bytes to exercise post-delivery checking.
+  HoldGraphPins(true);
+  absl::Cleanup unpin = [&] { HoldGraphPins(false); };
+  const unsigned owner = GetParam();
+  auto first = ReadHashPayload(owner);
+  auto second = ReadHashPayload(owner, *mismatched, false, true);
+  Start(first);
+  Start(second);
+  if (owner) SubmitRemote();
+  EXPECT_EQ(FlightStats(owner).leaders, 1);
+  EXPECT_EQ(FlightStats(owner).joins, 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  auto a = std::move(first).TakeResult();
+  auto b = std::move(second).TakeResult();
+  ASSERT_TRUE(a.ok()) << a.status();
+  EXPECT_TRUE(absl::IsDataLoss(b.status())) << b.status();
+  EXPECT_EQ(b.status().message(), "Hash group physical identity mismatch");
+  a->loaded_.lease_.Reset();
+  DrainReturns();
+  EXPECT_EQ(Pool(owner).shared_read_bytes(), 0);
+}
+
+TEST_P(GroupPageFlightTest, PopulationChangeRejectsEveryGroupConsumer) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(ValueType::kSet));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  const unsigned owner = GetParam();
+  auto first = ReadHashPayload(owner);
+  auto second = ReadHashPayload(owner);
+  Start(first);
+  Start(second);
+  if (owner) SubmitRemote();
+  EXPECT_EQ(FlightStats(owner).joins, 1);
+  ChangePopulation();
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  EXPECT_TRUE(absl::IsNotFound(std::move(first).TakeResult().status()));
+  EXPECT_TRUE(absl::IsNotFound(std::move(second).TakeResult().status()));
+  DrainReturns();
+  ExpectNoPageLeases();
+}
+
+INSTANTIATE_TEST_SUITE_P(KeyAndBlockOwner, GroupPageFlightTest,
+                         testing::Values(0u, 1u));
 
 }  // namespace lavik::storage
