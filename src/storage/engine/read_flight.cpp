@@ -133,7 +133,7 @@ bool ReadFlightRegistry::TryJoin(const ReadFlightKey& key, std::size_t hash,
     return Join(**found, waiter);
   }
   waiter.miss_epoch_ = stats_.leaders;
-  waiter.known_missing_ = miss_stamps_valid_;
+  waiter.known_missing_ = true;
   return false;
 }
 
@@ -145,8 +145,9 @@ ReadFlightRegistry::Admission ReadFlightRegistry::Start(
   // only erase entries. This avoids a redundant lookup for immediate awaiting,
   // while retained requests recheck after any intervening publication. Never
   // retain a table iterator across acquisition or a possible suspension.
-  if (!waiter.known_missing_ || !miss_stamps_valid_ ||
-      waiter.miss_epoch_ != stats_.leaders) {
+  // A retained miss must not span a full 2^64 producer-insertion cycle.
+  // Ordinary unsigned wrap needs only equality and keeps this shortcut valid.
+  if (!waiter.known_missing_ || waiter.miss_epoch_ != stats_.leaders) {
     if (auto found = map_.find(Lookup{key, hash}); found != map_.end()) {
       return {Join(**found, waiter) ? Outcome::kJoined : Outcome::kBypass};
     }
@@ -168,7 +169,7 @@ ReadFlightRegistry::Admission ReadFlightRegistry::Start(
   flight->lease = std::move(lease);
   flight->owns_pin = std::exchange(owns_pin, false);
   Attach(*flight, waiter);
-  if (++stats_.leaders == 0) miss_stamps_valid_ = false;
+  ++stats_.leaders;
   return {Outcome::kStarted, flight};
 }
 

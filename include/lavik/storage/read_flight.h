@@ -177,9 +177,6 @@ class ReadFlightRegistry {
   Allocations allocations_;
   Map map_;
   ReadFlightStats stats_;
-  // leaders doubles as an insertion epoch. After its theoretical wrap, miss
-  // shortcuts stay disabled permanently so an old retained awaitable is safe.
-  bool miss_stamps_valid_ = true;
   bool finalized_ = false;
 };
 

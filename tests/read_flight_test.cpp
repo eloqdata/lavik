@@ -357,27 +357,36 @@ TEST_F(ReadFlightTest, CancellationUnlinksMiddleHeadAndProducerIndependently) {
   EXPECT_EQ(pins_.normal, 1);
 }
 
-TEST_F(ReadFlightTest, InsertionCounterWrapCannotReviveAnOldMiss) {
+TEST_F(ReadFlightTest, InsertionCounterWrapRechecksDelayedMisses) {
   auto registry = Registry();
   ASSERT_TRUE(registry);
-  Waiter delayed, leader;
-  EXPECT_FALSE(registry->TryJoin({}, 42, delayed));
-  // Simulate the theoretical lifetime wrap without changing insertion logic.
-  const_cast<ReadFlightStats&>(registry->stats()).leaders =
-      std::numeric_limits<std::uint64_t>::max();
-  auto buffer = Buffer();
-  bool pin = true;
-  auto producer = registry->Start({}, 42, buffer, pin, leader);
-  ASSERT_NE(producer.tag, nullptr);
-  EXPECT_EQ(registry->stats().leaders, 0);
-  auto redundant = Buffer();
-  bool redundant_pin = true;
-  auto joined = registry->Start({}, 42, redundant, redundant_pin, delayed);
-  ASSERT_EQ(joined.outcome, ReadFlightRegistry::Outcome::kJoined);
-  redundant.Reset();
-  producer.tag->Complete(worker_, 4096, 0);
-  EXPECT_EQ(leader.calls, 1);
-  EXPECT_EQ(delayed.calls, 1);
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  const_cast<ReadFlightStats&>(registry->stats()).leaders = maximum - 1;
+  // Exercise fresh misses and delayed submissions before, across and after
+  // wrap. A waiter surviving an entire counter cycle is outside the contract.
+  for (const auto expected : {maximum, std::uint64_t{0}, std::uint64_t{1}}) {
+    Waiter delayed, leader;
+    EXPECT_FALSE(registry->TryJoin({}, 42, delayed));
+    EXPECT_FALSE(registry->TryJoin({}, 42, leader));
+    auto buffer = Buffer();
+    bool pin = true;
+    auto producer = registry->Start({}, 42, buffer, pin, leader);
+    ASSERT_EQ(producer.outcome, ReadFlightRegistry::Outcome::kStarted);
+    ASSERT_NE(producer.tag, nullptr);
+    EXPECT_EQ(registry->stats().leaders, expected);
+    auto redundant = Buffer();
+    bool redundant_pin = true;
+    auto joined = registry->Start({}, 42, redundant, redundant_pin, delayed);
+    ASSERT_EQ(joined.outcome, ReadFlightRegistry::Outcome::kJoined);
+    EXPECT_EQ(registry->size(), 1);
+    EXPECT_TRUE(redundant.valid());
+    EXPECT_TRUE(redundant_pin);
+    redundant.Reset();
+    producer.tag->Complete(worker_, 4096, 0);
+    EXPECT_EQ(leader.calls, 1);
+    EXPECT_EQ(delayed.calls, 1);
+    EXPECT_EQ(registry->size(), 0);
+  }
 }
 
 TEST_F(ReadFlightTest, OptionalMetadataAdmissionFailureBypasses) {
