@@ -43,6 +43,7 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "bycorf/net/server.h"
+#include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/task.h"
 #include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
@@ -56,6 +57,20 @@ class SharedReadBufferTestPeer {
   }
   static void Return(RegisteredBufferPool& pool, std::uint64_t ticket) {
     pool.ReleaseSharedReadLocal(ticket);
+  }
+  static constexpr std::size_t Slots() {
+    return RegisteredBufferPool::kSharedReadSlots;
+  }
+  static constexpr std::uint64_t LastGeneration() {
+    return RegisteredBufferPool::kSharedGenerationMax;
+  }
+  static void ArmGenerationWrap(RegisteredBufferPool& pool) {
+    ASSERT_NE(pool.shared_reads_, nullptr);
+    for (unsigned i = 0; i < Slots(); ++i) {
+      auto& state = pool.shared_reads_[i];
+      ASSERT_FALSE(state.active_);
+      state.generation_ = LastGeneration() - 1;
+    }
   }
 };
 namespace {
@@ -1032,6 +1047,104 @@ TEST_F(BufferPoolMemlockTest, SharedReadTicketsRetireOnlyOnOwnerAndFenceReuse) {
   EXPECT_EQ(pool_->shared_read_bytes(), bytes);
   reused.Reset();
   EXPECT_EQ(pool_->available_read_bytes(), capacity);
+}
+
+TEST_F(BufferPoolMemlockTest, SharedReadGenerationWrapPreservesEverySlot) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  auto initialize = pool_->TryReserveSharedRead(1);
+  ASSERT_TRUE(initialize.valid());
+  initialize.Reset();
+  ASSERT_NO_FATAL_FAILURE(SharedReadBufferTestPeer::ArmGenerationWrap(*pool_));
+
+  // Reserve all metadata slots at the last generation, then across zero and
+  // again after wrapping. Cancellation must never reduce the pool's capacity.
+  for (unsigned cycle = 0; cycle < 3; ++cycle) {
+    std::vector<SharedReadReservation> reservations;
+    for (std::size_t i = 0; i < SharedReadBufferTestPeer::Slots(); ++i) {
+      auto reservation = pool_->TryReserveSharedRead(1);
+      ASSERT_TRUE(reservation.valid()) << "cycle=" << cycle << " slot=" << i;
+      reservations.push_back(std::move(reservation));
+    }
+    EXPECT_FALSE(pool_->TryReserveSharedRead(1).valid());
+    EXPECT_EQ(pool_->shared_read_bytes(), reservations.size());
+    reservations.clear();
+    EXPECT_EQ(pool_->shared_read_bytes(), 0);
+  }
+}
+
+TEST_F(BufferPoolMemlockTest, SharedReadGenerationWrapFencesForeignReturns) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0, 2));
+  const auto capacity = pool_->available_read_bytes();
+  auto initialize = pool_->TryReserveSharedRead(1);
+  ASSERT_TRUE(initialize.valid());
+  initialize.Reset();
+  ASSERT_NO_FATAL_FAILURE(SharedReadBufferTestPeer::ArmGenerationWrap(*pool_));
+
+  auto lease = pool_->TryAcquireReadBuffer(4096);
+  ASSERT_TRUE(lease.ok());
+  const auto bytes = lease->bytes().size();
+  auto reservation = pool_->TryReserveSharedRead(bytes);
+  ASSERT_TRUE(reservation.valid());
+  auto first = std::move(reservation).Publish(std::move(*lease));
+  const auto old_ticket = SharedReadBufferTestPeer::Ticket(first);
+  ASSERT_EQ(old_ticket >> 15, SharedReadBufferTestPeer::LastGeneration());
+  auto foreign = first.CloneOnOwner();
+  ASSERT_TRUE(foreign.has_value());
+  first.Reset();
+  bycorf::SetThisWorker(1, cross_core_.get(), nullptr);
+  foreign->Reset();
+  bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
+  EXPECT_EQ(pool_->shared_read_bytes(), bytes);
+  EXPECT_EQ(pool_->available_read_bytes(), capacity - bytes);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pool_->shared_read_bytes() &&
+         std::chrono::steady_clock::now() < deadline)
+    worker_->RunOnce(false);
+  ASSERT_EQ(pool_->shared_read_bytes(), 0);
+
+  // The returned slot is reused at zero, then one. Returns from either side
+  // of the boundary must not release the next incarnation's consumer zero.
+  auto stale = old_ticket;
+  for (std::uint64_t generation : {0, 1}) {
+    lease = pool_->TryAcquireReadBuffer(4096);
+    ASSERT_TRUE(lease.ok());
+    reservation = pool_->TryReserveSharedRead(bytes);
+    ASSERT_TRUE(reservation.valid());
+    auto current = std::move(reservation).Publish(std::move(*lease));
+    const auto ticket = SharedReadBufferTestPeer::Ticket(current);
+    const auto slot_mask = SharedReadBufferTestPeer::Slots() - 1;
+    EXPECT_EQ((ticket >> 5) & slot_mask, (old_ticket >> 5) & slot_mask);
+    EXPECT_EQ(ticket >> 15, generation);
+    struct ReturnContext {
+      RegisteredBufferPool* pool;
+      bool delivered = false;
+    } returned{pool_.get()};
+    bycorf::SetThisWorker(1, cross_core_.get(), nullptr);
+    bycorf::PostNotification(
+        cross_core_.get(), 0,
+        {&returned, stale, [](void* context, std::uint64_t ticket) noexcept {
+           auto& returned = *static_cast<ReturnContext*>(context);
+           SharedReadBufferTestPeer::Return(*returned.pool, ticket);
+           returned.delivered = true;
+         }});
+    bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
+    while (!returned.delivered && std::chrono::steady_clock::now() < deadline)
+      worker_->RunOnce(false);
+    ASSERT_TRUE(returned.delivered);
+    EXPECT_EQ(pool_->shared_read_bytes(), bytes);
+    EXPECT_EQ(pool_->available_read_bytes(), capacity - bytes);
+    auto last = current.CloneOnOwner();
+    ASSERT_TRUE(last.has_value());
+    current.Reset();
+    EXPECT_EQ(pool_->shared_read_bytes(), bytes);
+    last->Reset();
+    EXPECT_EQ(pool_->shared_read_bytes(), 0);
+    EXPECT_EQ(pool_->available_read_bytes(), capacity);
+    stale = ticket;
+  }
 }
 
 TEST_F(BufferPoolMemlockTest, SharedReadQuotaAndConsumerLimitAreBounded) {

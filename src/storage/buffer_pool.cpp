@@ -219,8 +219,12 @@ SharedReadReservation RegisteredBufferPool::TryReserveSharedRead(
   const auto slot = shared_free_;
   auto& state = shared_reads_[slot];
   shared_free_ = state.next_free_;
-  assert(!state.active_ && state.generation_ < kSharedGenerationMax);
-  ++state.generation_;
+  assert(!state.active_);
+  // Keep all slots reusable: generation is a wrapping 48-bit ticket field,
+  // not a lifetime allocation limit. Matching needs equality, not serial-number
+  // ordering. As with any finite tag, a stale ticket must not survive a full
+  // 2^48 reuse cycle of this slot; that complete-cycle ABA is not detected.
+  state.generation_ = (state.generation_ + 1) & kSharedGenerationMax;
   state.active_ = true;
   state.reserved_bytes_ = bytes;
   state.live_consumers_ = 0;
@@ -248,12 +252,11 @@ void RegisteredBufferPool::RetireSharedRead(SharedReadState& state,
   state.reserved_bytes_ = 0;
   state.active_ = false;
   state.lease_.Reset();
-  // Never recycle a wrapped generation: even a delayed duplicate ticket must
-  // remain unable to release a different incarnation of the slot.
-  if (state.generation_ != kSharedGenerationMax) {
-    state.next_free_ = shared_free_;
-    shared_free_ = slot;
-  }
+  // A foreign return keeps its consumer bit live until this owner processes
+  // it. Recycle only after the final return (or an unpublished reservation's
+  // cancellation), including when the next allocation wraps the generation.
+  state.next_free_ = shared_free_;
+  shared_free_ = slot;
 }
 
 void RegisteredBufferPool::CancelSharedRead(std::uint64_t ticket) noexcept {

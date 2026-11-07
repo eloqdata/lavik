@@ -796,6 +796,10 @@ the same physical bytes, with separate GET headers and tails. Shared retained
 bytes have a worker-local limit that lasts through the final consumer's return,
 including socket backpressure. Only the buffer owner changes reference state;
 foreign consumers send generation-fenced return tickets to that owner.
+An in-transit return retains its consumer reference until the owner handles it.
+Slots are reused after their final return, with wrapping 48-bit generations
+matched by equality; stale tickets are assumed not to survive a complete
+generation cycle of the same slot.
 Collection handlers share their compact evaluation and reply logic with owner
 reads, retaining owned results through reply streaming. Command parsing precedes
 consumption of any captured read error. No borrowed index entry survives
