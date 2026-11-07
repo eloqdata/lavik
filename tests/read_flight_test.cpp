@@ -10,6 +10,8 @@
 #include <array>
 #include <functional>
 #include <limits>
+#include <random>
+#include <vector>
 
 #include "absl/cleanup/cleanup.h"
 #include "bycorf/runtime/worker.h"
@@ -54,7 +56,7 @@ class ReadFlightTest : public testing::Test {
     ASSERT_TRUE(worker_.Init({.recv_buffer_count_ = 0}).ok());
     RegisteredBufferPoolOptions options;
     options.storage_write_buffer_count_ = 2;
-    options.registered_bytes_ = 20 * kMiB;
+    options.registered_bytes_ = 32 * kMiB;
     ASSERT_TRUE(pool_.Init(worker_, options).ok());
   }
   void TearDown() override {
@@ -240,6 +242,48 @@ TEST_F(ReadFlightTest, CompleteRetiresBeforeReentryAndChurnAllocatesNothing) {
   }
   EXPECT_EQ(registry->map_allocations(), allocations);
   EXPECT_EQ(registry->size(), 0);
+}
+
+TEST_F(ReadFlightTest, SustainedCapacityChurnKeepsTableAllocationBounded) {
+  for (const std::size_t capacity :
+       {7, 14, 25, 49, 99, 199, 399, 801, 802, 850, 1024}) {
+    SCOPED_TRACE(capacity);
+    auto registry = Registry(capacity);
+    ASSERT_TRUE(registry);
+    const auto allocations = registry->map_allocations();
+    struct Pending {
+      std::unique_ptr<Waiter> waiter;
+      bycorf::IoCompletion* tag = nullptr;
+    };
+    std::vector<Pending> pending(capacity);
+    std::mt19937_64 random(12345);
+    for (std::uint64_t sequence = 0; sequence != capacity + 20000; ++sequence) {
+      auto& slot = pending[sequence % capacity];
+      if (slot.tag) slot.tag->Complete(worker_, -EIO, 0);
+      slot.waiter = std::make_unique<Waiter>();
+      auto buffer = Buffer();
+      bool pin = true;
+      // Keep low bits equal so a direct-index front, if present, still sends
+      // the sustained collision population through the Swiss table.
+      const auto hash = random() & ~std::size_t{4095};
+      auto admission = registry->Start(ReadFlightKey{.block = sequence}, hash,
+                                       buffer, pin, *slot.waiter);
+      ASSERT_EQ(admission.outcome, ReadFlightRegistry::Outcome::kStarted);
+      slot.tag = admission.tag;
+      EXPECT_FALSE(pin);
+      EXPECT_FALSE(buffer.valid());
+    }
+    EXPECT_EQ(registry->size(), capacity);
+    // Sanitizer iterator checks deliberately reallocate even sparse tables.
+    // Production admission must reuse its initial allocation under churn.
+    if constexpr (!absl::container_internal::SwisstableGenerationsEnabled()) {
+      EXPECT_EQ(registry->map_allocations(), allocations);
+    }
+    for (auto& slot : pending) slot.tag->Complete(worker_, -EIO, 0);
+    pending.clear();
+    EXPECT_EQ(registry->size(), 0);
+    EXPECT_EQ(pool_.available_read_bytes(), pool_.read_capacity_bytes());
+  }
 }
 
 TEST_F(ReadFlightTest, SameIdentityOnDifferentWorkersHasIndependentProducer) {

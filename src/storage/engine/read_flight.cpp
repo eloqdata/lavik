@@ -5,6 +5,7 @@
 #include "lavik/storage/read_flight.h"
 
 #include <array>
+#include <bit>
 #include <cassert>
 #include <new>
 
@@ -58,7 +59,13 @@ ReadFlightRegistry::ReadFlightRegistry(bycorf::Worker& worker,
       capacity_(capacity),
       flights_(std::make_unique<ReadFlight[]>(capacity)),
       map_(0, Hash{}, Equal{}, Allocator<ReadFlight*>(&allocations_)) {
-  map_.reserve(capacity);
+  // reserve(n) alone only covers the initial inserts. At high occupancy,
+  // tombstone churn can make the pinned Abseil grow instead of rehash in place
+  // (its cutoff is 25/32 of bucket capacity). Rounding the live-flight limit
+  // up to a power of two keeps larger tables at most about half full. The
+  // default 1024-flight registry already has this headroom. Sanitizer iterator
+  // instrumentation may still deliberately reallocate to detect stale uses.
+  map_.reserve(std::bit_ceil(capacity));
   for (std::size_t i = 0; i < capacity; ++i) {
     flights_[i].registry = this;
     flights_[i].next_free = free_;

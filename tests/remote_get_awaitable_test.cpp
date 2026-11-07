@@ -238,9 +238,6 @@ class RemoteGetTestPeer : public testing::Test {
     read.key_ = key;
   }
   std::size_t ReadBytes(Awaitable& read) { return read.read_bytes_; }
-  void RejectFlight(bycorf::IoCompletion* tag, Awaitable& read) {
-    Flights().Reject(tag, read.lease_, read.pin_.owns_);
-  }
 
   void Invalidate(unsigned which) {
     auto& engine = *storage_.impl_;
@@ -734,10 +731,15 @@ TEST_F(RemoteFlightTest, RegistryMemoryAdmissionFailureKeepsExclusiveRead) {
 
 TEST_F(RemoteFlightTest, SynchronousRejectionRestoresOriginalOwnership) {
   auto leader = NewRead();
-  auto* tag = StartFlight(*leader);
-  ASSERT_NE(tag, nullptr);
-  EXPECT_FALSE(HasBuffer(*leader));
-  RejectFlight(tag, *leader);
+  ASSERT_FALSE(leader->await_ready());
+  // Shutdown without RequestStop leaves registry admission open, but makes
+  // the real backend reject submission synchronously. Exercise the production
+  // await_suspend rollback rather than calling the registry's Reject directly.
+  worker_.Shutdown();
+  ASSERT_FALSE(worker_.stop_requested());
+  EXPECT_FALSE(leader->await_suspend(std::noop_coroutine()));
+  EXPECT_EQ(Flights().stats().leaders, 1);
+  EXPECT_EQ(Flights().stats().rejected, 1);
   EXPECT_TRUE(HasBuffer(*leader));
   EXPECT_EQ(Flights().size(), 0);
   EXPECT_EQ(block_.pin_count(), 1);
