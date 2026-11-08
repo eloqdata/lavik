@@ -1052,6 +1052,11 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   if (!affinity.ok()) {
     return affinity;
   }
+  for (const auto& allocator : device_allocators_) {
+    absl::Status zero_header =
+        stores_[allocator->owner_]->zero_header_.Init(allocator->owner_);
+    if (!zero_header.ok()) return zero_header;
+  }
   // Metadata probing is complete. Return its temporary controller qpairs so
   // a controller advertising exactly worker_count queues can still start.
   bycorf::ReleaseSpdkStorageMetadataQpairs();
@@ -1189,6 +1194,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     if (allocator->owner_ == worker.id())
       device_buffers.push_back(allocator->metadata_write_buffer_);
   }
+  if (store.zero_header_.initialized())
+    device_buffers.push_back(store.zero_header_.io_buffer());
   absl::Status status =
       store.buffers_.Init(worker, options_.buffers_, device_buffers);
   if (status.ok()) {
@@ -1197,6 +1204,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       if (allocator->owner_ == worker.id())
         allocator->metadata_write_buffer_ = device_buffers[index++];
     }
+    if (store.zero_header_.initialized())
+      store.zero_header_.SetRegisteredIndex(device_buffers[index].index_);
   }
   if (status.ok()) {
     status = worker.RegisterFixedFiles(

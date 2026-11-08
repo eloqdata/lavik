@@ -33,6 +33,36 @@ bool EpochIoFails(std::string_view kind, std::size_t device_index) {
 }  // namespace
 #endif
 
+ZeroHeaderBuffer::~ZeroHeaderBuffer() {
+  if (data_ != nullptr) {
+    bycorf::FreeStorageBuffer(const_cast<std::byte*>(data_),
+                              kDirectIoAlignment);
+  }
+}
+
+absl::Status ZeroHeaderBuffer::Init(bycorf::WorkerId owner) {
+  if (initialized()) return absl::OkStatus();
+  bool fail = false;
+  LAVIK_FAULT_INJECT(if (const char* worker = std::getenv(
+                             "LAVIK_FAIL_ZERO_HEADER_BUFFER_ALLOCATION")) {
+    fail = std::string_view(worker) == std::to_string(owner);
+  });
+  auto* data = fail ? nullptr
+                    : static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
+                          kBlockHeaderBytes, kDirectIoAlignment));
+  if (data == nullptr) {
+    return absl::ResourceExhaustedError(
+        "worker " + std::to_string(owner) +
+        " zero header buffer allocation failed: requested " +
+        std::to_string(kBlockHeaderBytes) + " bytes (" +
+        (bycorf::SpdkStorageEnabled() ? "SPDK DMA" : "aligned") + ")");
+  }
+  std::fill_n(data, kBlockHeaderBytes, std::byte{0});
+  data_ = data;
+  charge_.Account(owner + 1, kBlockHeaderBytes);
+  return absl::OkStatus();
+}
+
 DeviceAllocator::~DeviceAllocator() {
   if (metadata_write_buffer_.data_ != nullptr) {
     bycorf::FreeStorageBuffer(metadata_write_buffer_.data_, kDirectIoAlignment);
@@ -153,7 +183,7 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
+Task<absl::Status> StorageEngine::Impl::InvalidateActivatedBlockHeadersLocal(
     std::size_t device_index, std::span<const std::uint64_t> block_ids) {
   if (block_ids.empty()) {
     co_return absl::OkStatus();
@@ -162,24 +192,20 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
   assert(bycorf::ThisWorker().id_ == allocator.owner_);
   WorkerStore& store = *stores_[allocator.owner_];
   const StorageDevice& device = devices_[device_index];
-  const FixedBuffer buffer = allocator.metadata_write_buffer_;
-  auto* zero_header = buffer.data_;
-  assert(zero_header != nullptr);
-  // Metadata writes may have used this workspace since the last activation.
-  // The caller holds allocator.mutex_ until the whole batch is durable.
-  std::fill_n(zero_header, kBlockHeaderBytes, std::byte{0});
+  // Immutable across awaits, including concurrent clears for other devices on
+  // this owner. The allocator mutex still protects allocation publication.
+  const FixedBuffer buffer = store.zero_header_.io_buffer();
   absl::Status status = absl::OkStatus();
   for (const std::uint64_t block_id : block_ids) {
     assert(DeviceIndexForBlock(block_id) == device_index);
     auto written = co_await WriteStorageBuffer(
         *store.worker_, store.files_[device.file_index_],
-        std::span<const std::byte>(zero_header, kBlockHeaderBytes),
-        store.buffers_.workspace_registered(buffer), buffer,
-        LocalBlockOffset(block_id));
+        store.zero_header_.bytes(), store.buffers_.workspace_registered(buffer),
+        buffer, LocalBlockOffset(block_id));
     if (!written.ok() || *written != kBlockHeaderBytes) {
       status = written.ok()
                    ? absl::Status(absl::StatusCode::kInternal,
-                                  "short recycled-block header invalidation")
+                                  "short activated-block header invalidation")
                    : written.status();
       break;
     }
@@ -198,8 +224,6 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
   const StorageDevice& device = devices_[device_index];
   std::vector<std::uint64_t> activated;
   activated.reserve(kActivationBatchBlocks);
-  std::vector<std::uint64_t> reactivated;
-  reactivated.reserve(kActivationBatchBlocks);
   // Reuse reclaimed blocks before touching new offsets. Besides bounding the
   // physical footprint of sparse file-backed devices under overwrite-heavy
   // workloads, this makes blocks released by replication backlog trimming
@@ -209,7 +233,6 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
     const std::uint64_t block_id = allocator.cold_free_.back();
     allocator.cold_free_.pop_back();
     activated.push_back(block_id);
-    reactivated.push_back(block_id);
   }
   while (activated.size() < kActivationBatchBlocks &&
          allocator.next_pristine_ < device.capacity_blocks_) {
@@ -221,12 +244,13 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
     co_return absl::OkStatus();
   }
 
-  // A cold block deliberately retains its old header while its bitmap bit is
-  // clear. Invalidate that stale header before making the bit durable again,
-  // otherwise a crash between activation and the writer's first flush could
-  // make recovery accept records from the block's previous allocation.
-  absl::Status invalidated = co_await InvalidateReactivatedBlockHeadersLocal(
-      device_index, reactivated);
+  // The bitmap does not retain a durable high-water mark: after restart, even
+  // offsets beyond next_pristine_ may contain retired records from an earlier
+  // allocation. Invalidate every activated header before persisting its bit,
+  // including unused ready-pool entries. Otherwise recovery (or a shutdown
+  // checkpoint's next startup) can resurrect records absent from runtime state.
+  absl::Status invalidated =
+      co_await InvalidateActivatedBlockHeadersLocal(device_index, activated);
   if (!invalidated.ok()) {
     allocator.failed_ = invalidated;
     LatchRuntimeFailure();

@@ -69,11 +69,12 @@ plus framing or startup fails. These startup options also work as Redis-style
 configuration directives without the leading `--`.
 
 Additional fixed DMA allocations are 24 MiB per data worker for three
-maintenance readers, 8 MiB per process for Redis export, and 8 KiB per device
-for metadata writes. With defaults, fixed storage-buffer capacity is
-`88 MiB × data workers + 8 MiB + 8 KiB × storage devices`. Read-arena metadata
-uses ordinary memory: one 16-byte descriptor per 4 KiB unit plus allocator
-control state (128 KiB of descriptors for the default 32 MiB read arena).
+maintenance readers, 8 MiB per process for Redis export, 8 KiB per device
+for metadata writes, and 8 KiB per worker owning a device allocator for an
+immutable zero header. With defaults, fixed storage-buffer capacity is
+`88 MiB × data workers + 8 MiB + 8 KiB × (storage devices + device-owner workers)`.
+Read-arena metadata uses ordinary memory: one 16-byte descriptor per 4 KiB unit
+plus allocator control state (128 KiB of descriptors for the default 32 MiB read arena).
 All count toward retained memory; allocation failure prevents startup.
 Startup metadata I/O, recovery, and shutdown checkpoints reuse these allocations.
 See [storage ownership](../architecture/04-storage-and-recovery.md) and
@@ -88,7 +89,8 @@ The pool first attempts to register all fixed workspaces. If io_uring rejects
 it, Lavik uses the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in
 KiB) divided across runtime workers as a starting budget, with this priority:
 
-1. The owner worker's per-device 8 KiB metadata write buffers.
+1. The owner worker's per-device 8 KiB metadata write buffers, then its shared
+   8 KiB zero header.
 2. An aligned prefix of the ordinary read arena.
 3. Ordinary write slots.
 4. The 8 MiB maintenance images, ordered defrag, TxCleaner, then Tomb Raider.
@@ -98,7 +100,8 @@ prefix is rounded to its allocation alignment. Each class is admitted fully
 before considering the next. Failed retries reduce the budget, which is an
 estimate because other locked resources can consume the allowance. Export and
 ordinary-heap result assembly buffers remain unregistered. With defaults,
-registration requests `88 MiB + 8 KiB × owned devices` per data worker.
+registration requests `88 MiB + 8 KiB × owned devices` per data worker, plus
+8 KiB when that worker owns at least one device allocator.
 Registration adds no second memory charge.
 
 Allocated capacity never shrinks. A read lease outside the registered prefix

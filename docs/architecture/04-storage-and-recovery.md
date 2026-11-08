@@ -120,9 +120,9 @@ an owner-local range allocator; descriptors are preallocated outside DMA memory.
 The read arena is split into registered regions where kernel limits require it.
 Buffer-pool capacity is independent of registration success.
 If full io_uring registration fails, a finite memlock allowance permits a
-best-effort subset registration: per-device metadata workspaces on their owner
-worker first, then an aligned prefix of the read arena, write slots, and
-maintenance images. The process-wide export image remains unregistered.
+best-effort subset registration: per-device metadata workspaces and the owner's
+immutable zero header first, then an aligned prefix of the read arena, write
+slots, and maintenance images. The process-wide export image remains unregistered.
 A lease outside the registered prefix or crossing a registration-region boundary
 uses the same aligned memory with plain asynchronous I/O. On SPDK, a
 worker opens only namespaces whose physical controller assigned it a qpair.
@@ -339,9 +339,9 @@ recognizable and retryable when the same complete set is supplied again.
 
 An explicit reset validates every target before writing and zeroes the fixed
 metadata prefix through the first data-block boundary. This is a logical reset,
-not a secure erase of the data region. The implementation does not establish a
-crash-safe stale-media sanitization guarantee for reset media or a reused
-zero-label added device, so this architecture does not make one.
+not a secure erase of the data region. Subsequent allocation invalidates both
+block-header slots before making an activation bit durable; it does not erase
+the old payload bytes.
 
 After labels are resolved, preparation loads the newest valid epoch and bitmap
 page on every device. Epochs only increase, so the runtime vector is the
@@ -433,9 +433,12 @@ Recovery proceeds as follows:
    checkpoint, an ordinary record block contributes only its header because
    the checkpoint already supplies its winning index entries. Without one,
    ordinary record blocks are read through their committed boundary.
-   Transaction blocks are always read through their committed boundary; zero
-   page padding is skipped, while record bounds, allocation epochs, topology,
-   keys, and checksums are validated. Recovery computes each winning key's
+   A validated checkpoint proves that transaction winners were promoted and
+   their source blocks retired; any remaining transaction headers are stale
+   activation remnants and are reclaimed without merging their records.
+   Without a checkpoint, transaction blocks are read through their committed
+   boundary. Zero page padding is skipped, while record bounds, allocation
+   epochs, topology, keys, and checksums are validated. Recovery computes each winning key's
    runtime digest from the recovered complete key instead of loading one from
    disk.
    Recovered records are routed to key owners in byte-targeted batches. The
@@ -636,11 +639,13 @@ have been collected, every worker's remaining footprint must fit its normal
 failed transition stops startup. Recovery does not change the disk scan count.
 
 Retained memory includes fixed read/write pools and maintenance, device-metadata,
-and export workspaces. These are allocated at startup and retained until their
-owners tear down after I/O drains; allocation failure prevents startup.
+zero-header, and export workspaces. These are allocated at startup and retained
+until their owners tear down after I/O drains; allocation failure prevents startup.
 Registration and reuse across startup, recovery, and serving do not allocate
-or charge a second copy. Each device allocator owns an 8 KiB write workspace
-for metadata and recycled-block headers, serialized by its coroutine mutex.
+or charge a second copy. Each device allocator owns an 8 KiB metadata write
+workspace, serialized by its coroutine mutex. Each worker owning a device
+allocator also owns one immutable 8 KiB zero header shared by concurrent block
+clears across its devices; allocation publication still uses the device mutex.
 [Redis export](05-replication.md#redis-psync-export) owns a separate process-wide
 workspace.
 
@@ -1014,6 +1019,12 @@ set allocation bit and fdatasync metadata
 publish block ID to the ready pool
 assign a fresh allocation epoch
 ```
+
+Every activation invalidates both header slots before its allocation bit becomes
+durable, including offsets beyond the reconstructed allocation cursor. That
+cursor is derived from currently set bitmap bits, not a durable historical
+high-water mark; a retired tail can retain old records after restart. Unused
+ready-pool entries therefore have no recoverable header from an earlier life.
 
 A destructive replica reset makes the prior records logically obsolete by
 epoch; it does not make their blocks immediately allocatable. Partial-attempt

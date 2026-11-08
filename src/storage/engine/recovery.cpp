@@ -315,6 +315,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
   const std::size_t batch_target_bytes =
       RecoveryWorkerBatchTargetBytes(worker_count_);
   std::size_t buffered_bytes = 0;
+  std::vector<bool> cleared_header_files(store.files_.size(), false);
 
   // Preserve the global striped ownership of physical blocks, but visit one
   // block from each device in turn. Scanning every device to completion in
@@ -435,6 +436,37 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         // once this startup completes.
         if (!indirect_key_pass) zero_blocks->push_back(block_id);
         if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
+        continue;
+      }
+
+      if (block.kind_ == BlockKind::kTransaction &&
+          checkpoint_active_.load(std::memory_order_acquire)) {
+        // Checkpoint publication requires all transaction winners to be
+        // promoted and every transaction block retired. Older allocators could
+        // reactivate a retired tail without invalidating its header. Such
+        // copies cannot contribute winners or decisions to this snapshot;
+        // reclaim them before rebuilding runtime ownership. Failed checkpoint
+        // validation still takes the ordinary transactional recovery path.
+        if (!indirect_key_pass) {
+          // A reusable scan slot keeps its allocation bit set. zero_blocks is
+          // scan-local scratch: the caller publishes it only after this scan
+          // and the recovery barriers succeed. Batch the durability fence by
+          // file below instead of synchronizing every retired header.
+          std::fill_n(header_buffer.data_, kBlockHeaderBytes, std::byte{0});
+          auto cleared = co_await WriteStorageBuffer(
+              *store.worker_, store.files_[file_id],
+              std::span<const std::byte>(header_buffer.data_,
+                                         kBlockHeaderBytes),
+              store.buffers_.workspace_registered(header_buffer), header_buffer,
+              block_offset);
+          if (!cleared.ok()) co_return cleared.status();
+          if (*cleared != kBlockHeaderBytes)
+            co_return absl::InternalError(
+                "short stale transaction header write");
+          cleared_header_files[file_id] = true;
+          zero_blocks->push_back(block_id);
+          ReportRecoveryProgress(0, /*allocated=*/true);
+        }
         continue;
       }
 
@@ -922,6 +954,16 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       }
     }
     if (!scanned_block) break;
+  }
+  // Do not let the caller make any cleared slot reusable unless every write
+  // is durable. A failed sync aborts recovery before allocator publication;
+  // a later cold boot must not resurrect a header from a published free slot.
+  for (std::size_t file_id = 0; file_id < cleared_header_files.size();
+       ++file_id) {
+    if (!cleared_header_files[file_id]) continue;
+    auto synced =
+        co_await bycorf::Fdatasync(*store.worker_, store.files_[file_id]);
+    if (!synced.ok()) co_return synced;
   }
   co_return absl::OkStatus();
 }

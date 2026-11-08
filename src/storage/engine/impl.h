@@ -1411,6 +1411,39 @@ struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
 
 static_assert(sizeof(RecoveryDeviceCursor) % kCacheLineBytes == 0);
 
+// One immutable I/O source per device-owner worker. Devices on that owner may
+// submit concurrent clears without borrowing a mutable metadata workspace.
+// The worker store retains it until worker I/O and coroutine teardown finish.
+class ZeroHeaderBuffer {
+ public:
+  ZeroHeaderBuffer() = default;
+  ~ZeroHeaderBuffer();
+  ZeroHeaderBuffer(const ZeroHeaderBuffer&) = delete;
+  ZeroHeaderBuffer& operator=(const ZeroHeaderBuffer&) = delete;
+
+  // Prepare once after device ownership is resolved; failure prevents startup.
+  absl::Status Init(bycorf::WorkerId owner);
+  bool initialized() const noexcept { return data_ != nullptr; }
+  std::span<const std::byte> bytes() const {
+    assert(initialized());
+    return {data_, kBlockHeaderBytes};
+  }
+  // Bycorf registration descriptors require a mutable pointer even for writes.
+  // This descriptor is only for registration and write submission, never reads.
+  FixedBuffer io_buffer() const {
+    assert(initialized());
+    return {.data_ = const_cast<std::byte*>(data_),
+            .size_ = kBlockHeaderBytes,
+            .index_ = registered_index_};
+  }
+  void SetRegisteredIndex(std::uint16_t index) { registered_index_ = index; }
+
+ private:
+  const std::byte* data_ = nullptr;
+  std::uint16_t registered_index_ = 0;
+  RetainedMemoryCharge charge_;
+};
+
 struct DeviceAllocator {
   ~DeviceAllocator();
   // Allocate once during Prepare, before workers can issue allocator I/O.
@@ -1419,8 +1452,8 @@ struct DeviceAllocator {
 
   bycorf::WorkerId owner_ = 0;
   AsyncMutex mutex_;
-  // Cleared block headers and metadata pages share this write-only workspace
-  // under mutex_. Engine ownership outlives worker I/O and coroutine teardown.
+  // Metadata pages share this write-only workspace under mutex_. Engine
+  // ownership outlives worker I/O and coroutine teardown.
   // Its owner registers it before ordinary buffers when memlock permits;
   // unregistered io_uring writes remain valid. SPDK requires DMA memory.
   FixedBuffer metadata_write_buffer_{};
@@ -2048,6 +2081,7 @@ class StorageEngine::Impl {
     // greatest durable LSN; workers then advance disjoint striped sequences
     // by worker_count, so allocation is local and needs no atomic operation.
     std::uint64_t next_lsn_ = 0;
+    ZeroHeaderBuffer zero_header_;
     RegisteredBufferPool buffers_;
     // Owner-local producers outlive cancelled request frames, but are reclaimed
     // after backend quiescence and before their buffer pool is destroyed.
@@ -4115,7 +4149,7 @@ class StorageEngine::Impl {
                                         DeviceAllocator& allocator,
                                         std::vector<std::size_t> page_indexes);
 
-  Task<absl::Status> InvalidateReactivatedBlockHeadersLocal(
+  Task<absl::Status> InvalidateActivatedBlockHeadersLocal(
       std::size_t device_index, std::span<const std::uint64_t> block_ids);
 
   void MaybeRefillDeviceInBackground(std::size_t device_index,

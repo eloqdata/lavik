@@ -565,8 +565,8 @@ absl::Status RegisteredBufferPool::Init(
       iovecs.size() > kMaxRegions - maintenance_count - priority_count) {
     return absl::OutOfRangeError("too many storage registration regions");
   }
-  // Registration borrows the device images; ownership and retained charges
-  // stay with their allocators. Read and write registration indices follow
+  // Registration borrows the device images and immutable zero header; ownership
+  // and retained charges stay with their callers. Read/write indices follow
   // these small high-priority pages without moving their underlying memory.
   std::vector<iovec> registration;
   registration.reserve(priority_count + iovecs.size() + maintenance_count);
