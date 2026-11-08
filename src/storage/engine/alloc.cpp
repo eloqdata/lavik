@@ -33,6 +33,36 @@ bool EpochIoFails(std::string_view kind, std::size_t device_index) {
 }  // namespace
 #endif
 
+ZeroHeaderBuffer::~ZeroHeaderBuffer() {
+  if (data_ != nullptr) {
+    bycorf::FreeStorageBuffer(const_cast<std::byte*>(data_),
+                              kDirectIoAlignment);
+  }
+}
+
+absl::Status ZeroHeaderBuffer::Init(bycorf::WorkerId owner) {
+  if (initialized()) return absl::OkStatus();
+  bool fail = false;
+  LAVIK_FAULT_INJECT(if (const char* worker = std::getenv(
+                             "LAVIK_FAIL_ZERO_HEADER_BUFFER_ALLOCATION")) {
+    fail = std::string_view(worker) == std::to_string(owner);
+  });
+  auto* data = fail ? nullptr
+                    : static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
+                          kBlockHeaderBytes, kDirectIoAlignment));
+  if (data == nullptr) {
+    return absl::ResourceExhaustedError(
+        "worker " + std::to_string(owner) +
+        " zero header buffer allocation failed: requested " +
+        std::to_string(kBlockHeaderBytes) + " bytes (" +
+        (bycorf::SpdkStorageEnabled() ? "SPDK DMA" : "aligned") + ")");
+  }
+  std::fill_n(data, kBlockHeaderBytes, std::byte{0});
+  data_ = data;
+  charge_.Account(owner + 1, kBlockHeaderBytes);
+  return absl::OkStatus();
+}
+
 DeviceAllocator::~DeviceAllocator() {
   if (metadata_write_buffer_.data_ != nullptr) {
     bycorf::FreeStorageBuffer(metadata_write_buffer_.data_, kDirectIoAlignment);
@@ -162,20 +192,16 @@ Task<absl::Status> StorageEngine::Impl::InvalidateActivatedBlockHeadersLocal(
   assert(bycorf::ThisWorker().id_ == allocator.owner_);
   WorkerStore& store = *stores_[allocator.owner_];
   const StorageDevice& device = devices_[device_index];
-  const FixedBuffer buffer = allocator.metadata_write_buffer_;
-  auto* zero_header = buffer.data_;
-  assert(zero_header != nullptr);
-  // Metadata writes may have used this workspace since the last activation.
-  // The caller holds allocator.mutex_ until the whole batch is durable.
-  std::fill_n(zero_header, kBlockHeaderBytes, std::byte{0});
+  // Immutable across awaits, including concurrent clears for other devices on
+  // this owner. The allocator mutex still protects allocation publication.
+  const FixedBuffer buffer = store.zero_header_.io_buffer();
   absl::Status status = absl::OkStatus();
   for (const std::uint64_t block_id : block_ids) {
     assert(DeviceIndexForBlock(block_id) == device_index);
     auto written = co_await WriteStorageBuffer(
         *store.worker_, store.files_[device.file_index_],
-        std::span<const std::byte>(zero_header, kBlockHeaderBytes),
-        store.buffers_.workspace_registered(buffer), buffer,
-        LocalBlockOffset(block_id));
+        store.zero_header_.bytes(), store.buffers_.workspace_registered(buffer),
+        buffer, LocalBlockOffset(block_id));
     if (!written.ok() || *written != kBlockHeaderBytes) {
       status = written.ok()
                    ? absl::Status(absl::StatusCode::kInternal,

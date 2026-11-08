@@ -107,16 +107,16 @@ class WriteBufferTestPeer {
       reads.push_back(std::move(*read));
     }
     const auto retained = WorkerMemoryAccountingBytes(store.worker_->id());
-    // Two devices on one worker must own distinct images. Each round writes
-    // nonzero old headers, returns the blocks, and activates them again with
-    // every ordinary slot held and dynamic read allocation disabled.
+    // Devices retain distinct metadata images but concurrently share their
+    // owner's immutable zero header, even with every ordinary slot held.
     if (impl.device_allocators_.size() != 2 ||
         impl.device_allocators_[0]->metadata_write_buffer_.data_ ==
             impl.device_allocators_[1]->metadata_write_buffer_.data_)
       co_return absl::InternalError(
           "devices do not own separate write buffers");
     for (unsigned round = 0; round != 2; ++round) {
-      for (std::size_t device = 0; device != impl.devices_.size(); ++device) {
+      auto exercise_device = [&](std::size_t device) -> Task<absl::Status> {
+        absl::Status status;
         auto& allocator = *impl.device_allocators_[device];
         auto* const buffer = allocator.metadata_write_buffer_.data_;
         std::vector<std::uint64_t> blocks;
@@ -136,6 +136,15 @@ class WriteBufferTestPeer {
         {
           co_await allocator.mutex_.Lock();
           UnlockGuard unlock(&allocator.mutex_, store.worker_);
+          std::array<std::byte, kDirectIoAlignment> metadata_before;
+          std::copy_n(buffer, metadata_before.size(), metadata_before.begin());
+          status = co_await impl.InvalidateActivatedBlockHeadersLocal(device,
+                                                                      blocks);
+          if (!status.ok()) co_return status;
+          if (!std::equal(metadata_before.begin(), metadata_before.end(),
+                          buffer))
+            co_return absl::InternalError(
+                "header clearing modified the metadata workspace");
           status = co_await impl.RefillReadyBlocksLocal(device, allocator);
           if (!status.ok()) co_return status;
         }
@@ -173,6 +182,24 @@ class WriteBufferTestPeer {
         if (buffer != allocator.metadata_write_buffer_.data_)
           co_return absl::InternalError(
               "metadata writes replaced their workspace");
+        if (!IsZero(store.zero_header_.bytes()))
+          co_return absl::InternalError("zero header was modified");
+        co_return absl::OkStatus();
+      };
+      std::vector<Task<absl::Status>> tasks;
+      for (std::size_t device = 0; device != impl.devices_.size(); ++device) {
+        auto task = exercise_device(device);
+        auto handle = std::move(task).ReleaseHandle();
+        tasks.emplace_back(handle);
+        handle.resume();
+      }
+      // Drain every operation before inspecting failures or releasing buffers.
+      while (std::any_of(tasks.begin(), tasks.end(),
+                         [](const auto& task) { return !task.done(); }))
+        co_await bycorf::Yield(*store.worker_);
+      for (auto& task : tasks) {
+        auto result = std::move(task).TakeResult();
+        if (!result.ok()) co_return result;
       }
     }
     if (pool.available_read_buffers() != 0 ||
@@ -1633,6 +1660,43 @@ TEST(DeviceMetadataBufferTest, AllocationFailureAndOwnerAccounting) {
     ASSERT_EQ(unsetenv("LAVIK_FAIL_DEVICE_METADATA_BUFFER_ALLOCATION"), 0);
     ASSERT_TRUE(second.InitMetadataWriteBuffer(1).ok());
     EXPECT_NE(second.metadata_write_buffer_.data_, data);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(1),
+              second_before + kBlockHeaderBytes);
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), first_before);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(1), second_before);
+}
+
+TEST(ZeroHeaderBufferTest, AllocationFailureAndOwnerAccounting) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires allocation failure injection";
+#endif
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  const auto first_before = WorkerMemoryAccountingBytes(0);
+  const auto second_before = WorkerMemoryAccountingBytes(1);
+  ASSERT_EQ(setenv("LAVIK_FAIL_ZERO_HEADER_BUFFER_ALLOCATION", "1", 1), 0);
+  absl::Cleanup restore = [] {
+    unsetenv("LAVIK_FAIL_ZERO_HEADER_BUFFER_ALLOCATION");
+  };
+  {
+    ZeroHeaderBuffer first, second;
+    ASSERT_TRUE(first.Init(0).ok());
+    const auto* data = first.bytes().data();
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(data) % kDirectIoAlignment, 0);
+    EXPECT_TRUE(IsZero(first.bytes()));
+    ASSERT_TRUE(first.Init(0).ok());
+    EXPECT_EQ(first.bytes().data(), data);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0), first_before + kBlockHeaderBytes);
+    const auto failed = second.Init(1);
+    EXPECT_TRUE(absl::IsResourceExhausted(failed));
+    EXPECT_NE(failed.message().find("worker 1 zero header buffer"),
+              std::string::npos);
+    EXPECT_FALSE(second.initialized());
+    EXPECT_EQ(WorkerMemoryAccountingBytes(1), second_before);
+    ASSERT_EQ(unsetenv("LAVIK_FAIL_ZERO_HEADER_BUFFER_ALLOCATION"), 0);
+    ASSERT_TRUE(second.Init(1).ok());
+    EXPECT_NE(second.bytes().data(), data);
+    EXPECT_TRUE(IsZero(second.bytes()));
     EXPECT_EQ(WorkerMemoryAccountingBytes(1),
               second_before + kBlockHeaderBytes);
   }
