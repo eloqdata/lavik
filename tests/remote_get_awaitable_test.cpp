@@ -214,6 +214,13 @@ class RemoteGetTestPeer : public testing::Test {
   ReadFlightRegistry& Flights() {
     return *storage_.impl_->stores_[0]->read_flights_;
   }
+  auto FlightAdmissionCounts() const {
+    const auto& store = *storage_.impl_->stores_[0];
+    return std::pair{store.read_flight_eligible_attempts_,
+                     store.read_flight_metadata_failed_
+                         ? store.read_flight_eligible_attempts_
+                         : 0};
+  }
   bycorf::IoCompletion* StartFlight(Awaitable& read) {
     FillRecord(read);
     auto& io = *read.io_;
@@ -727,6 +734,16 @@ TEST_F(RemoteFlightTest, RegistryMemoryAdmissionFailureKeepsExclusiveRead) {
   ASSERT_TRUE(result && result->ok());
   EXPECT_EQ(result->value().view().encoded_, value_);
   EXPECT_FALSE(result->value().lease_.shared());
+  EXPECT_EQ(FlightAdmissionCounts(),
+            (std::pair<std::uint64_t, std::uint64_t>{1, 1}));
+  // Optional registry allocation is attempted once. Later eligible reads still
+  // bypass and remain observable after the memory limit is restored.
+  auto next = NewRead();
+  EXPECT_EQ(FlightAdmissionCounts(),
+            (std::pair<std::uint64_t, std::uint64_t>{2, 2}));
+  ASSERT_NO_FATAL_FAILURE(Complete(*next));
+  auto next_result = next->await_resume();
+  ASSERT_TRUE(next_result && next_result->ok());
 }
 
 TEST_F(RemoteFlightTest, SynchronousRejectionRestoresOriginalOwnership) {

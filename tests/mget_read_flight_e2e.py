@@ -66,6 +66,8 @@ def check_metrics(port, workers):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     text = opener.open(f"http://127.0.0.1:{port}/metrics").read().decode()
     for suffix in (
+        "read_flight_eligible_attempts_total",
+        "read_flight_metadata_bypass_total",
         "read_flight_leaders_total",
         "read_flight_joins_total",
         "read_flight_cancellations_total",
@@ -74,7 +76,9 @@ def check_metrics(port, workers):
         "read_flight_waiter_full_total",
         "read_flight_shared_budget_total",
         "read_flights_pending",
+        "read_flight_waiters_pending",
         "shared_read_bytes",
+        "shared_read_peak_bytes",
     ):
         aggregate = re.findall(rf"^lavik_storage_{suffix} (\d+)$", text, re.M)
         owners = re.findall(
@@ -120,6 +124,7 @@ def main():
             ]
             trace = next(t for t in records if t["command"] == "MGET")
             stages = {s["name"]: s for s in trace["stages"]}
+            assert "read_io" in stages and "read_flight_wait" in stages, trace
             assert stages["read_io"].get("observations", 1) == 1, trace
             assert stages["read_flight_wait"]["observations"] == 3, trace
             assert admin.batch(

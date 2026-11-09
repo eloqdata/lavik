@@ -53,13 +53,26 @@ suffixes use the same `lavik_storage_` prefix. Physical read counters increment
 once per successful completion, including short completions, regardless of the
 number of waiters. `read_flight_cancellations_total` counts detached waiters.
 
+`read_flight_eligible_attempts_total` counts physical-read attempts that reach
+sharing admission, including retries and batch wave rechecks. It excludes
+staging hits and paths that cannot share; it is not a count of unique commands
+or submitted I/O. `read_flight_metadata_bypass_total` counts those attempts
+when the worker's optional registry is unavailable after failed allocation or
+memory admission. These counters survive independently of registry creation.
+
 The `read_flight_table_full_total`, `read_flight_waiter_full_total`, and
 `read_flight_shared_budget_total` counters count unsuccessful admission attempts,
 not unique requests: a delayed submission can recheck admission. Sharing remains
 an optimization and these failures use the existing exclusive path.
-`read_flights_pending` counts current producers. `shared_read_bytes` includes
+`read_flights_pending` counts current producers. `read_flight_waiters_pending`
+counts requests still attached to those reads, including producers; delivered
+results retained by consumers are excluded. The owning worker derives this
+count from its bounded registry during collection, without another hot-path
+counter. `shared_read_bytes` includes
 reserved or retained shared arena bytes and framing through the final return,
-including consumers blocked on network output. INFO stats exposes the same
+including consumers blocked on network output. `shared_read_peak_bytes` is the
+sum of each worker's high-water mark since startup, not a simultaneous
+process-wide peak. INFO stats exposes the same
 observations with `storage_` names and without counter `_total` suffixes.
 Collection visits state owners; cross-worker totals are not an atomic snapshot.
 

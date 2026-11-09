@@ -450,6 +450,7 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
 }
 
 ReadFlightRegistry* StorageEngine::Impl::ReadFlights(WorkerStore& store) {
+  ++store.read_flight_eligible_attempts_;
   if (!store.read_flights_attempted_) [[unlikely]] {
     store.read_flights_attempted_ = true;
     store.read_flights_ = ReadFlightRegistry::TryCreate(
@@ -471,6 +472,7 @@ ReadFlightRegistry* StorageEngine::Impl::ReadFlights(WorkerStore& store) {
             engine.UnpinRemoteBlock(block, owner, block_id);
           }
         });
+    store.read_flight_metadata_failed_ = !store.read_flights_;
   }
   return store.read_flights_.get();
 }

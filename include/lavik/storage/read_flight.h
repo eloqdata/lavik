@@ -114,6 +114,10 @@ class ReadFlightRegistry {
   // No callbacks, traces, wakeups or maintenance notifications are emitted.
   void FinalizeQuiesced() noexcept;
   std::size_t size() const noexcept { return active_; }
+  // Attached requests, including producers; excludes delivered results still
+  // retained by consumers. Owner-only diagnostics scan bounded stable slots
+  // instead of maintaining another counter on every request/completion.
+  [[gnu::cold]] std::size_t pending_waiters() const noexcept;
   std::size_t map_allocations() const noexcept { return allocations_.calls; }
   const ReadFlightStats& stats() const noexcept { return stats_; }
 

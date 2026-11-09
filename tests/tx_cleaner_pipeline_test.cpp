@@ -575,7 +575,11 @@ TEST_F(TxCleanerPipelineTestPeer,
     EXPECT_EQ(full.read_flights_[owner].worker_id_, owner);
     EXPECT_EQ(full.read_flights_[owner].stats_.leaders, 0);
     EXPECT_EQ(full.read_flights_[owner].pending_, 0);
+    EXPECT_EQ(full.read_flights_[owner].waiters_pending_, 0);
+    EXPECT_EQ(full.read_flights_[owner].eligible_attempts_, 0);
+    EXPECT_EQ(full.read_flights_[owner].metadata_bypass_, 0);
     EXPECT_EQ(full.read_flights_[owner].shared_bytes_, 0);
+    EXPECT_EQ(full.read_flights_[owner].shared_peak_bytes_, 0);
   }
   for (unsigned owner = 0; owner < kWorkers; ++owner) {
     EXPECT_EQ(full.replication_logs_[owner].worker_id_, owner);
@@ -595,6 +599,23 @@ TEST_F(TxCleanerPipelineTestPeer,
 
 TEST_F(TxCleanerPipelineTestPeer,
        ConcurrentReadFlightSnapshotsDoNotShareTotals) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, kWorkers).ok());
+  struct Waiter : ReadFlightWaiter {
+    void ReceiveRead(bycorf::Worker&, ReadResultBuffer&&, int,
+                     unsigned) override {}
+  };
+  std::array<std::array<Waiter, 3>, kWorkers> waiters;
+  std::array<bycorf::IoCompletion*, kWorkers> completions{};
+  std::array<std::uint64_t, kWorkers> shared_bytes{}, peak_bytes{};
+  // Complete on the correct owner even when an assertion aborts the test.
+  // Callbacks discard results, so no shared handle survives this cleanup.
+  absl::Cleanup finish_reads = [&] {
+    for (unsigned owner = 0; owner < kWorkers; ++owner) {
+      On(owner);
+      if (completions[owner])
+        completions[owner]->Complete(workers_[owner], 4096, 0);
+    }
+  };
   constexpr std::array fields{
       &ReadFlightStats::leaders,       &ReadFlightStats::joins,
       &ReadFlightStats::cancellations, &ReadFlightStats::rejected,
@@ -603,11 +624,33 @@ TEST_F(TxCleanerPipelineTestPeer,
   for (unsigned owner = 0; owner < kWorkers; ++owner) {
     On(owner);
     auto& store = Store(owner);
+    RegisteredBufferPoolOptions options;
+    options.storage_write_buffer_count_ = 2;
+    options.registered_bytes_ = 32 * kMiB;
+    ASSERT_TRUE(store.buffers_.Init(workers_[owner], options).ok());
     store.read_flights_ = ReadFlightRegistry::TryCreate(
-        workers_[owner], store.buffers_, nullptr, nullptr, 1);
+        workers_[owner], store.buffers_, nullptr,
+        [](void*, std::uint64_t, unsigned, bool) noexcept {}, 1);
     ASSERT_NE(store.read_flights_, nullptr);
-    // Seed distinct historical counts without starting physical IO. Overlapping
-    // collectors on different workers must each receive exactly one copy.
+    auto lease = store.buffers_.TryAcquireReadBuffer(4096);
+    ASSERT_TRUE(lease.ok());
+    bool pin = true;
+    completions[owner] =
+        store.read_flights_->Start({}, 42, *lease, pin, waiters[owner][0]).tag;
+    ASSERT_NE(completions[owner], nullptr);
+    for (unsigned i = 1; i < owner + 2; ++i)
+      ASSERT_TRUE(store.read_flights_->TryJoin({}, 42, waiters[owner][i]));
+    shared_bytes[owner] = store.buffers_.shared_read_bytes();
+    {
+      auto temporary = store.buffers_.TryReserveSharedRead(4096 * (owner + 1));
+      ASSERT_TRUE(temporary.valid());
+    }
+    peak_bytes[owner] = store.buffers_.shared_read_peak_bytes();
+    ASSERT_GT(peak_bytes[owner], shared_bytes[owner]);
+    store.read_flight_eligible_attempts_ = 100 * (owner + 1);
+    // Seed distinct historical counts without submitting physical IO.
+    // Overlapping collectors on different workers must each receive exactly one
+    // copy.
     auto& stats = const_cast<ReadFlightStats&>(store.read_flights_->stats());
     for (std::size_t i = 0; i < fields.size(); ++i)
       stats.*fields[i] = (owner + 1) * (i + 1);
@@ -621,15 +664,45 @@ TEST_F(TxCleanerPipelineTestPeer,
   ASSERT_TRUE(PumpUntil([&] { return metrics.done() && diagnostics.done(); }));
   const auto full = std::move(metrics).TakeResult();
   const auto info = std::move(diagnostics).TakeResult();
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    EXPECT_EQ(full.read_flights_[owner].pending_, 1);
+    EXPECT_EQ(full.read_flights_[owner].waiters_pending_, owner + 2);
+    EXPECT_EQ(full.read_flights_[owner].eligible_attempts_, 100 * (owner + 1));
+    EXPECT_EQ(full.read_flights_[owner].metadata_bypass_, 0);
+    EXPECT_EQ(full.read_flights_[owner].shared_bytes_, shared_bytes[owner]);
+    EXPECT_EQ(full.read_flights_[owner].shared_peak_bytes_, peak_bytes[owner]);
+  }
+  for (const auto* snapshot : {&full.diagnostics_, &info}) {
+    EXPECT_EQ(snapshot->read_flights_pending_, 2);
+    EXPECT_EQ(snapshot->read_flight_waiters_pending_, 5);
+    EXPECT_EQ(snapshot->read_flight_eligible_attempts_, 300);
+    EXPECT_EQ(snapshot->read_flight_metadata_bypass_, 0);
+    EXPECT_EQ(snapshot->shared_read_bytes_, shared_bytes[0] + shared_bytes[1]);
+    EXPECT_EQ(snapshot->shared_read_peak_bytes_, peak_bytes[0] + peak_bytes[1]);
+  }
   for (std::size_t i = 0; i < fields.size(); ++i) {
     EXPECT_EQ(full.diagnostics_.read_flights_.*fields[i], 3 * (i + 1));
     EXPECT_EQ(info.read_flights_.*fields[i], 3 * (i + 1));
   }
   // A new collection starts from zero, and an owner without a registry
   // contributes zero rather than retaining a previous snapshot's counters.
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    On(owner);
+    std::exchange(completions[owner], nullptr)
+        ->Complete(workers_[owner], 4096, 0);
+  }
   On(1);
   Store(1).read_flights_.reset();
+  // Model an owner whose one-time metadata admission failed. Its attempts
+  // remain visible even though no registry exists to hold any counters.
+  Store(1).read_flight_metadata_failed_ = true;
   const auto subsequent = Diagnostics();
+  EXPECT_EQ(subsequent.read_flights_pending_, 0);
+  EXPECT_EQ(subsequent.read_flight_waiters_pending_, 0);
+  EXPECT_EQ(subsequent.read_flight_eligible_attempts_, 300);
+  EXPECT_EQ(subsequent.read_flight_metadata_bypass_, 200);
+  EXPECT_EQ(subsequent.shared_read_bytes_, 0);
+  EXPECT_EQ(subsequent.shared_read_peak_bytes_, peak_bytes[0] + peak_bytes[1]);
   for (std::size_t i = 0; i < fields.size(); ++i)
     EXPECT_EQ(subsequent.read_flights_.*fields[i], i + 1);
 }
