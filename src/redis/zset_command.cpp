@@ -250,9 +250,19 @@ void AppendRangeMembers(ReplyBuilder& builder,
   }
   for (std::size_t i = 0; i < count; ++i) {
     const auto member = result.member_view(i);
-    if (nested) builder.AppendArrayHeader(2);
-    builder.AppendBulkString(member.member_);
-    AppendScore(builder, member.score_);
+    if (!nested) {
+      // RESP2 encodes both entries as bulk strings. Append the pair with one
+      // exact resize; the score's stack bytes are copied before this iteration
+      // ends. Standalone score replies keep their existing scalar path.
+      std::array<char, kMaximumFormattedDoubleBytes> score;
+      const std::array<std::string_view, 2> pair{
+          member.member_, FormatDoubleTo(member.score_, score)};
+      builder.AppendBulkStrings(std::span<const std::string_view>(pair));
+    } else {
+      builder.AppendArrayHeader(2);
+      builder.AppendBulkString(member.member_);
+      AppendScore(builder, member.score_);
+    }
   }
 }
 
