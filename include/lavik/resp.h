@@ -214,6 +214,8 @@ class ReplyBuilder {
   [[nodiscard]] RespVersion version() const noexcept { return version_; }
 
   std::string_view AppendSimpleString(std::string_view value);
+  // Input bytes must remain valid independently of this builder's growth.
+  // An unrepresentable wire size throws without changing the existing reply.
   std::string_view AppendBulkString(std::string_view value);
   // Appends bulk elements without a container header, preserving any existing
   // prefix. Input bytes must remain valid independently of this builder. Checks

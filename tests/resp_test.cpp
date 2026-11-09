@@ -686,6 +686,31 @@ TEST(ReplyBuilderTest, EncodesScalarAndCompositeReplies) {
   EXPECT_EQ(builder.View(), "*2\r\n$5\r\nfirst\r\n$-1\r\n");
 }
 
+TEST(ReplyBuilderTest, BulkScalarsPreservePrefixesAcrossGrowthAndReuse) {
+  for (auto version : {RespVersion::k2, RespVersion::k3}) {
+    ReplyBuilder builder(version);
+    for (int reuse = 0; reuse < 2; ++reuse) {
+      builder.Reset();
+      builder.AppendArrayHeader(9);
+      std::string expected = "*9\r\n";
+      // The default empty view has no data pointer. Subsequent binary values
+      // cross decimal framing widths and force both inline and heap growth.
+      builder.AppendBulkString(std::string_view{});
+      expected += "$0\r\n\r\n";
+      for (std::size_t size : {1, 9, 10, 99, 100, 999, 1000, 65536}) {
+        std::string value(size, '\0');
+        for (std::size_t i = 0; i < size; ++i)
+          value[i] = static_cast<char>(i % 256);
+        expected += "$" + std::to_string(size) + "\r\n" + value + "\r\n";
+        EXPECT_EQ(builder.AppendBulkString(value), expected);
+      }
+      EXPECT_EQ(builder.View(), expected);
+      EXPECT_EQ(builder.version(), version);
+      EXPECT_EQ(builder.outcome().result_, CommandResult::kSuccess);
+    }
+  }
+}
+
 TEST(ReplyBuilderTest, ReplyReplacementRetainsTimingUntilTheNextRequest) {
   ReplyBuilder builder(RespVersion::k3);
   builder.MarkExecutionStart(300);

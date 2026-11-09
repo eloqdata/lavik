@@ -577,11 +577,32 @@ std::string_view ReplyBuilder::AppendSimpleString(std::string_view value) {
 }
 
 std::string_view ReplyBuilder::AppendBulkString(std::string_view value) {
-  buffer_.push_back('$');
-  AppendUnsigned(buffer_, value.size());
-  buffer_.append("\r\n");
-  buffer_.append(value);
-  buffer_.append("\r\n");
+  char header[std::numeric_limits<std::size_t>::digits10 + 5];
+  header[0] = '$';
+  auto [end, error] =
+      std::to_chars(header + 1, header + sizeof(header) - 2, value.size());
+  assert(error == std::errc{});
+  *end++ = '\r';
+  *end++ = '\n';
+  const auto prefix = buffer_.size();
+  const auto framing = static_cast<std::size_t>(end - header);
+  const auto remaining = buffer_.max_size() - prefix;
+  if (value.size() > remaining || framing + 2 > remaining - value.size())
+    throw std::length_error("RESP reply is too large");
+  const auto bytes = prefix + framing + value.size() + 2;
+  // Commit one complete scalar instead of repeatedly growing/checking the
+  // string for its marker, length, delimiters and payload. Preserve an existing
+  // composite prefix and avoid zero-filling the tail before overwriting it.
+  buffer_.resize_and_overwrite(bytes, [&](char* data, std::size_t) noexcept {
+    auto* output = data + prefix;
+    std::memcpy(output, header, framing);
+    output += framing;
+    if (!value.empty()) std::memcpy(output, value.data(), value.size());
+    output += value.size();
+    *output++ = '\r';
+    *output = '\n';
+    return bytes;
+  });
   return buffer_;
 }
 
