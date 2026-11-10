@@ -1684,8 +1684,62 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
     return pages[first].id_;
   };
   const auto source_id = locate(object, state.before_);
-  const auto destination_id = locate(object, state.after_);
+  auto destination_id = locate(object, state.after_);
   if (!source_id || !destination_id) co_return std::nullopt;
+  // Cross-page edits can wait for a cold source without holding the shared
+  // destination hot spot. This temporary S hold is released before acquiring
+  // the complete ordered lock set; retaining it could invert the global lock
+  // order or require an S-to-X upgrade. Only owned bytes survive the hold.
+  MemoryReservation source_admission;
+  std::optional<LoadedOrderedGroup> prefetched_source;
+  if (*source_id && *destination_id && *source_id != *destination_id) {
+    {
+      auto source_hold = store.group_locks_->MakeLockSet(
+          {db_id, tx::FingerprintOf(digest), object->incarnation()});
+      co_await source_hold.Acquire(
+          {GroupedLockIndex::kOrdered, {*source_id, 0}},
+          GroupedLockMode::kShared);
+      refreshed = RefreshLockedGroup(partition, db_id, key, object, member_id);
+      if (!refreshed.ok()) co_return refreshed.status();
+      object = std::move(*refreshed);
+      if (locate(object, state.before_) != source_id) co_return std::nullopt;
+      physical = object->FindGroup({*source_id, 0});
+      if (!physical) co_return absl::DataLossError("missing source point page");
+      GroupedScratchBudget budget;
+      status = budget.AddGroup(*physical, object->ExtentsFor({*source_id, 0}));
+      if (!status.ok()) co_return status;
+      // Optional headroom: memory pressure keeps the original locked loader,
+      // rather than turning speculative retention into a new command OOM.
+      auto admission = TryReserveMemory(budget.bytes());
+      if (admission) {
+        source_admission = std::move(*admission);
+        auto page = co_await LoadEncodedSortedSetGroupSnapshot(
+            store, partition, db_id, key, digest, object, *source_id, nullptr,
+            true, operation.diagnostics_);
+        if (!page.ok()) co_return page.status();
+        prefetched_source.emplace(std::move(*page));
+      }
+    }
+    LAVIK_FAULT_INJECT({
+      if (prefetched_source &&
+          LAVIK_FAULT_MATCHES("LAVIK_ZSET_PREFETCH_PAUSE_MEMBER", member)) {
+        spdlog::info("zset source prefetch released member={} page={}", member,
+                     *source_id);
+        auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_ZSET_PREFETCH_PAUSE_FILE");
+        if (!paused.ok()) co_return paused;
+      }
+    });
+    // No ordered hold remains, so a destination boundary changed during the
+    // source read does not require whole-key X. Rebase the unlocked route now;
+    // the complete lock set below still revalidates it after any lock waits.
+    refreshed = RefreshLockedGroup(partition, db_id, key, object, member_id);
+    if (!refreshed.ok()) co_return refreshed.status();
+    object = std::move(*refreshed);
+    if (locate(object, state.before_) != source_id) co_return std::nullopt;
+    destination_id = locate(object, state.after_);
+    if (!destination_id) co_return std::nullopt;
+  }
   std::map<std::uint64_t, GroupedLockMode> selected;
   for (const auto id : {*source_id, *destination_id}) {
     if (!id) continue;
@@ -1737,7 +1791,22 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
   }
   status = pages_budget.AddBytes(member.size() + 256);
   if (!status.ok()) co_return status;
-  auto pages_admission = pages_budget.Reserve(4);
+  // Speculation must not consume headroom required by the original planner.
+  // If the normal scratch would no longer fit, discard the optional source
+  // before ordinary admission, without recording a rejected command.
+  std::optional<MemoryReservation> prepaid_pages;
+  if (prefetched_source &&
+      pages_budget.bytes() <= std::numeric_limits<std::size_t>::max() / 4) {
+    prepaid_pages = TryReserveMemory(pages_budget.bytes() * 4);
+    if (!prepaid_pages) {
+      prefetched_source.reset();
+      source_admission.Release();
+    }
+  }
+  auto pages_admission =
+      prepaid_pages
+          ? absl::StatusOr<MemoryReservation>(std::move(*prepaid_pages))
+          : pages_budget.Reserve(4);
   if (!pages_admission.ok()) co_return pages_admission.status();
   std::uint64_t protected_bytes = 0;
   for (const auto& [id, mode] : selected) {
@@ -1756,9 +1825,31 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
         co_return absl::UnavailableError(
             "injected Sorted Set plan page read failure");
     });
-    auto page = co_await LoadEncodedSortedSetGroupSnapshot(
-        store, partition, db_id, key, digest, object, id, nullptr, true,
-        operation.diagnostics_);
+    const auto* current_page = object->FindGroup({id, 0});
+    const bool reuse_source =
+        prefetched_source && id == *source_id &&
+        prefetched_source->sequence_ == current_page->mutation_sequence_;
+    if (reuse_source) {
+      // Other page loads may have suspended since the common routing check.
+      // Preserve the ordinary loader's population and failed-decision checks.
+      auto checked = RefreshLockedGroup(partition, db_id, key, object, {id, 0});
+      if (!checked.ok()) co_return checked.status();
+    }
+    LAVIK_FAULT_INJECT({
+      if (prefetched_source && id == *source_id &&
+          LAVIK_FAULT_MATCHES("LAVIK_TRACE_ZSET_PREFETCH_MEMBER", member))
+        spdlog::info("zset source prefetch reuse={} member={}",
+                     unsigned(reuse_source), member);
+    });
+    // A writer may have changed another member in our source page while its
+    // S hold was released. Reload under X when the logical version changed;
+    // physical relocation alone does not invalidate this owned snapshot.
+    absl::StatusOr<LoadedOrderedGroup> page =
+        reuse_source
+            ? absl::StatusOr<LoadedOrderedGroup>(std::move(*prefetched_source))
+            : co_await LoadEncodedSortedSetGroupSnapshot(
+                  store, partition, db_id, key, digest, object, id, nullptr,
+                  true, operation.diagnostics_);
     if (!page.ok()) co_return page.status();
     auto edited = EditEncodedSortedSetGroup(
         page->snapshot_, member,
