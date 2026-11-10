@@ -35,9 +35,11 @@ namespace lavik::test {
 // export workspace and one device's metadata workspace. Index page directories
 // remain part of the working allowance, as do the collection directories and
 // entry pages. The returned value is the actual --max-memory; keep client
-// quotas explicit when they are part of the scenario.
+// quotas explicit when they are part of the scenario. Empty-startup tests
+// exclude index arrays because no database has been activated yet.
 inline std::string WithStorageBaseline(std::uint64_t working_limit,
-                                       unsigned workers) {
+                                       unsigned workers,
+                                       bool include_indexes = true) {
   const storage::RegisteredBufferPoolOptions buffers;
   const auto read_bytes =
       buffers.registered_bytes_ -
@@ -49,7 +51,7 @@ inline std::string WithStorageBaseline(std::uint64_t working_limit,
       workers * (buffers.registered_bytes_ + 3 * storage::kStorageBlockBytes +
                  arena_metadata) +
       storage::kStorageBlockBytes + 2 * storage::kDirectIoAlignment;
-  for (unsigned worker = 0; worker < workers; ++worker) {
+  for (unsigned worker = 0; include_indexes && worker < workers; ++worker) {
     const auto partitions =
         (storage::kLogicalStorageShards + workers - 1 - worker) / workers;
     const auto bytes = sizeof(storage::RecordIndex) * partitions;

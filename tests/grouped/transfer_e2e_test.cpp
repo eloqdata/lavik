@@ -72,8 +72,11 @@ TEST(GroupedTransferE2e, StorageBaselinePreservesWorkingHeadroom) {
   for (const unsigned workers : {2U, 3U, 4U}) {
     SCOPED_TRACE(workers);
     PrivateDisk disk;
+    // An empty store has no primary/grouped index arrays, unlike the populated
+    // recovery fixtures that use the helper's default admission budget.
     Server server(disk, workers, {}, {}, false, 2,
-                  WithStorageBaseline(working, workers));
+                  WithStorageBaseline(working, workers,
+                                      /*include_indexes=*/false));
     Client client(server.port());
     const auto info = client.Command({"INFO", "MEMORY"}).text_;
     const auto field = [&](std::string_view name) {
