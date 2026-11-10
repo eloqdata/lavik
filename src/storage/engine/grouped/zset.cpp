@@ -68,6 +68,32 @@ bool ScanRead(const SortedSetOperation& operation) {
          operation.kind_ == SortedSetOperationKind::kCount;
 }
 
+// A published ordered page is already framing/identity checked by its
+// loader. Only the binary-search probes and exact match need decoding here.
+absl::StatusOr<std::optional<std::size_t>> FindRankSlot(
+    const auto& page, double score, std::string_view member) {
+  if (page.indexed_) {
+    const auto& reader = *page.indexed_;
+    auto at = reader.LowerBound(score, member);
+    if (!at.ok()) return at.status();
+    if (*at == reader.size()) return std::nullopt;
+    auto entry = reader.At(*at);
+    if (!entry.ok()) return entry.status();
+    if (entry->score_ == score && entry->value_ == member) return *at;
+    return std::nullopt;
+  }
+  const auto& entries = page.entries_;
+  const auto at = std::lower_bound(
+      entries.begin(), entries.end(), OrderedCollectionEntryView{member, score},
+      [](const auto& entry, const auto& key) {
+        return entry.score_ < key.score_ ||
+               (entry.score_ == key.score_ && entry.value_ < key.value_);
+      });
+  if (at != entries.end() && at->score_ == score && at->value_ == member)
+    return at - entries.begin();
+  return std::nullopt;
+}
+
 std::pair<std::uint64_t, std::uint64_t> RankSlice(std::int64_t first,
                                                   std::int64_t last,
                                                   std::uint64_t count) {
@@ -1275,13 +1301,21 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
             object->version().index_generation_)
       co_return std::nullopt;
     object = std::move(current);
-    auto scores = operation;
-    scores.kind_ = SortedSetOperationKind::kScores;
-    auto read = co_await ReadGroupedSortedSetScores(
-        store, partition, db_id, key, digest, scores, object, true);
+    // Rank needs one scalar, not an allocated score reply or an additional
+    // score-command coroutine. Both borrowed spans live in this frame until
+    // the leaf loader completes; the member hold preserves the score below.
+    if (shutdown_flush_requested_)
+      co_return absl::CancelledError("member read cancelled by shutdown");
+    HashFieldLookup request{.group_ = id,
+                            .field_ = operation.members_.front(),
+                            .result_index_ = 0,
+                            .value_ = std::nullopt};
+    auto read = co_await LoadSortedSetMemberScores(
+        store, partition, db_id, key, digest, object, std::span(&request, 1),
+        std::span(&member_score, 1), nullptr, true, operation.diagnostics_);
     if (!read.ok()) co_return read.status();
-    member_score = read->scores_.front();
   }
+  std::size_t rank_page = kNoPage;
   // Enumerate only payloads used by the operation. Counts for complete score
   // pages come from one immutable directory, so ZCOUNT needs just boundary
   // holds. Mixed-score BYLEX has no lexical page index and requires all pages.
@@ -1331,6 +1365,7 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
       first = directory.LowerBoundScore(*member_score);
       end = directory.UpperBoundScore(*member_score);
       if (end - first <= 1) {
+        rank_page = first;
         if (first < pages.size()) emit(pages[first].id_);
         return true;
       }
@@ -1348,6 +1383,7 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
         else
           end = mid;
       }
+      rank_page = first;
       if (first < pages.size()) emit(pages[first].id_);
       return true;
     }
@@ -1490,15 +1526,17 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
     }
   });
   auto read = co_await [&]() {
+    if (operation.kind_ == SortedSetOperationKind::kRank)
+      return ReadLockedSortedSetRank(store, partition, db_id, key, digest,
+                                     operation, current, member_score,
+                                     rank_page);
     if (operation.kind_ == SortedSetOperationKind::kRandom)
       return ReadGroupedSortedSetRandom(store, partition, db_id, key, digest,
                                         operation, current, random.draws_,
                                         std::move(random_result), true);
-    return ExecuteGroupedSortedSetLocked(
-        store, partition, db_id, key, digest, operation, current, nullptr,
-        nullptr, nullptr, nullptr, nullptr, true,
-        operation.kind_ == SortedSetOperationKind::kRank ? &member_score
-                                                         : nullptr);
+    return ExecuteGroupedSortedSetLocked(store, partition, db_id, key, digest,
+                                         operation, current, nullptr, nullptr,
+                                         nullptr, nullptr, nullptr, true);
   }();
   if (!read.ok()) {
     if (EffectiveRecordDbEpoch(partition, db_id) !=
@@ -1510,6 +1548,60 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
     co_return read.status();
   }
   co_return std::optional(std::move(*read));
+}
+
+// The lock planner has already found and revalidated this exact page. Keep
+// rank out of the general scan/mutation coroutine, whose much larger frame
+// and repeated score routing have no work to do for this one-page projection.
+Task<absl::StatusOr<SortedSetResult>>
+StorageEngine::Impl::ReadLockedSortedSetRank(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, GroupedObject::Handle object,
+    std::optional<double> score, std::size_t page_index) {
+  SortedSetResult result;
+  result.key_exists_ = true;
+  const auto& directory = object->ordered_directory();
+  result.length_ = directory.root().item_count_;
+  if (!score) co_return result;
+  if (page_index >= directory.groups().size())
+    co_return absl::DataLossError("Sorted Set indexed member missing");
+  LAVIK_FAULT_INJECT(
+      if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key) &&
+          (std::getenv("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE") == nullptr ||
+           LAVIK_FAULT_MATCHES_NTH("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key,
+                                   "LAVIK_FAIL_ZSET_ORDERED_READ_PAGE",
+                                   page_index + 1))) co_return absl::
+          UnavailableError("injected ordered-page read failure"););
+  const auto id = directory.groups()[page_index].id_;
+  const RecordIndexValue* physical = nullptr;
+  auto refreshed =
+      RefreshLockedGroup(partition, db_id, key, object, {id, 0}, &physical);
+  if (!refreshed.ok()) co_return refreshed.status();
+  GroupedScratchBudget budget;
+  auto checked = budget.AddGroup(
+      *physical, physical->external() ? (*refreshed)->ExtentsFor({id, 0})
+                                      : ExtentManifest{});
+  if (!checked.ok()) co_return checked;
+  if (shutdown_flush_requested_)
+    co_return absl::CancelledError("Sorted Set read cancelled by shutdown");
+  auto admission = budget.Reserve(2);
+  if (!admission.ok()) co_return admission.status();
+  auto page = co_await LoadSortedSetPage(
+      store, partition, db_id, key, digest, object, id,
+      SortedSetMemberValidation::kTrustStored,
+      SortedSetPageReadMode::kIndexedProjection, true, operation.diagnostics_);
+  if (!page.ok()) co_return page.status();
+  auto slot = FindRankSlot(*page, *score, operation.members_.front());
+  if (!slot.ok()) co_return slot.status();
+  if (!*slot)
+    co_return absl::DataLossError("Sorted Set indexed member missing");
+  // Use the common cut captured after all S holds, not the newer physical
+  // view used for IO: unrelated writes may change preceding page counts.
+  const auto rank = directory.CountBefore(page_index) + **slot;
+  result.rank_ = operation.reverse_ ? result.length_ - 1 - rank : rank;
+  result.rank_score_ = *score;
+  co_return result;
 }
 
 Task<absl::StatusOr<std::optional<SortedSetResult>>>
@@ -3946,29 +4038,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       auto page =
           co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
       if (!page.ok()) co_return page.status();
-      auto slot = [&]() -> absl::StatusOr<std::optional<std::size_t>> {
-        if (page->page_.indexed_) {
-          const auto& reader = *page->page_.indexed_;
-          auto at = reader.LowerBound(*score, member);
-          if (!at.ok()) return at.status();
-          if (*at == reader.size()) return std::nullopt;
-          auto entry = reader.At(*at);
-          if (!entry.ok()) return entry.status();
-          if (entry->score_ == *score && entry->value_ == member) return *at;
-          return std::nullopt;
-        }
-        const auto& entries = page->page_.entries_;
-        const auto at = std::lower_bound(
-            entries.begin(), entries.end(),
-            OrderedCollectionEntryView{member, *score},
-            [](const auto& entry, const auto& key) {
-              return entry.score_ < key.score_ ||
-                     (entry.score_ == key.score_ && entry.value_ < key.value_);
-            });
-        if (at != entries.end() && at->score_ == *score && at->value_ == member)
-          return at - entries.begin();
-        return std::nullopt;
-      }();
+      auto slot = FindRankSlot(page->page_, *score, member);
       if (!slot.ok()) co_return slot.status();
       if (*slot) {
         const auto rank = directory.CountBefore(i) + **slot;
