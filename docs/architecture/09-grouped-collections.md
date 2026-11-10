@@ -282,8 +282,13 @@ recheck its representation after acquisition. The worker lazily owns one group
 lock table. Writers acquire all requested member leaves exclusively, resolve source and
 destination ordered pages, and acquire those pages exclusively and their
 immediate routing neighbours shared, in identity order. Routes are rechecked
-after waits. Group holds span page IO, private preparation and publication;
-unrelated groups can perform IO concurrently. Page reads refresh physical
+after waits. Cross-page point edits may first read their source under a temporary
+shared page hold, release that hold, then acquire the complete ordered set.
+The request owns and admits the snapshot until use; its logical page revision
+must still match under the exclusive hold, otherwise the source is reloaded.
+Population, routing and commit-decision checks remain required. Final group
+holds span remaining page IO, private preparation and publication; unrelated
+groups can perform IO concurrently. Page reads refresh physical
 coordinates and validate the protected group's revision instead of rejecting
 an unrelated root publication.
 

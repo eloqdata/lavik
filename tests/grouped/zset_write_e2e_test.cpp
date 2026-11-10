@@ -882,7 +882,8 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
   const std::string key = "dense-probe-fallback";
   std::map<std::string, double> expected;
   // This optional source cache belongs to the whole-key planner. EXEC keeps
-  // that path under X; standalone bounded points have no optional page cache.
+  // that path under X; standalone bounded points use a separate concurrent
+  // path and do not consume this planner's probe-retention hook.
   auto point_under_x = [](Client& client, std::vector<std::string> command) {
     Check(client.Command({"MULTI"}).text_ == "OK",
           "starting probe transaction");
@@ -1962,6 +1963,247 @@ TEST(GroupedSortedSetWriteE2e, PopRevalidatesSelectionAfterReleasingReadLocks) {
     Client client(recovered.port());
     ExpectDenseZSet(client, key, expected);
   }
+}
+
+// Deterministically change a different member in the prefetched page while
+// its temporary S hold is released. Reuse must follow the concrete page
+// revision, not just our member's unchanged score or the whole root revision.
+TEST(GroupedSortedSetWriteE2e, SourcePrefetchRevalidatesAfterReleasedHold) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires source-prefetch pause and reuse tracing";
+#endif
+  for (bool change_source : {false, true}) {
+    PrivateDisk disk;
+    const std::string key = "source-prefetch-version";
+    std::map<std::string, double> expected;
+    {
+      Server server(disk, 1);
+      Client client(server.port());
+      ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+      client.Durable();
+    }
+    const auto page = FirstDenseOrderedPage(disk, key);
+    ASSERT_TRUE(page);
+    ASSERT_GT(page->entries_.size(), 8U);
+    const auto a = page->entries_[page->entries_.size() / 2].value_;
+    const auto layout = InspectZSetMembers(disk, key);
+    const auto leaf_for = [&](const std::string& member) {
+      const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+      for (const auto& [id, leaf] : layout.leaves_)
+        if (id.ContainsHash(hash)) return id;
+      throw std::runtime_error("missing fixture member route");
+    };
+    std::string b;
+    if (change_source) {
+      for (std::size_t i = 1; i + 1 < page->entries_.size(); ++i) {
+        const auto& member = page->entries_[i].value_;
+        if (leaf_for(member) != leaf_for(a)) {
+          b = member;
+          break;
+        }
+      }
+    } else {
+      for (unsigned i = 900; i < 950; ++i) {
+        const auto member = DenseZSetMember(i);
+        if (leaf_for(member) != leaf_for(a)) {
+          b = member;
+          break;
+        }
+      }
+    }
+    ASSERT_FALSE(b.empty());
+    {
+      const auto gate = disk.path() + ".prefetch-gate";
+      std::ofstream(gate).put('1');
+      ScopedEnvironment target("LAVIK_ZSET_PREFETCH_PAUSE_MEMBER", a.c_str());
+      ScopedEnvironment file("LAVIK_ZSET_PREFETCH_PAUSE_FILE", gate.c_str());
+      ScopedEnvironment trace("LAVIK_TRACE_ZSET_PREFETCH_MEMBER", a.c_str());
+      Server server(disk, 1);
+      std::future<Reply> first, other;
+      absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+      first = std::async(std::launch::async, [&] {
+        Client client(server.port());
+        return client.Command({"ZADD", key, "CH", "900.5", a});
+      });
+      bool ready = false;
+      for (unsigned i = 0; i < 200; ++i) {
+        ready = server.Log().find("zset source prefetch released") !=
+                std::string::npos;
+        if (ready) break;
+        std::this_thread::sleep_for(25ms);
+      }
+      ASSERT_TRUE(ready) << server.Log();
+      other = std::async(std::launch::async, [&] {
+        Client client(server.port());
+        return client.Command({"ZINCRBY", key, "0.25", b});
+      });
+      ASSERT_EQ(other.wait_for(3s), std::future_status::ready) << server.Log();
+      ASSERT_EQ(std::stod(other.get().text_), expected.at(b) + 0.25);
+      expected[b] += 0.25;
+      EXPECT_EQ(first.wait_for(0ms), std::future_status::timeout);
+      ::unlink(gate.c_str());
+      ASSERT_EQ(first.get().text_, "1") << server.Log();
+      expected[a] = 900.5;
+      EXPECT_NE(
+          server.Log().find(change_source ? "zset source prefetch reuse=0"
+                                          : "zset source prefetch reuse=1"),
+          std::string::npos)
+          << server.Log();
+      Client client(server.port());
+      ExpectDenseZSet(client, key, expected);
+      client.Durable();
+    }
+    Server recovered(disk, 2);
+    Client client(recovered.port());
+    ExpectDenseZSet(client, key, expected);
+  }
+}
+
+// The destination is still unlocked during prefetch. Moving its upper
+// boundary can change the route without touching the source or requiring a
+// split; keep the prefetched source and build a fresh ordered lock set.
+TEST(GroupedSortedSetWriteE2e, SourcePrefetchRebasesChangedDestination) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires source-prefetch pause and reuse tracing";
+#endif
+  PrivateDisk disk;
+  const std::string key = "source-prefetch-destination";
+  // Boundary members must fit the resident key bound: the long common
+  // prefixes in DenseZSetMember intentionally require whole-key fallback.
+  const auto member_at = [](unsigned i) {
+    return "m" + std::to_string(10000 + i);
+  };
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 1024; ++i) {
+      const auto member = member_at(i);
+      seed.insert(seed.end(), {std::to_string(i), member});
+      expected.emplace(member, i);
+    }
+    ASSERT_EQ(client.Command(seed).text_, "1024");
+    client.Durable();
+  }
+  const auto destination = FirstDenseOrderedPage(disk, key);
+  ASSERT_TRUE(destination);
+  ASSERT_GT(destination->entries_.size(), 8U);
+  const auto b = destination->entries_.back().value_;
+  const double target = destination->entries_.back().score_ - 0.25;
+  const double lowered = destination->entries_.front().score_ + 0.5;
+  ASSERT_GT(target,
+            destination->entries_[destination->entries_.size() - 2].score_);
+  const auto layout = InspectZSetMembers(disk, key);
+  const auto leaf_for = [&](const std::string& member) {
+    const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+    for (const auto& [id, leaf] : layout.leaves_)
+      if (id.ContainsHash(hash)) return id;
+    throw std::runtime_error("missing fixture member route");
+  };
+  std::string a;
+  for (unsigned i = 900; i < 950; ++i) {
+    const auto member = member_at(i);
+    if (leaf_for(member) != leaf_for(b)) {
+      a = member;
+      break;
+    }
+  }
+  ASSERT_FALSE(a.empty());
+  {
+    const auto gate = disk.path() + ".prefetch-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment selector("LAVIK_ZSET_PREFETCH_PAUSE_MEMBER", a.c_str());
+    ScopedEnvironment file("LAVIK_ZSET_PREFETCH_PAUSE_FILE", gate.c_str());
+    ScopedEnvironment trace("LAVIK_TRACE_ZSET_PREFETCH_MEMBER", a.c_str());
+    Server server(disk, 1);
+    // Recovery restores score bounds but not the optional Sorted Set max-key
+    // cache. Publish an interior edit first so the boundary member can route
+    // through IX instead of requesting key X before this test's race begins.
+    {
+      Client warm(server.port());
+      const auto interior = destination->entries_[2].value_;
+      EXPECT_EQ(
+          std::stod(warm.Command({"ZINCRBY", key, "0.125", interior}).text_),
+          expected.at(interior) + 0.125);
+      EXPECT_EQ(
+          std::stod(warm.Command({"ZINCRBY", key, "-0.125", interior}).text_),
+          expected.at(interior));
+    }
+    std::future<Reply> first, other;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZADD", key, "CH", std::to_string(target), a});
+    });
+    bool ready = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      ready = server.Log().find("zset source prefetch released") !=
+              std::string::npos;
+      if (ready) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(ready) << server.Log();
+    other = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZADD", key, "CH", std::to_string(lowered), b});
+    });
+    ASSERT_EQ(other.wait_for(3s), std::future_status::ready) << server.Log();
+    ASSERT_EQ(other.get().text_, "1");
+    expected[b] = lowered;
+    ::unlink(gate.c_str());
+    ASSERT_EQ(first.get().text_, "1") << server.Log();
+    expected[a] = target;
+    // An unnecessary whole-key retry would destroy the prefetched owner and
+    // never reach this checked reuse path.
+    EXPECT_NE(server.Log().find("zset source prefetch reuse=1"),
+              std::string::npos)
+        << server.Log();
+    Client client(server.port());
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e, OppositeCrossPageMovesPreserveBothIndexes) {
+  PrivateDisk disk;
+  const std::string key = "opposite-page-moves";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    std::vector<std::future<void>> writers;
+    for (unsigned connection = 0; connection < 8; ++connection) {
+      writers.push_back(std::async(std::launch::async, [&, connection] {
+        Client writer(server.port());
+        const unsigned index =
+            connection < 4 ? 10 + connection : 900 + connection;
+        const auto member = DenseZSetMember(index);
+        const int delta = connection < 4 ? 800 : -800;
+        for (unsigned i = 0; i < 32; ++i) {
+          auto reply =
+              writer.Command({"ZINCRBY", key, std::to_string(delta), member});
+          Check(reply.kind_ == '$' &&
+                    std::stod(reply.text_) == int(index) + delta,
+                "cross-page increment mismatch: " + reply.text_);
+          reply =
+              writer.Command({"ZINCRBY", key, std::to_string(-delta), member});
+          Check(reply.kind_ == '$' && std::stod(reply.text_) == index,
+                "cross-page restore mismatch: " + reply.text_);
+        }
+      }));
+    }
+    for (auto& writer : writers) writer.get();
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
 }
 
 TEST(GroupedSortedSetWriteE2e, ConcurrentPointCommandsPreserveBothIndexes) {
