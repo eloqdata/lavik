@@ -44,7 +44,10 @@ class RemoteGetTestPeer : public testing::Test {
     source.worker_ = &owner_;
     source.partitions_.resize(1);
     source.partitions_[0].id_ = 1;
-    source.partitions_[0].indexes_ = std::span(&index_, 1);
+    source.index_bases_[0] = &index_;
+    source.partitions_[0].indexes_ = {&source.index_bases_, 0};
+    source.partitions_[0].grouped_objects_ = {&source.grouped_bases_, 0};
+    source.published_indexes_[0].store(&index_);
     source.remote_reads_ready_.store(true);
     source.remote_population_generation_.store(2);
     engine.db_epochs_[0].store(1);
@@ -95,6 +98,32 @@ class RemoteGetTestPeer : public testing::Test {
     storage_.impl_.reset();
     if (wake_fd_ >= 0) close(wake_fd_);
     bycorf::MutableThisWorker() = std::move(saved_context_);
+  }
+
+  auto& Engine() { return *storage_.impl_; }
+  auto& Source() { return *Engine().stores_[1]; }
+  void SetDatabaseCount(std::uint8_t count) {
+    Engine().options_.database_count_ = count;
+  }
+  void PrepareLazyDatabase() {
+    ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+    auto& source = Source();
+    source.record_index_entry_arena_ = std::make_shared<ScanHashMapEntryArena>(
+        63, /*externally_admitted=*/true);
+    ASSERT_TRUE(source.record_index_entry_arena_->PreallocateDirectory());
+  }
+  void ChangeLazyIntent(const tx::KeyRef& key, bool close) {
+    StorageEngine::Impl::ChangeReadIntent(&Source(), key, close);
+  }
+  bool LazyIntentReady(const tx::KeyRef& key) {
+    return StorageEngine::Impl::ReadIntentReady(&Source(), key);
+  }
+  void SeedLazyDatabase(std::uint8_t db) {
+    ASSERT_NE(Source().index_bases_[db]->InsertNew(
+                  ComputeDigest("seed"), "seed",
+                  Engine().MaterializeIndexLocation(
+                      *index_.Find(ComputeDigest(key_), key_))),
+              nullptr);
   }
 
   RegisteredBufferPool& Pool() { return storage_.impl_->stores_[0]->buffers_; }
@@ -290,6 +319,94 @@ class RemoteGetTestPeer : public testing::Test {
   RecordHeader header_;
   ReadLatencyTrace trace_;
 };
+
+TEST_F(RemoteGetTestPeer, UnallocatedDatabaseFallsBackWithoutActivation) {
+  PrepareLazyDatabase();
+  Source().index_bases_[0] = nullptr;
+  Source().published_indexes_[0].store(nullptr);
+  for (std::uint8_t db : {0, 15}) {
+    auto read = storage_.TryRemoteRead(db, key_, 1, ValueType::kString);
+    ASSERT_TRUE(read.await_ready());
+    EXPECT_FALSE(read.await_resume().has_value());
+    EXPECT_EQ(Source().index_bases_[db], nullptr);
+    EXPECT_EQ(Source().grouped_bases_[db], nullptr);
+    const tx::KeyRef key{
+        .fp_ = tx::FingerprintOf(ComputeDigest(key_)), .db_ = db, .slot_ = 1};
+    ChangeLazyIntent(key, true);
+    EXPECT_TRUE(LazyIntentReady(key));
+    ChangeLazyIntent(key, false);
+    EXPECT_EQ(Source().index_bases_[db], nullptr);
+  }
+}
+
+TEST_F(RemoteGetTestPeer,
+       FirstActivationRetainsAllPreviouslyRegisteredIntents) {
+  PrepareLazyDatabase();
+  const tx::KeyRef key{.fp_ = tx::FingerprintOf(ComputeDigest(key_)),
+                       .mode_ = tx::LockMode::kExclusive,
+                       .db_ = 15,
+                       .slot_ = 1};
+  ChangeLazyIntent(key, true);
+  ChangeLazyIntent(key, true);
+  ASSERT_TRUE(Engine().EnsureDatabaseIndexes(Source(), 15).ok());
+  auto* const address = Source().index_bases_[15];
+  ASSERT_NE(address, nullptr);
+  ASSERT_NE(Source().grouped_bases_[15], nullptr);
+  // Bucketless maps also decline remote admission. Populate another key so
+  // the miss below specifically exercises publication of reader stripes.
+  SeedLazyDatabase(15);
+  EXPECT_EQ(Source().index_bases_[14], nullptr);
+  EXPECT_EQ(Source().published_indexes_[15].load(), nullptr);
+  auto read = storage_.TryRemoteRead(15, key_, 1, ValueType::kString);
+  ASSERT_TRUE(read.await_ready());
+  EXPECT_FALSE(read.await_resume().has_value());
+  ChangeLazyIntent(key, false);
+  EXPECT_EQ(Source().published_indexes_[15].load(), nullptr);
+  // An intent arriving after allocation must join the same closed interval.
+  ChangeLazyIntent(key, true);
+  ChangeLazyIntent(key, false);
+  EXPECT_EQ(Source().published_indexes_[15].load(), nullptr);
+  ChangeLazyIntent(key, false);
+  EXPECT_EQ(Source().published_indexes_[15].load(), address);
+  auto miss = storage_.TryRemoteRead(15, key_, 1, ValueType::kString);
+  ASSERT_TRUE(miss.await_ready());
+  auto result = miss.await_resume();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(absl::IsNotFound(result->status()));
+  ASSERT_TRUE(Engine().EnsureDatabaseIndexes(Source(), 15).ok());
+  EXPECT_EQ(Source().index_bases_[15], address);
+  // Once published, the ordinary stripe closure protocol resumes.
+  ChangeLazyIntent(key, true);
+  auto closed = storage_.TryRemoteRead(15, key_, 1, ValueType::kString);
+  ASSERT_TRUE(closed.await_ready());
+  EXPECT_FALSE(closed.await_resume().has_value());
+  ChangeLazyIntent(key, false);
+}
+
+TEST_F(RemoteGetTestPeer, DatabaseActivationAdmissionFailureIsRetryable) {
+  PrepareLazyDatabase();
+  ASSERT_TRUE(InitMemoryLimit(1, 2).ok());
+  const auto rejected = Engine().EnsureDatabaseIndexes(Source(), 15);
+  // Restore the shared test budget even if the assertions below fail.
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  EXPECT_TRUE(absl::IsResourceExhausted(rejected));
+  EXPECT_EQ(Source().index_bases_[15], nullptr);
+  EXPECT_EQ(Source().grouped_bases_[15], nullptr);
+  EXPECT_EQ(Source().published_indexes_[15].load(), nullptr);
+  EXPECT_TRUE(Source().database_indexes_[15].primary_.empty());
+  EXPECT_TRUE(Source().database_indexes_[15].grouped_.empty());
+  ASSERT_TRUE(Engine().EnsureDatabaseIndexes(Source(), 15).ok());
+  EXPECT_NE(Source().published_indexes_[15].load(), nullptr);
+}
+
+TEST_F(RemoteGetTestPeer, DisabledDatabaseCannotBeActivated) {
+  PrepareLazyDatabase();
+  SetDatabaseCount(1);
+  EXPECT_TRUE(
+      absl::IsInvalidArgument(Engine().EnsureDatabaseIndexes(Source(), 1)));
+  EXPECT_EQ(Source().index_bases_[1], nullptr);
+  EXPECT_EQ(Source().grouped_bases_[1], nullptr);
+}
 
 TEST_F(RemoteGetTestPeer, SynchronousMissAndClosedIndexFallback) {
   {

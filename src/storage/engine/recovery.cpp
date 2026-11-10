@@ -1099,6 +1099,8 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
       return absl::FailedPreconditionError(
           "storage contains current records in a disabled database");
     }
+    const auto activation = EnsureDatabaseIndexes(store, recovered.db_id_);
+    if (!activation.ok()) return activation;
     partition.mutation_sequence_ = std::max(
         partition.mutation_sequence_, recovered.location_.mutation_sequence_);
     auto& index = partition.indexes_[recovered.db_id_];
@@ -1301,6 +1303,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     // grouped key. Physical identity disambiguates a reused name across DBs.
     const Digest digest = ComputeDigest(key);
     for (std::uint8_t db = 0; db < options_.database_count_; ++db) {
+      if (!partition.indexes_.Get(db)) continue;
       for (auto* candidate :
            partition.indexes_[db].FindCandidates(digest, key)) {
         if (candidate == entry) {

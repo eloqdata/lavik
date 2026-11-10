@@ -520,6 +520,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
     store_lock.End();
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
     TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
+    if (!partition.indexes_.Get(db_id))
+      co_return absl::NotFoundError("key not found");
     auto found = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                             digest, key);
     lookup.End();

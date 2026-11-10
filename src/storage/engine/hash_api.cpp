@@ -74,7 +74,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLike(
     // Only the owner reads this hint, without suspension or retained pointers.
     // Admission drains direct readers; the callee rechecks after the key wait.
     auto& partition = PartitionForKey(CurrentStore(), key);
-    const auto* found = partition.indexes_[db_id].Find(digest, key);
+    const auto* found = (partition.indexes_.Get(db_id)
+                             ? partition.indexes_[db_id].Find(digest, key)
+                             : nullptr);
     concurrent = CanPrepareGroupedWriteUnlocked(partition) && found &&
                  found->key_complete() && found->value_.grouped() &&
                  found->value_.value_type() == value_type;
@@ -135,7 +137,9 @@ StorageEngine::Impl::TryConcurrentHashLike(
   auto& partition = PartitionForKey(store, key);
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  const auto* found = partition.indexes_[db_id].Find(digest, key);
+  const auto* found = (partition.indexes_.Get(db_id)
+                           ? partition.indexes_[db_id].Find(digest, key)
+                           : nullptr);
   const auto now = operation.now_ms_ ? operation.now_ms_ : UnixTimeMillis();
   if (!CanPrepareGroupedWriteUnlocked(partition) || !found ||
       !found->key_complete() || !found->value_.grouped() ||

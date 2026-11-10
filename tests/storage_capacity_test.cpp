@@ -40,6 +40,22 @@ class ExpirationAuthorityTestPeer {
  public:
   using WorkerCache = StorageEngine::Impl::WorkerStore;
 
+  static bool HasDatabaseIndexes(StorageEngine& storage, unsigned worker,
+                                 std::uint8_t db) {
+    auto& store = *storage.impl_->stores_[worker];
+    return store.index_bases_[db] != nullptr &&
+           store.grouped_bases_[db] != nullptr;
+  }
+
+  // Prepare-time accounting tests run before worker threads exist; the arrays
+  // remain unpublished and retain their future worker's allocation domain.
+  static absl::Status ActivateDatabaseIndexes(StorageEngine& storage,
+                                              unsigned worker,
+                                              std::uint8_t db) {
+    return storage.impl_->EnsureDatabaseIndexes(*storage.impl_->stores_[worker],
+                                                db);
+  }
+
   static RecordIndex& IndexFor(StorageEngine& storage, std::string_view key) {
     auto* impl = storage.impl_.get();
     return impl->PartitionForKey(impl->CurrentStore(), key).indexes_[0];
@@ -773,7 +789,7 @@ TEST(StorageExpirationAuthorityTest,
   EXPECT_TRUE(service.result().ok()) << service.result();
 }
 
-TEST(StorageCapacityTest, EmptyIndexesAreChargedToTheirWorkers) {
+TEST(StorageCapacityTest, LazyIndexesAreChargedOnlyOnActivation) {
   const std::string path = lavik::test::TestDataPath(
       "lavik-index-accounting-" + std::to_string(::getpid()) + ".data");
   Cleanup cleanup{{path}};
@@ -781,6 +797,7 @@ TEST(StorageCapacityTest, EmptyIndexesAreChargedToTheirWorkers) {
   ASSERT_TRUE(lavik::InitMemoryLimit(2048 * kMiB, 2).ok());
   const auto first_baseline = lavik::WorkerMemoryAccountingBytes(0);
   const auto second_baseline = lavik::WorkerMemoryAccountingBytes(1);
+  std::optional<std::array<std::int64_t, 2>> empty_charges;
   for (unsigned databases : {1u, 16u}) {
     SCOPED_TRACE(databases);
     {
@@ -789,15 +806,29 @@ TEST(StorageCapacityTest, EmptyIndexesAreChargedToTheirWorkers) {
       options.database_count_ = databases;
       lavik::storage::StorageEngine storage(std::move(options));
       ASSERT_TRUE(storage.Prepare(2).ok());
-      // Each worker owns a fixed page directory and half of the primary map
-      // objects, including their inline reader states even before any insert.
-      const auto minimum_bytes =
-          16 * kMiB + lavik::storage::kLogicalStorageShards / 2 * databases *
-                          sizeof(lavik::storage::RecordIndex);
-      EXPECT_GE(lavik::WorkerMemoryAccountingBytes(0) - first_baseline,
-                minimum_bytes);
-      EXPECT_GE(lavik::WorkerMemoryAccountingBytes(1) - second_baseline,
-                minimum_bytes);
+      using Peer = lavik::storage::ExpirationAuthorityTestPeer;
+      const std::array<std::int64_t, 2> empty{
+          lavik::WorkerMemoryAccountingBytes(0) - first_baseline,
+          lavik::WorkerMemoryAccountingBytes(1) - second_baseline};
+      // Enabling sixteen logical DBs retains the same empty footprint as one.
+      // Neither DB0 nor a nonzero DB materializes merely during Prepare.
+      if (empty_charges) EXPECT_EQ(empty, *empty_charges);
+      empty_charges = empty;
+      for (unsigned worker = 0; worker < 2; ++worker) {
+        for (unsigned db = 0; db < databases; ++db)
+          EXPECT_FALSE(Peer::HasDatabaseIndexes(storage, worker, db));
+        const auto before = lavik::WorkerMemoryAccountingBytes(worker);
+        ASSERT_TRUE(
+            Peer::ActivateDatabaseIndexes(storage, worker, databases - 1).ok());
+        EXPECT_TRUE(Peer::HasDatabaseIndexes(storage, worker, databases - 1));
+        if (databases > 1)
+          EXPECT_FALSE(Peer::HasDatabaseIndexes(storage, worker, 0));
+        const auto minimum_bytes = lavik::storage::kLogicalStorageShards / 2 *
+                                   (sizeof(lavik::storage::RecordIndex) +
+                                    sizeof(lavik::storage::GroupedObjectIndex));
+        EXPECT_GE(lavik::WorkerMemoryAccountingBytes(worker) - before,
+                  minimum_bytes);
+      }
       // The fixed footprint must participate in recovery's transition to the
       // steady waterline, even for an empty database.
       ASSERT_TRUE(lavik::InitMemoryLimit(32 * kMiB, 2).ok());

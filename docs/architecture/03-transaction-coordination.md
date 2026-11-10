@@ -99,9 +99,13 @@ the first conflicting waiter stops that drain. Cancelling a queued acquisition
 repolls eligibility so compatible successors need not wait for unrelated IO
 to finish.
 
-Storage binds admission hooks to each shard. Recording a key intent closes its
-index reader stripe before hold acquisition, and releasing or cancelling that
-intent releases the closure. Closures nest across keys sharing a stripe and
+Storage binds admission hooks to each shard. For a remotely published database,
+recording a key intent closes its index reader stripe before hold acquisition,
+and releasing or cancelling that intent releases the closure. Before a DB's
+lazy index activation is published to remote readers, storage counts intents
+without allocating indexes. The first local DB intent quiescence boundary
+permits remote publication; all reads use the owner until then, including when
+an executing transaction creates the arrays. Closures nest across keys sharing a stripe and
 structural index writers. Existing remote index readers must drain before the
 callback takes its holds; the same ordered and bypass queues handle this wait.
 The last reader of a closed stripe sends a worker notification that repolls

@@ -440,6 +440,7 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store,
   std::size_t steps = 0;
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
+      if (!partition.indexes_.Get(db_id)) continue;
       auto& index = partition.indexes_[db_id];
       if (index.empty()) {
         continue;
@@ -918,6 +919,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
   std::size_t steps = 0;
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
+      if (!partition.indexes_.Get(db_id)) continue;
       auto& index = partition.indexes_[db_id];
       if (index.empty()) {
         continue;

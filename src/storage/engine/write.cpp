@@ -192,8 +192,9 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
   // writer resolves the current entry after preparing its append block anyway
   // (preparation may release store state), and owns replacement accounting,
   // WATCH invalidation, and retirement for unconditional writes of any type.
-  if (options.condition_ != SetCondition::kNone || options.keep_ttl_ ||
-      options.return_old_value_) {
+  if ((options.condition_ != SetCondition::kNone || options.keep_ttl_ ||
+       options.return_old_value_) &&
+      partition.indexes_.Get(db_id)) {
     auto& index = partition.indexes_[db_id];
     found = index.Find(digest, key);
     if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -297,6 +298,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
 
+  if (!partition.indexes_.Get(db_id)) [[unlikely]]
+    co_return false;
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -413,6 +416,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
 
   TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
+  if (!partition.indexes_.Get(db_id)) [[unlikely]]
+    co_return false;
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -1212,9 +1217,9 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   std::vector<RecordIndex::WriteGuard> index_writes;
-  index_writes.reserve(store.partition_indexes_.size());
-  for (auto& index : store.partition_indexes_)
-    index_writes.push_back(index.CloseAllReaders());
+  for (auto& db : store.database_indexes_)
+    for (auto& index : db.primary_)
+      index_writes.push_back(index.CloseAllReaders());
   for (auto& guard : index_writes)
     while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
   auto found = store.tx_undo_.find(txid);
@@ -2181,6 +2186,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     co_return absl::FailedPreconditionError(
         "storage writer is stopped after an IO failure");
   }
+  const auto activation = EnsureDatabaseIndexes(store, db_id);
+  if (!activation.ok()) co_return activation;
   const auto value_bytes =
       inline_payload ? inline_payload->encoded_bytes() : value.size();
   // Compact editors borrow read leases through allocation waits. Oversized
@@ -3022,6 +3029,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                  : &PartitionForKey(store, request.key_));
   assert(request.known_partition_ == nullptr || request.key_indirect_ ||
          request.known_partition_->id_ == RedisSlot(request.key_));
+  if (partition_ptr != nullptr) {
+    const auto activation = EnsureDatabaseIndexes(store, request.db_id_);
+    if (!activation.ok()) co_return activation;
+  }
   RecordIndex* index_ptr =
       auxiliary ? nullptr
       : request.explicit_root_ != nullptr

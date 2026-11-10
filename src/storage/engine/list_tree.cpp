@@ -550,10 +550,10 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   TraceSpanScope lookup_scope(operation.diagnostics_, TraceStage::kLookup);
 
-  auto& index = partition.indexes_[db_id];
-  auto* found = index.Find(digest, key);
+  auto* index = partition.indexes_.Get(db_id);
+  auto* found = index ? index->Find(digest, key) : nullptr;
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    auto resolved = co_await FindVerifiedEntry(store, *index, digest, key);
     if (!resolved.ok()) co_return resolved.status();
     found = *resolved;
   }
@@ -940,9 +940,12 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     unlock.Adopt();
     absl::Status validated;
     if (unlocked_create) {
-      auto* current = index.Find(digest, key);
+      auto* current_index = partition.indexes_.Get(db_id);
+      auto* current =
+          current_index ? current_index->Find(digest, key) : nullptr;
       if (current != nullptr && !current->key_complete()) {
-        auto verified = co_await FindVerifiedEntry(store, index, digest, key);
+        auto verified =
+            co_await FindVerifiedEntry(store, *current_index, digest, key);
         if (!verified.ok()) co_return verified.status();
         current = *verified;
       }

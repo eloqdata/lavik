@@ -349,12 +349,13 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       requested.db_id_, tx::FingerprintOf(digest), tx::LockMode::kShared,
       lavik::storage::RedisSlot(requested.key_));
-  auto& index = partition.indexes_[requested.db_id_];
-  auto resolved =
-      co_await FindVerifiedEntry(store, index, digest, requested.key_);
-  if (!resolved.ok()) co_return resolved.status();
-
-  const RecordIndex::Entry* current = *resolved;
+  const RecordIndex::Entry* current = nullptr;
+  if (auto* index = partition.indexes_.Get(requested.db_id_)) {
+    auto resolved =
+        co_await FindVerifiedEntry(store, *index, digest, requested.key_);
+    if (!resolved.ok()) co_return resolved.status();
+    current = *resolved;
+  }
   if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
       IsExpiredNow(*current)) {
     const std::uint64_t sequence =
@@ -441,7 +442,8 @@ ScanPartitionAwaitable StorageEngine::Impl::ScanPartition(
           ? std::numeric_limits<std::size_t>::max()
           : count * 10;
   ScanPartitionState state;
-  state.index_ = &PartitionFor(CurrentStore(), partition_id).indexes_[db_id];
+  state.index_ = PartitionFor(CurrentStore(), partition_id).indexes_.Get(db_id);
+  if (state.index_ == nullptr) return ScanPartitionAwaitable(ScanBatch{});
   state.now_ms_ = now_ms;
   state.count_ = count;
   state.max_bytes_ = max_bytes;
@@ -848,6 +850,7 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
                            "full-sync partition capture is not active");
   }
   const std::uint64_t baseline_version = capture->second.baseline_version_;
+  if (!partition.indexes_.Get(db_id)) co_return PartitionSnapshotBatch{};
   auto& index = partition.indexes_[db_id];
   const std::uint64_t now_ms = UnixTimeMillis();
   if (capture->second.pending_snapshot_keys_.empty()) {
@@ -1467,10 +1470,11 @@ StorageEngine::Impl::ResetReplicaPartitions(
     sync->local_db_epochs_ = local_db_epochs;
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       ++partition.grouped_generations_[db_id];
-      auto index_write =
-          co_await AwaitAllIndexReaders(partition.indexes_[db_id]);
-      QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
-                         &partition.grouped_objects_[db_id]);
+      if (auto* index = partition.indexes_.Get(db_id)) {
+        auto index_write = co_await AwaitAllIndexReaders(*index);
+        QueueDetachedIndex(store, *index, db_id,
+                           &partition.grouped_objects_[db_id]);
+      }
       partition.fullsync_coverage_bytes_[db_id] = 0;
       if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
           [[unlikely]] {
@@ -1579,10 +1583,11 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
     auto& partition = PartitionFor(store, partition_ids[i]);
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       ++partition.grouped_generations_[db_id];
-      auto index_write =
-          co_await AwaitAllIndexReaders(partition.indexes_[db_id]);
-      QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
-                         &partition.grouped_objects_[db_id]);
+      if (auto* index = partition.indexes_.Get(db_id)) {
+        auto index_write = co_await AwaitAllIndexReaders(*index);
+        QueueDetachedIndex(store, *index, db_id,
+                           &partition.grouped_objects_[db_id]);
+      }
       partition.fullsync_coverage_bytes_[db_id] = 0;
       if (store.live_key_count_[db_id] < partition.live_key_count_[db_id]) {
         co_return absl::InternalError(
@@ -1708,6 +1713,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::ReplicaCommandNeedsApply(
     co_return absl::FailedPreconditionError(
         "FULL command coverage checked outside its apply context");
   }
+  if (!partition.indexes_.Get(db_id)) co_return true;
   auto found =
       co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
   if (!found.ok()) co_return found.status();
@@ -1938,6 +1944,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                              "stale partition replication epoch");
     }
+    const auto activation = EnsureDatabaseIndexes(store, applied.db_id_);
+    if (!activation.ok()) co_return activation;
     auto& index = partition.indexes_[applied.db_id_];
     auto resolved =
         co_await FindVerifiedEntry(store, index, digest, applied.key_);
@@ -2296,10 +2304,11 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
           for (std::uint8_t db_id = 0; db_id < options_.database_count_;
                ++db_id) {
             ++partition.grouped_generations_[db_id];
-            auto index_write =
-                co_await AwaitAllIndexReaders(partition.indexes_[db_id]);
-            QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
-                               &partition.grouped_objects_[db_id]);
+            if (auto* index = partition.indexes_.Get(db_id)) {
+              auto index_write = co_await AwaitAllIndexReaders(*index);
+              QueueDetachedIndex(store, *index, db_id,
+                                 &partition.grouped_objects_[db_id]);
+            }
             partition.fullsync_coverage_bytes_[db_id] = 0;
             if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
                 [[unlikely]] {

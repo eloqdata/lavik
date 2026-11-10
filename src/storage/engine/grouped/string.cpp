@@ -143,10 +143,12 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
   store_wait.End();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   TraceSpanScope lookup_scope(operation.diagnostics_, TraceStage::kLookup);
-  auto resolved =
-      co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
-  if (!resolved.ok()) co_return resolved.status();
-  auto* found = *resolved;
+  RecordIndex::Entry* found = nullptr;
+  if (auto* index = partition.indexes_.Get(db_id)) {
+    auto resolved = co_await FindVerifiedEntry(store, *index, digest, key);
+    if (!resolved.ok()) co_return resolved.status();
+    found = *resolved;
+  }
   lookup_scope.End();
   GroupedObject::Handle grouped;
   if (found && found->value_.grouped()) {

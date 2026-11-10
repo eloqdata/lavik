@@ -137,6 +137,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
   auto& partition = PartitionForKey(store, key);
   if (key.size() > std::numeric_limits<std::size_t>::max() - 4096)
     co_return absl::ResourceExhaustedError("collection key size overflow");
+  const auto activation = EnsureDatabaseIndexes(store, db_id);
+  if (!activation.ok()) co_return activation;
   auto initial_admission = TryReserveMemory(4096 + key.size());
   if (!initial_admission) {
     RecordMemoryRejection();

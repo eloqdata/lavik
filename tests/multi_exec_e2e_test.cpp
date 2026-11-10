@@ -441,6 +441,35 @@ int main(int argc, char** argv) {
     RespClient client = Connect(port);
     Expect(client.Command({"PING"}), "+PONG", "PING");
 
+    // An unused DB has no index arrays, but empty reads and flushes still
+    // carry normal WATCH/epoch semantics. The first write below occurs inside
+    // EXEC after both key intents have already been registered.
+    Expect(client.Command({"SELECT", "15"}), "+OK", "select unallocated DB");
+    Expect(client.Command({"GET", "lazy-a"}), "$-1", "empty lazy GET");
+    Expect(client.Command({"DBSIZE"}), ":0", "empty lazy DBSIZE");
+    ExpectContains(client.Command({"SCAN", "0"}), "\r\n*0", "empty lazy SCAN");
+    Expect(client.Command({"WATCH", "lazy-a"}), "+OK", "watch absent lazy key");
+    {
+      RespClient flusher = Connect(port);
+      Expect(flusher.Command({"SELECT", "15"}), "+OK", "flusher select");
+      Expect(flusher.Command({"FLUSHDB", "ASYNC"}), "+OK",
+             "flush unallocated DB");
+    }
+    Expect(client.Command({"MULTI"}), "+OK", "lazy invalidated MULTI");
+    Expect(client.Command({"GET", "lazy-a"}), "+QUEUED", "lazy queued GET");
+    Expect(client.Command({"EXEC"}), "*-1", "empty flush invalidates WATCH");
+    Expect(client.Command({"MULTI"}), "+OK", "lazy first-write MULTI");
+    Expect(client.Command({"SET", "lazy-a", "one"}), "+QUEUED",
+           "lazy first SET");
+    Expect(client.Command({"SET", "lazy-b", "two"}), "+QUEUED",
+           "lazy second SET");
+    Expect(client.Command({"EXEC"}), "*2\r\n+OK\r\n+OK",
+           "lazy first-write EXEC");
+    Expect(client.Command({"MGET", "lazy-a", "lazy-b"}),
+           "*2\r\n" + Bulk("one") + "\r\n" + Bulk("two"), "lazy EXEC values");
+    Expect(client.Command({"FLUSHDB", "SYNC"}), "+OK", "flush activated DB");
+    Expect(client.Command({"SELECT", "0"}), "+OK", "restore default DB");
+
     constexpr std::string_view invalid_function_library =
         "#!lua name=invalid_named_arg\n"
         "redis.register_function{function_name='invalid_named_arg', "
