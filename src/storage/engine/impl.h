@@ -2891,6 +2891,15 @@ class StorageEngine::Impl {
                                  const SortedSetOperation& operation,
                                  GroupedObject::Handle object);
 
+  // Caller retains member S and the selected ordered-page S under key IS.
+  // page_index addresses the common logical cut validated by the lock planner;
+  // score (including absence) remains protected until this task completes.
+  Task<absl::StatusOr<SortedSetResult>> ReadLockedSortedSetRank(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, GroupedObject::Handle object,
+      std::optional<double> score, std::size_t page_index);
+
   // Projects already sampled ranks. Draws and caller-owned S group holds
   // (when group_locked) must outlive the awaited task and its reply copies.
   Task<absl::StatusOr<SortedSetResult>> ReadGroupedSortedSetRandom(
