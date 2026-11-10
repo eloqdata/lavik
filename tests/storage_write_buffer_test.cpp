@@ -384,10 +384,10 @@ class WriteBufferTestPeer {
         {.action_ = DefragConfigAction::kPause});
     if (!status.ok()) co_return status;
     constexpr std::string_view key = "retirement-snapshot";
-    auto& index = impl.PartitionForKey(store, key).indexes_[0];
     const auto digest = ComputeDigest(key);
     auto wrote = co_await storage.Set(0, key, "first");
     if (!wrote.ok()) co_return wrote.status();
+    auto& index = impl.PartitionForKey(store, key).indexes_[0];
     const auto first = impl.MaterializeIndexLocation(*index.Find(digest, key));
     wrote = co_await storage.Set(0, key, "second");
     if (!wrote.ok()) co_return wrote.status();

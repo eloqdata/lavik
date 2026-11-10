@@ -1749,12 +1749,27 @@ class StorageEngine::Impl {
   std::size_t direct_io_alignment_ = kDirectIoAlignment;
 
  public:
+  // Owner-only views into per-database arrays. A missing array is an empty
+  // logical DB, not a disabled DB. Remote readers use the separately published
+  // atomic base, never these owner-local pointers.
+  template <typename T>
+  struct PartitionIndexView {
+    std::array<T*, kLogicalDatabaseCount>* bases_ = nullptr;
+    std::size_t offset_ = 0;
+
+    T* Get(std::uint8_t db) const noexcept {
+      T* base = (*bases_)[db];
+      return base ? base + offset_ : nullptr;
+    }
+    T& operator[](std::uint8_t db) const noexcept {
+      T* index = Get(db);
+      assert(index != nullptr);
+      return *index;
+    }
+  };
+
   struct FullSyncCollection;
   struct WorkerStore {
-    explicit WorkerStore(unsigned memory_owner = CurrentMemoryAccountingShard())
-        : partition_indexes_(RetainedAllocator<RecordIndex>(
-              {.owner_shard_ = memory_owner, .externally_admitted_ = true})) {}
-
     Impl* engine_ = nullptr;
     // Created only by grouped point writers; all access and waiter wakeups
     // stay on this key owner. The store outlives every request lock set.
@@ -2031,13 +2046,13 @@ class StorageEngine::Impl {
       };
 
       std::uint16_t id_ = 0;
-      // Views into the worker's fixed, contiguous index arrays. Prepare binds
-      // them once; neither the arrays nor their arena move afterwards.
-      std::span<RecordIndex> indexes_;
+      // Prepare binds the views once. Each DB array is created on demand and
+      // keeps its address until worker teardown, including across FLUSHDB.
+      PartitionIndexView<RecordIndex> indexes_;
       // Sparse second-level metadata: compact String and collection
       // keys never consult this table. Its population follows the top-level
       // index through detach/reset; handles alone do not pin physical data.
-      std::span<GroupedObjectIndex> grouped_objects_;
+      PartitionIndexView<GroupedObjectIndex> grouped_objects_;
       // A grouped view belongs to one partition/DB population. The worker's
       // broader index_generations_ invalidates ordinary suspended IO, but a
       // reset of an unrelated partition must not invalidate retained views
@@ -2106,11 +2121,21 @@ class StorageEngine::Impl {
     // Declaring the arena before partitions and detached populations makes it
     // outlive every map during reverse-order WorkerStore destruction.
     std::shared_ptr<ScanHashMapEntryArena> record_index_entry_arena_;
-    // Constructed before workers start, but charged to the eventual owner.
-    // Startup recovery includes this fixed footprint in its budget checks;
-    // allocator ownership also survives main-thread teardown.
-    std::vector<RecordIndex, RetainedAllocator<RecordIndex>> partition_indexes_;
-    std::vector<GroupedObjectIndex> partition_grouped_objects_;
+    struct DatabaseIndexes {
+      std::vector<RecordIndex, RetainedAllocator<RecordIndex>> primary_;
+      std::vector<GroupedObjectIndex, RetainedAllocator<GroupedObjectIndex>>
+          grouped_;
+      // Until the first quiescent intent boundary, all readers use the owner.
+      // This includes intents registered before the arrays existed: enabling
+      // stripes at allocation time would lose those transaction closures.
+      std::size_t unpublished_intents_ = 0;
+      bool reads_published_ = false;
+    };
+    std::array<DatabaseIndexes, kLogicalDatabaseCount> database_indexes_;
+    std::array<RecordIndex*, kLogicalDatabaseCount> index_bases_{};
+    std::array<GroupedObjectIndex*, kLogicalDatabaseCount> grouped_bases_{};
+    std::array<std::atomic<RecordIndex*>, kLogicalDatabaseCount>
+        published_indexes_{};
     std::vector<PartitionStore> partitions_;
     // Present only while a shutdown checkpoint is being restored. Keeping the
     // exact counts owner-local permits a post-load equality check without
@@ -2363,6 +2388,10 @@ class StorageEngine::Impl {
   absl::Status Prepare(unsigned worker_count);
 
   Task<absl::Status> InitializeWorker(Worker& worker);
+  // Non-suspending owner-local activation. Admission failure leaves both
+  // arrays absent and retryable; physical allocation failure remains fatal.
+  absl::Status EnsureDatabaseIndexes(WorkerStore& store, std::uint8_t db_id);
+  static void PublishDatabaseReads(WorkerStore& store, std::uint8_t db_id);
   static void NotifyIndexReaders(void* context) noexcept;
   static void ChangeReadIntent(void* context, const tx::KeyRef& key,
                                bool close);
@@ -3365,7 +3394,9 @@ class StorageEngine::Impl {
         epoch_metadata_failed_.load(std::memory_order_acquire))
       return absl::FailedPreconditionError(
           "storage writer is stopped after an IO failure");
-    const auto* current = partition.indexes_[db_id].Find(digest, key);
+    const auto* current = (partition.indexes_.Get(db_id)
+                               ? partition.indexes_[db_id].Find(digest, key)
+                               : nullptr);
     if (current == nullptr || !current->key_complete() ||
         current->value_.kind() != RecordKind::kValue ||
         current->value_.value_type() != location.value_type() ||

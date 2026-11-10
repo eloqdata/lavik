@@ -73,7 +73,9 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
   if (mutation || partial_read) {
     auto& store = CurrentStore();
     auto& partition = PartitionForKey(store, key);
-    const auto* found = partition.indexes_[db_id].Find(digest, key);
+    const auto* found = (partition.indexes_.Get(db_id)
+                             ? partition.indexes_[db_id].Find(digest, key)
+                             : nullptr);
     concurrent = CanPrepareGroupedWriteUnlocked(partition) && found &&
                  found->key_complete() && found->value_.grouped() &&
                  found->value_.value_type() == ValueType::kSortedSet;

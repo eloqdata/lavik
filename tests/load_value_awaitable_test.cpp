@@ -51,8 +51,12 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     store.engine_ = &engine;
     store.worker_ = &worker_;
     store.partitions_.resize(1);
-    store.partition_indexes_.resize(kLogicalDatabaseCount);
-    store.partitions_[0].indexes_ = store.partition_indexes_;
+    store.record_index_entry_arena_ = std::make_shared<ScanHashMapEntryArena>(
+        ScanHashMapEntryArena::kMaximumPageId, /*externally_admitted=*/true);
+    ASSERT_TRUE(store.record_index_entry_arena_->PreallocateDirectory());
+    store.partitions_[0].indexes_ = {&store.index_bases_, 0};
+    store.partitions_[0].grouped_objects_ = {&store.grouped_bases_, 0};
+    ASSERT_TRUE(engine.EnsureDatabaseIndexes(store, 0).ok());
     store.partitions_[0].replication_epoch_ = 1;
     store.files_.push_back(bycorf::FixedFile{});
     engine.db_epochs_[0].store(1);
@@ -348,8 +352,6 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     for (std::size_t i = 0; i < bytes; ++i)
       value_[i] = static_cast<char>(i % 251);
     auto& store = Store();
-    store.partition_grouped_objects_.resize(kLogicalDatabaseCount);
-    store.partitions_[0].grouped_objects_ = store.partition_grouped_objects_;
     block_.in_memory_ = true;
     if (block_.staging_slot_ == 0) {
       block_.staging_slot_ = store.staging_slots_.size();
@@ -437,8 +439,6 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   void PrepareGroupedCollection(ValueType type, std::size_t count) {
     digest_ = ComputeDigest(key_);
     auto& store = Store();
-    store.partition_grouped_objects_.resize(kLogicalDatabaseCount);
-    store.partitions_[0].grouped_objects_ = store.partition_grouped_objects_;
     block_.in_memory_ = true;
     if (block_.staging_slot_ == 0) {
       block_.staging_slot_ = store.staging_slots_.size();

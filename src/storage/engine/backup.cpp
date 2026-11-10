@@ -580,6 +580,8 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
   }
 
   if (saved == nullptr) {
+    if (!partition.indexes_.Get(db_id))
+      co_return std::optional<RdbSnapshotValue>{};
     auto& index = partition.indexes_[db_id];
     while (true) {
       auto resolved = co_await FindVerifiedEntry(store, index, digest, key);

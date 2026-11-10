@@ -1119,7 +1119,9 @@ StorageEngine::Impl::TryConcurrentSortedSetRead(
   auto& partition = PartitionForKey(store, key);
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  const auto* found = partition.indexes_[db_id].Find(digest, key);
+  const auto* found = (partition.indexes_.Get(db_id)
+                           ? partition.indexes_[db_id].Find(digest, key)
+                           : nullptr);
   const auto now = operation.now_ms_ ? operation.now_ms_ : UnixTimeMillis();
   if (!found || !found->key_complete() || !found->value_.grouped() ||
       found->value_.value_type() != ValueType::kSortedSet ||
@@ -1523,7 +1525,9 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
   auto& partition = PartitionForKey(store, key);
   if (!CanPrepareGroupedWriteUnlocked(partition)) co_return std::nullopt;
   const auto population = CaptureCompactWriteSnapshot(store, partition, db_id);
-  const auto* found = partition.indexes_[db_id].Find(digest, key);
+  const auto* found = (partition.indexes_.Get(db_id)
+                           ? partition.indexes_[db_id].Find(digest, key)
+                           : nullptr);
   const auto now = operation.now_ms_ ? operation.now_ms_ : UnixTimeMillis();
   if (!found || !found->key_complete() || !found->value_.grouped() ||
       found->value_.value_type() != ValueType::kSortedSet ||
@@ -1910,7 +1914,9 @@ StorageEngine::Impl::TryConcurrentSortedSetBatch(
   auto& partition = PartitionForKey(store, key);
   if (!CanPrepareGroupedWriteUnlocked(partition)) co_return std::nullopt;
   const auto population = CaptureCompactWriteSnapshot(store, partition, db_id);
-  const auto* found = partition.indexes_[db_id].Find(digest, key);
+  const auto* found = (partition.indexes_.Get(db_id)
+                           ? partition.indexes_[db_id].Find(digest, key)
+                           : nullptr);
   if (!found || !found->key_complete() || !found->value_.grouped() ||
       found->value_.value_type() != ValueType::kSortedSet ||
       IsExpired(*found,
@@ -2299,7 +2305,9 @@ StorageEngine::Impl::TryConcurrentSortedSetSelection(
   auto& partition = PartitionForKey(store, key);
   if (!CanPrepareGroupedWriteUnlocked(partition)) co_return std::nullopt;
   const auto population = CaptureCompactWriteSnapshot(store, partition, db_id);
-  const auto* found = partition.indexes_[db_id].Find(digest, key);
+  const auto* found = (partition.indexes_.Get(db_id)
+                           ? partition.indexes_[db_id].Find(digest, key)
+                           : nullptr);
   if (!found || !found->key_complete() || !found->value_.grouped() ||
       found->value_.value_type() != ValueType::kSortedSet ||
       IsExpired(*found,
@@ -2432,10 +2440,10 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   store_wait.End();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   TraceSpanScope lookup_scope(operation.diagnostics_, TraceStage::kLookup);
-  auto& index = partition.indexes_[db_id];
-  auto* found = index.Find(digest, key);
+  auto* index = partition.indexes_.Get(db_id);
+  auto* found = index ? index->Find(digest, key) : nullptr;
   if (found && !found->key_complete()) {
-    auto verified = co_await FindVerifiedEntry(store, index, digest, key);
+    auto verified = co_await FindVerifiedEntry(store, *index, digest, key);
     if (!verified.ok()) co_return verified.status();
     found = *verified;
   }

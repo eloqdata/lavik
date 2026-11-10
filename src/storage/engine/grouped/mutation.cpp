@@ -185,6 +185,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   const auto replication_epoch = partition.replication_epoch_;
   const auto index_generation = store.index_generations_[db_id];
   const auto grouped_generation = partition.grouped_generations_[db_id];
+  const auto activation = EnsureDatabaseIndexes(store, db_id);
+  if (!activation.ok()) co_return activation;
   auto& side = partition.grouped_objects_[db_id];
   auto source_side = side.CurrentForMutation(key);
   const auto source_matches = [&](const GroupedObject::Handle& current) {

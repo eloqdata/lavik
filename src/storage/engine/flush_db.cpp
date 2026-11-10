@@ -290,7 +290,8 @@ Task<absl::Status> StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   std::vector<RecordIndex::WriteGuard> index_writes;
   index_writes.reserve(store.partitions_.size());
   for (auto& partition : store.partitions_)
-    index_writes.push_back(partition.indexes_[db_id].CloseAllReaders());
+    if (auto* index = partition.indexes_.Get(db_id))
+      index_writes.push_back(index->CloseAllReaders());
   for (auto& guard : index_writes)
     while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
   // FLUSHDB invalidates every watcher of this database, including watches
@@ -325,9 +326,10 @@ Task<absl::Status> StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   ++store.index_generations_[db_id];
   tomb_raider_index_generation_.fetch_add(1, std::memory_order_release);
   for (auto& partition : store.partitions_) {
-    auto& index = partition.indexes_[db_id];
     ++partition.grouped_generations_[db_id];
-    QueueDetachedIndex(store, index, db_id, &partition.grouped_objects_[db_id]);
+    if (auto* index = partition.indexes_.Get(db_id))
+      QueueDetachedIndex(store, *index, db_id,
+                         &partition.grouped_objects_[db_id]);
     partition.fullsync_coverage_bytes_[db_id] = 0;
     partition.live_key_count_[db_id] = 0;
     partition.expiring_key_count_[db_id] = 0;

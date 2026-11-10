@@ -65,12 +65,25 @@ Storage separates three ownership domains:
 - A logical partition is one of the 16,384 Redis hash slots. Its current key
   owner is `partition_id % worker_count`; that worker owns the partition's
   enabled logical-database indexes, mutation sequence, replication epoch,
-  counts, and snapshot state. Cluster client mode constructs only DB0 indexes;
-  Single client mode constructs all 16, independently of Meta management. Each worker owns contiguous index arrays
-  backed by its shared entry arena, with partitions holding fixed views into
-  those arrays. Durable epochs and checkpoint capacity tables retain all 16
-  database slots in both modes. Recovery rejects current records in disabled
-  databases rather than hiding an existing standalone dataset.
+  counts, and snapshot state. Cluster client mode enables only DB0; Single
+  enables all 16, independently of Meta management. Primary and grouped-object
+  index arrays are allocated together on their owner at worker × database
+  granularity, including DB0, when a write, recovery, or replica import needs
+  them. Empty reads and enumeration do not allocate indexes. Lightweight
+  counts, epochs and population generations exist independently, so empty-DB
+  flushes still invalidate WATCH, snapshots and full-sync state. Durable epochs
+  and checkpoint capacity tables retain all 16 database slots in both modes;
+  recovery rejects current records in disabled databases.
+  Each activation admits both complete arrays before publication, and rejected
+  admission leaves activation retryable. Arrays share the worker's entry arena
+  and keep their addresses through flush and replica reset until worker
+  teardown; those operations detach entries and buckets, not index objects.
+  Remote readers acquire a separately published array pointer and otherwise
+  fall back to the owner. Publication waits for a local DB intent quiescence
+  boundary, including intents registered before allocation. Until that boundary
+  new intents also use owner fallback; afterwards the existing index stripes
+  provide transaction reader admission. This avoids exposing a first write's
+  intermediate transaction state without cross-worker locks.
 - A physical block has one current runtime owner. When the worker topology
   matches the topology recorded in its header, recovery retains the original
   writer if that worker can access the device. Otherwise recovery hashes the

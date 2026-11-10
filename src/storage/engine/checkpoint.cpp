@@ -1209,9 +1209,10 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       payload->AppendPod(CheckpointCapacityEntry{
           // Keep the fixed 16-DB capacity table compatible with cold and
           // checkpoint recovery in either server mode.
-          .entry_count_ = db_id < options_.database_count_
-                              ? partition.indexes_[db_id].size()
-                              : 0,
+          .entry_count_ =
+              db_id < options_.database_count_ && partition.indexes_.Get(db_id)
+                  ? partition.indexes_[db_id].size()
+                  : 0,
           .partition_id_ = partition.id_,
           .db_id_ = db_id,
       });
@@ -1450,6 +1451,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
 
   for (WorkerStore::PartitionStore& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
+      if (!partition.indexes_.Get(db_id)) continue;
       RecordIndex& index = partition.indexes_[db_id];
       RecordIndex::StableScanCursor cursor;
       bool exhausted = false;
@@ -2174,6 +2176,9 @@ absl::Status StorageEngine::Impl::PreallocateCheckpointIndexes(
         }
         continue;
       }
+      if (count == 0) continue;
+      const auto activation = EnsureDatabaseIndexes(store, db_id);
+      if (!activation.ok()) return activation;
       if (count > std::numeric_limits<std::size_t>::max() ||
           !partition.indexes_[db_id].PreallocateForExpectedSize(
               static_cast<std::size_t>(count))) {
@@ -2194,9 +2199,10 @@ absl::Status StorageEngine::Impl::ValidateCheckpointIndexSizes(
        partition_index < store.partitions_.size(); ++partition_index) {
     const auto& partition = store.partitions_[partition_index];
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      const std::size_t size = db_id < options_.database_count_
-                                   ? partition.indexes_[db_id].size()
-                                   : 0;
+      const std::size_t size =
+          db_id < options_.database_count_ && partition.indexes_.Get(db_id)
+              ? partition.indexes_[db_id].size()
+              : 0;
       if (size != store.checkpoint_index_capacities_[partition_index][db_id]) {
         return absl::InternalError(
             "checkpoint index size differs from declared capacity");
@@ -2504,6 +2510,10 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
                 key_indirect, (flags & kShielding) != 0,
                 (flags & kUnclaimed) != 0, false, kind, value_type));
         auto& partition = PartitionFor(store, partition_id);
+        if (!partition.indexes_.Get(db_id)) {
+          return absl::InternalError(
+              "checkpoint entry has no declared database capacity");
+        }
         RecordIndex::Entry* installed = partition.indexes_[db_id].InsertNew(
             entry.digest_, key, location, !key_indirect);
         if (installed == nullptr) {

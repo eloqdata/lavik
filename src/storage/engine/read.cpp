@@ -281,6 +281,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
   // ScanPartition once per empty logical partition would create thousands of
   // coroutine round trips when the only counted records are expired.
   for (WorkerStore::PartitionStore& partition : store.partitions_) {
+    if (!partition.indexes_.Get(db_id)) continue;
     RecordIndex& index = partition.indexes_[db_id];
     RecordIndex::Entry* selected = nullptr;
     const std::uint64_t now_ms = UnixTimeMillis();
@@ -343,7 +344,10 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   result.replication_epoch_ = replication_epoch;
   TraceSpanScope lookup(result.trace_ ? result.trace_->diagnostics_ : nullptr,
                         TraceStage::kLookup);
-  auto& index = PartitionFor(source, slot).indexes_[db_id];
+  auto* base = source.published_indexes_[db_id].load(std::memory_order_acquire);
+  if (base == nullptr) [[unlikely]]
+    return;
+  auto& index = base[slot / worker_count_];
   index.PrefetchRead();
   const auto digest = ComputeDigest(key);
   auto reader = index.TryRead(digest);
@@ -669,6 +673,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
   while (true) {
     TraceSpanScope lookup_scope(trace ? trace->diagnostics_ : nullptr,
                                 TraceStage::kLookup);
+    if (!partition.indexes_.Get(db_id)) [[unlikely]]
+      co_return absl::NotFoundError("");
     auto& index = partition.indexes_[db_id];
     auto* found = index.Find(digest, key);
     if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -771,6 +777,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const BatchGetRequest& request = requests[i];
     auto& partition = PartitionForKey(store, request.key_);
+    if (!partition.indexes_.Get(db_id)) continue;
     auto& index = partition.indexes_[db_id];
     auto* found = index.Find(request.digest_, request.key_);
     if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -1080,6 +1087,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  if (!partition.indexes_.Get(db_id)) [[unlikely]]
+    co_return absl::NotFoundError("");
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -1137,6 +1146,8 @@ Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadataLocked(
   auto& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
   TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
+  if (!partition.indexes_.Get(db_id)) [[unlikely]]
+    co_return ExpirationInfo{};
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -1181,6 +1192,8 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpirationLocked(
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  if (!partition.indexes_.Get(db_id)) [[unlikely]]
+    co_return ExpirationInfo{};
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -1217,6 +1230,8 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
   TraceSpanScope lookup_scope(diagnostics, TraceStage::kLookup);
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
 
+  if (!partition.indexes_.Get(db_id)) [[unlikely]]
+    co_return absl::NotFoundError("");
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -1279,6 +1294,8 @@ Task<bool> StorageEngine::Impl::KeyLive(std::uint8_t db_id,
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  if (!partition.indexes_.Get(db_id)) [[unlikely]]
+    co_return false;
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -1308,6 +1325,8 @@ Task<bool> StorageEngine::Impl::ExistsLocked(std::uint8_t db_id,
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  if (!partition.indexes_.Get(db_id)) [[unlikely]]
+    co_return false;
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {

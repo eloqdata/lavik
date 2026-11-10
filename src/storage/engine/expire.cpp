@@ -533,7 +533,8 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
          step < maintenance_steps && !store->partitions_.empty(); ++step) {
       auto& partition =
           store->partitions_[store->index_maintenance_partition_cursor_];
-      if (partition.indexes_[store->index_maintenance_db_cursor_].Maintain()) {
+      auto* index = partition.indexes_.Get(store->index_maintenance_db_cursor_);
+      if (index != nullptr && index->Maintain()) {
         continue;
       }
       if (++store->index_maintenance_db_cursor_ == options_.database_count_) {

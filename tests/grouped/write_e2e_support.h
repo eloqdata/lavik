@@ -341,9 +341,9 @@ class Client {
 
 class Server {
  public:
-  // General correctness cases recover with up to four workers. Their fixed
-  // indexes and I/O pools alone exceed the online waterline of a 1 GiB limit;
-  // tests of tight admission supply WithStorageBaseline(...) explicitly.
+  // General correctness cases recover with up to four workers and need room
+  // for I/O pools, activated indexes, and large collection operations. Tests
+  // of tight admission supply WithStorageBaseline(...) explicitly.
   Server(const PrivateDisk& disk, unsigned workers = 2,
          std::string_view crash = {}, std::string_view fail_aux = {},
          bool pause_handoff = false, unsigned fail_aux_nth = 2,

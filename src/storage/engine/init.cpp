@@ -364,7 +364,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   // registered pools exist. That exact allocation remains with the worker for
   // recovery and maintenance. All synchronous uses finish before handoff.
   stores_.reserve(worker_count);
-  stores_.push_back(std::make_unique<WorkerStore>(1));
+  stores_.push_back(std::make_unique<WorkerStore>());
   absl::Status prepared = stores_[0]->buffers_.PrepareMaintenanceBuffers(
       0, options_.buffers_.alignment_);
   if (!prepared.ok()) return prepared;
@@ -997,7 +997,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   recovery_next_log_ms_.store(recovery_started_ms_ + 5000,
                               std::memory_order_relaxed);
   for (unsigned i = 0; i < worker_count; ++i) {
-    if (i != 0) stores_.push_back(std::make_unique<WorkerStore>(i + 1));
+    if (i != 0) stores_.push_back(std::make_unique<WorkerStore>());
     WorkerStore& store = *stores_[i];
     // Record and UUID insertion reserve a new page together with any bucket
     // growth before mutating durable staging. The arena must not reserve the
@@ -1017,29 +1017,15 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     store.indirect_keys_.SetEntryArena(store.record_index_entry_arena_);
     const std::size_t partition_count =
         (kLogicalStorageShards + worker_count - 1 - i) / worker_count;
-    const std::size_t index_count = partition_count * options_.database_count_;
     store.partitions_.reserve(partition_count);
-    store.partition_indexes_.reserve(index_count);
-    store.partition_grouped_objects_.reserve(index_count);
-    // Construct directly with the shared arena. In particular, do not create
-    // and then discard a private grouped-object arena for every empty DB.
-    for (std::size_t index = 0; index < index_count; ++index) {
-      store.partition_indexes_.emplace_back(store.record_index_entry_arena_);
-      store.partition_grouped_objects_.emplace_back(
-          store.record_index_entry_arena_);
-    }
     for (std::uint32_t partition = i; partition < kLogicalStorageShards;
          partition += worker_count) {
       store.partitions_.emplace_back();
       WorkerStore::PartitionStore& partition_store = store.partitions_.back();
       partition_store.id_ = static_cast<std::uint16_t>(partition);
-      const std::size_t offset =
-          (store.partitions_.size() - 1) * options_.database_count_;
-      partition_store.indexes_ = std::span(store.partition_indexes_)
-                                     .subspan(offset, options_.database_count_);
-      partition_store.grouped_objects_ =
-          std::span(store.partition_grouped_objects_)
-              .subspan(offset, options_.database_count_);
+      const std::size_t offset = store.partitions_.size() - 1;
+      partition_store.indexes_ = {&store.index_bases_, offset};
+      partition_store.grouped_objects_ = {&store.grouped_bases_, offset};
       partition_store.replication_epoch_ =
           epoch_values_[kLogicalDatabaseCount + partition];
       remote_replication_epochs_[partition].store(
@@ -1472,7 +1458,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     // Validated root entries retain recovery metadata for the winner merge.
     for (auto& partition : store.partitions_)
       for (std::uint8_t db = 0; db < options_.database_count_; ++db)
-        (void)partition.grouped_objects_[db].Detach();
+        if (auto* grouped = partition.grouped_objects_.Get(db))
+          (void)grouped->Detach();
   }
 
   if (checkpoint_load_fell_back_.load(std::memory_order_acquire)) {
@@ -1483,6 +1470,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     // this O(keys) auxiliary hash table entirely.
     for (auto& partition : store.partitions_) {
       for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
+        if (!partition.indexes_.Get(db_id)) continue;
         partition.indexes_[db_id].ForEach([&](RecordIndex::Entry& entry) {
           store.recovery_lsns_.insert_or_assign(
               &entry, std::numeric_limits<std::uint64_t>::max());
@@ -1642,6 +1630,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         // preserving the durable-tombstone treatment below for every index
         // that can expire.
         if (partition.expiring_key_count_[db_id] == 0) continue;
+        if (!partition.indexes_.Get(db_id)) continue;
         auto& index = partition.indexes_[db_id];
         index.ForEach([&](RecordIndex::Entry& entry) {
           if (entry.value_.kind() == RecordKind::kValue &&
@@ -1815,6 +1804,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     // live key until the complete pass finishes.
     for (auto& partition : store.partitions_) {
       for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
+        if (!partition.indexes_.Get(db_id)) continue;
         auto& index = partition.indexes_[db_id];
         RecordIndex::StableScanCursor cursor;
         bool exhausted = false;
@@ -2204,11 +2194,9 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                              ChangeReadIntent(ctx, key, false);
                            },
                            &ReadIntentReady});
-  for (auto& index : store.partition_indexes_) {
-    index.SetReaderNotifier(&store, &NotifyIndexReaders);
-    index.EnableConcurrentReads();
-  }
   store.remote_reads_ready_.store(true, std::memory_order_release);
+  for (std::uint8_t db = 0; db < options_.database_count_; ++db)
+    PublishDatabaseReads(store, db);
   worker.SpawnRoot(PeriodicFlush(&store));
   worker.SpawnBackground(ActiveExpiration(&store));
   // The scheduler lives until shutdown, including OFF and incomplete FULL.
@@ -2217,6 +2205,62 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     worker.SpawnBackground(TombRaiderLoop(&store));
   }
   co_return absl::OkStatus();
+}
+
+absl::Status StorageEngine::Impl::EnsureDatabaseIndexes(WorkerStore& store,
+                                                        std::uint8_t db_id) {
+  if (db_id >= options_.database_count_)
+    return absl::InvalidArgumentError("invalid logical database");
+  if (store.index_bases_[db_id] != nullptr) [[likely]]
+    return absl::OkStatus();
+  const std::size_t count = store.partitions_.size();
+  // Admit both arrays, including allocator rounding/alignment, before either
+  // becomes reachable. Entry pages and buckets retain their existing separate
+  // pre-publication admission. A later write failure may retain empty arrays,
+  // but never changes the logical contents of the database.
+  const std::size_t bytes =
+      AllocatorUsableSizeForRequest(count * sizeof(RecordIndex)) +
+      alignof(RecordIndex) +
+      AllocatorUsableSizeForRequest(count * sizeof(GroupedObjectIndex)) +
+      alignof(GroupedObjectIndex);
+  auto reservation = TryReserveMemory(bytes);
+  if (!reservation) {
+    RecordMemoryRejection();
+    return MemoryLimitError("OOM logical database indexes");
+  }
+  const auto& domain = store.record_index_entry_arena_->allocation_domain();
+  auto& db = store.database_indexes_[db_id];
+  db.primary_ = decltype(db.primary_)(RetainedAllocator<RecordIndex>(domain));
+  db.grouped_ =
+      decltype(db.grouped_)(RetainedAllocator<GroupedObjectIndex>(domain));
+  db.primary_.reserve(count);
+  db.grouped_.reserve(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    db.primary_.emplace_back(store.record_index_entry_arena_);
+    db.grouped_.emplace_back(store.record_index_entry_arena_);
+    db.primary_.back().SetReaderNotifier(&store, &NotifyIndexReaders);
+  }
+  store.grouped_bases_[db_id] = db.grouped_.data();
+  store.index_bases_[db_id] = db.primary_.data();
+  PublishDatabaseReads(store, db_id);
+  return absl::OkStatus();
+}
+
+void StorageEngine::Impl::PublishDatabaseReads(WorkerStore& store,
+                                               std::uint8_t db_id) {
+  auto& db = store.database_indexes_[db_id];
+  if (db.reads_published_ || db.unpublished_intents_ != 0 ||
+      store.index_bases_[db_id] == nullptr ||
+      !store.remote_reads_ready_.load(std::memory_order_relaxed))
+    return;
+  // No intent can span this owner-local, non-suspending transition. Until it
+  // happens even newly arriving intents join the coarse count; afterwards
+  // all closures use the existing per-partition stripes. Under uninterrupted
+  // overlapping intents, owner fallback remains correct until the DB drains.
+  for (auto& index : db.primary_) index.EnableConcurrentReads();
+  db.reads_published_ = true;
+  store.published_indexes_[db_id].store(db.primary_.data(),
+                                        std::memory_order_release);
 }
 
 void StorageEngine::Impl::NotifyIndexReaders(void* context) noexcept {
@@ -2240,6 +2284,17 @@ void StorageEngine::Impl::ChangeReadIntent(void* context, const tx::KeyRef& key,
       index.ReleaseReadIntent(key.fp_);
   };
   if (key.db_ >= store.engine_->options_.database_count_) return;
+  auto& db = store.database_indexes_[key.db_];
+  if (!db.reads_published_) [[unlikely]] {
+    if (close) {
+      ++db.unpublished_intents_;
+    } else {
+      assert(db.unpublished_intents_ != 0);
+      --db.unpublished_intents_;
+      PublishDatabaseReads(store, key.db_);
+    }
+    return;
+  }
   if (key.slot_ < kLogicalStorageShards) {
     change(store.engine_->PartitionFor(store, key.slot_).indexes_[key.db_]);
   } else {
@@ -2254,6 +2309,7 @@ bool StorageEngine::Impl::ReadIntentReady(void* context,
                                           const tx::KeyRef& key) {
   auto& store = *static_cast<WorkerStore*>(context);
   if (key.db_ >= store.engine_->options_.database_count_) return true;
+  if (!store.database_indexes_[key.db_].reads_published_) return true;
   if (key.slot_ < kLogicalStorageShards)
     return store.engine_->PartitionFor(store, key.slot_)
         .indexes_[key.db_]

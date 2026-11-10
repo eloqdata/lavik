@@ -151,6 +151,8 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaCollection(
       lavik::storage::RedisSlot(stage.key_));
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  const auto activation = EnsureDatabaseIndexes(store, stage.db_id_);
+  if (!activation.ok()) co_return activation;
   auto current = co_await FindVerifiedEntry(
       store, partition.indexes_[stage.db_id_], digest, stage.key_);
   if (!current.ok()) co_return current.status();

@@ -459,6 +459,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   auto& partition = record.key_indirect_
                         ? PartitionFor(key_store, record.key_id_[0] & 0x3fff)
                         : PartitionForKey(key_store, key);
+  if (!partition.indexes_.Get(record.db_id_)) co_return std::nullopt;
   auto& index = partition.indexes_[record.db_id_];
   Digest digest;
   if (record.key_indirect_) {
