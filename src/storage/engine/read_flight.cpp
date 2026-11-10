@@ -104,6 +104,15 @@ std::unique_ptr<ReadFlightRegistry> ReadFlightRegistry::TryCreate(
 }
 ReadFlightRegistry::~ReadFlightRegistry() { FinalizeQuiesced(); }
 
+std::size_t ReadFlightRegistry::pending_waiters() const noexcept {
+  if (!active_) return 0;
+  std::size_t pending = 0;
+  // Recycled slots have no consumers. The owner cannot interleave a scrape
+  // with synchronous completion fanout or cancellation.
+  for (std::size_t i = 0; i < capacity_; ++i) pending += flights_[i].consumers;
+  return pending;
+}
+
 void ReadFlightRegistry::Attach(ReadFlight& flight, ReadFlightWaiter& waiter) {
   assert(!waiter.flight_ && !waiter.delivered_);
   waiter.flight_ = &flight;

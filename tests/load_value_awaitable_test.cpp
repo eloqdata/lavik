@@ -2963,6 +2963,8 @@ TEST_F(LocalReadFlightTest, OverlapSharesOneIoAndCompletionIsNotACache) {
   }
   EXPECT_EQ(Flights().stats().leaders, 1);
   EXPECT_EQ(Flights().stats().joins, 15);
+  EXPECT_EQ(Store().read_flight_eligible_attempts_, 16);
+  EXPECT_FALSE(Store().read_flight_metadata_failed_);
   EXPECT_EQ(block_.pin_count(), 1);
   EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount() - 1);
   std::vector<Result> results;
@@ -2981,6 +2983,7 @@ TEST_F(LocalReadFlightTest, OverlapSharesOneIoAndCompletionIsNotACache) {
   auto next = ReadCoalescedTask();
   Start(next);
   EXPECT_EQ(Flights().stats().leaders, 2);
+  EXPECT_EQ(Store().read_flight_eligible_attempts_, 17);
   ASSERT_NO_FATAL_FAILURE(Drain(next));
   auto single = std::move(next).TakeResult();
   ExpectValue(single);
@@ -3258,6 +3261,7 @@ TEST_F(LocalReadFlightTest, StagingAndDefaultConsumersBypassFlights) {
   auto value = std::move(staged).TakeResult();
   ExpectValue(value);
   EXPECT_FALSE(HasFlights());
+  EXPECT_EQ(Store().read_flight_eligible_attempts_, 0);
   value->lease_.Reset();
   block_.in_memory_ = false;
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
@@ -3265,11 +3269,13 @@ TEST_F(LocalReadFlightTest, StagingAndDefaultConsumersBypassFlights) {
   auto exclusive_task = AwaitExisting(exclusive);
   Start(exclusive_task);
   EXPECT_FALSE(HasFlights());
+  EXPECT_EQ(Store().read_flight_eligible_attempts_, 0);
   auto eligible = ReadCoalescedTask();
   Start(eligible);
   EXPECT_EQ(block_.pin_count(), 2);
   EXPECT_EQ(Flights().stats().leaders, 1);
   EXPECT_EQ(Flights().stats().joins, 0);
+  EXPECT_EQ(Store().read_flight_eligible_attempts_, 1);
   ASSERT_NO_FATAL_FAILURE(Drain(exclusive_task));
   ASSERT_NO_FATAL_FAILURE(Drain(eligible));
   auto first = std::move(exclusive_task).TakeResult();

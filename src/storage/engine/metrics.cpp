@@ -91,7 +91,11 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
   struct WorkerDiagnostics {
     ReadFlightStats read_flights;
     std::uint64_t pending = 0;
+    std::uint64_t waiters_pending = 0;
+    std::uint64_t eligible_attempts = 0;
+    std::uint64_t metadata_bypass = 0;
     std::uint64_t shared_bytes = 0;
+    std::uint64_t shared_peak_bytes = 0;
     std::optional<std::uint64_t> dirty_bytes;
   };
 
@@ -121,11 +125,17 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
       // would move the same accumulator cache lines through every worker.
       WorkerDiagnostics local;
       const auto& store = CurrentStore();
+      local.eligible_attempts = store.read_flight_eligible_attempts_;
+      local.metadata_bypass = store.read_flight_metadata_failed_
+                                  ? store.read_flight_eligible_attempts_
+                                  : 0;
       if (store.read_flights_) {
         local.read_flights = store.read_flights_->stats();
         local.pending = store.read_flights_->size();
+        local.waiters_pending = store.read_flights_->pending_waiters();
       }
       local.shared_bytes = store.buffers_.shared_read_bytes();
+      local.shared_peak_bytes = store.buffers_.shared_read_peak_bytes();
       if (replication != nullptr) {
         const ReplicationLogInfo log = LocalReplicationLogInfo();
         *replication = StorageReplicationLogMetrics{
@@ -161,7 +171,11 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
           .worker_id_ = target,
           .stats_ = observation.read_flights,
           .pending_ = observation.pending,
+          .waiters_pending_ = observation.waiters_pending,
+          .eligible_attempts_ = observation.eligible_attempts,
+          .metadata_bypass_ = observation.metadata_bypass,
           .shared_bytes_ = observation.shared_bytes,
+          .shared_peak_bytes_ = observation.shared_peak_bytes,
       });
     }
     const auto& local = observation.read_flights;
@@ -174,7 +188,11 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
     total.waiter_full += local.waiter_full;
     total.shared_budget += local.shared_budget;
     result.read_flights_pending_ += observation.pending;
+    result.read_flight_waiters_pending_ += observation.waiters_pending;
+    result.read_flight_eligible_attempts_ += observation.eligible_attempts;
+    result.read_flight_metadata_bypass_ += observation.metadata_bypass;
     result.shared_read_bytes_ += observation.shared_bytes;
+    result.shared_read_peak_bytes_ += observation.shared_peak_bytes;
     if (observation.dirty_bytes.has_value()) {
       result.durability_.dirty_staging_bytes_ += *observation.dirty_bytes;
     } else {

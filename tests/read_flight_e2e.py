@@ -112,6 +112,7 @@ async def wait_retired(client):
         values = stats(client)
         if (
             values[b"storage_read_flights_pending"] == b"0"
+            and values[b"storage_read_flight_waiters_pending"] == b"0"
             and values[b"storage_shared_read_bytes"] == b"0"
         ):
             return values

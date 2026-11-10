@@ -303,7 +303,12 @@ struct StorageDiagnosticsSnapshot {
   StorageDurabilityStats durability_;
   ReadFlightStats read_flights_;
   std::uint64_t read_flights_pending_ = 0;
+  std::uint64_t read_flight_waiters_pending_ = 0;
+  std::uint64_t read_flight_eligible_attempts_ = 0;
+  std::uint64_t read_flight_metadata_bypass_ = 0;
   std::uint64_t shared_read_bytes_ = 0;
+  // Sum of owner high-water marks, not a simultaneous process-wide peak.
+  std::uint64_t shared_read_peak_bytes_ = 0;
   // Current nesting depth of explicit expiration pauses, not pause events.
   std::uint32_t expiration_pause_count_ = 0;
 };
@@ -343,7 +348,11 @@ struct StorageReadFlightMetrics {
   unsigned worker_id_ = 0;
   ReadFlightStats stats_;
   std::uint64_t pending_ = 0;
+  std::uint64_t waiters_pending_ = 0;
+  std::uint64_t eligible_attempts_ = 0;
+  std::uint64_t metadata_bypass_ = 0;
   std::uint64_t shared_bytes_ = 0;
+  std::uint64_t shared_peak_bytes_ = 0;
 };
 
 struct StorageMetricsSnapshot {

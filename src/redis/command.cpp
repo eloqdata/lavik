@@ -5251,7 +5251,11 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(durability.dirty_staging_bytes_) + "\r\n";
     const auto& flights = diagnostics.read_flights_;
     absl::StrAppend(
-        &info, "storage_read_flight_leaders:", flights.leaders,
+        &info, "storage_read_flight_eligible_attempts:",
+        diagnostics.read_flight_eligible_attempts_,
+        "\r\nstorage_read_flight_metadata_bypass:",
+        diagnostics.read_flight_metadata_bypass_,
+        "\r\nstorage_read_flight_leaders:", flights.leaders,
         "\r\nstorage_read_flight_joins:", flights.joins,
         "\r\nstorage_read_flight_cancellations:", flights.cancellations,
         "\r\nstorage_read_flight_rejections:", flights.rejected,
@@ -5259,8 +5263,11 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
         "\r\nstorage_read_flight_waiter_full:", flights.waiter_full,
         "\r\nstorage_read_flight_shared_budget:", flights.shared_budget,
         "\r\nstorage_read_flights_pending:", diagnostics.read_flights_pending_,
+        "\r\nstorage_read_flight_waiters_pending:",
+        diagnostics.read_flight_waiters_pending_,
         "\r\nstorage_shared_read_bytes:", diagnostics.shared_read_bytes_,
-        "\r\n");
+        "\r\nstorage_shared_read_peak_bytes:",
+        diagnostics.shared_read_peak_bytes_, "\r\n");
     info += "storage_expiration_pause_count:" +
             std::to_string(diagnostics.expiration_pause_count_) + "\r\n";
     info += "storage_flushes_pending:" +

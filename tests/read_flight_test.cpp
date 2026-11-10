@@ -175,6 +175,7 @@ TEST_F(ReadFlightTest, BoundedWaitersAndFullTableBypassWithoutTakingOwnership) {
   for (unsigned i = 1; i != 32; ++i)
     ASSERT_TRUE(registry->TryJoin(key, 42, waiters[i]));
   EXPECT_FALSE(registry->TryJoin(key, 42, waiters[32]));
+  EXPECT_EQ(registry->pending_waiters(), 32);
   auto bypass_buffer = Buffer();
   bool bypass_pin = true;
   EXPECT_EQ(registry
@@ -185,6 +186,7 @@ TEST_F(ReadFlightTest, BoundedWaitersAndFullTableBypassWithoutTakingOwnership) {
   EXPECT_TRUE(bypass_pin);
   EXPECT_TRUE(bypass_buffer.valid());
   producer.tag->Complete(worker_, 4096, 0);
+  EXPECT_EQ(registry->pending_waiters(), 0);
   for (unsigned i = 0; i != 32; ++i) {
     EXPECT_EQ(waiters[i].calls, 1);
     EXPECT_TRUE(waiters[i].buffer.shared());
@@ -344,10 +346,13 @@ TEST_F(ReadFlightTest, CancellationUnlinksMiddleHeadAndProducerIndependently) {
   ASSERT_NE(producer.tag, nullptr);
   for (unsigned i = 1; i < waiters.size(); ++i)
     ASSERT_TRUE(registry->TryJoin({}, 42, *waiters[i]));
+  EXPECT_EQ(registry->pending_waiters(), 6);
   waiters[3].reset();
   waiters[5].reset();
   waiters[0].reset();
+  EXPECT_EQ(registry->pending_waiters(), 3);
   producer.tag->Complete(worker_, 4096, 0);
+  EXPECT_EQ(registry->pending_waiters(), 0);
   for (const auto& waiter : waiters) {
     if (!waiter) continue;
     EXPECT_EQ(waiter->calls, 1);

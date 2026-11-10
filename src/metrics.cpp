@@ -715,7 +715,7 @@ std::array<CommandText, kCommandKindCount> g_command_text;
 std::array<WaitText, 2> g_wait_text;
 std::vector<std::string> g_worker_text;
 std::vector<std::string> g_worker_labels;
-std::array<std::string, 31> g_storage_diagnostic_text;
+std::array<std::string, 35> g_storage_diagnostic_text;
 void AppendStorageDiagnostics(
     const storage::StorageDiagnosticsSnapshot& diagnostics, MetricText* output);
 
@@ -794,6 +794,13 @@ void AppendStorageDiagnostics(
     AppendMetricText(output, value, "\n");
   };
   const auto& flights = diagnostics.read_flights_;
+  append("read_flight_eligible_attempts_total", "counter",
+         "Physical-read attempts eligible for worker-local sharing, including "
+         "retries and batch wave rechecks; not unique commands.",
+         diagnostics.read_flight_eligible_attempts_);
+  append("read_flight_metadata_bypass_total", "counter",
+         "Eligible attempts bypassed because registry metadata is unavailable.",
+         diagnostics.read_flight_metadata_bypass_);
   append("read_flight_leaders_total", "counter",
          "Immutable read producers admitted, including synchronous submission "
          "rejection.",
@@ -819,10 +826,18 @@ void AppendStorageDiagnostics(
   append("read_flights_pending", "gauge",
          "Physical producers still present in worker-local registries.",
          diagnostics.read_flights_pending_);
+  append("read_flight_waiters_pending", "gauge",
+         "Requests attached to pending physical reads, including producers; "
+         "excludes delivered results retained by consumers.",
+         diagnostics.read_flight_waiters_pending_);
   append("shared_read_bytes", "gauge",
          "Reserved or retained shared read arena bytes, including framing, "
          "until the final return.",
          diagnostics.shared_read_bytes_);
+  append("shared_read_peak_bytes", "gauge",
+         "Sum of worker shared read arena high-water marks since startup; "
+         "not a simultaneous process-wide peak.",
+         diagnostics.shared_read_peak_bytes_);
   const auto& cleaner = diagnostics.tx_cleaner_;
   append("tx_backlog_bytes", "gauge",
          "Occupied record bytes in sealed unreclaimed Tx blocks summed across "
@@ -1383,6 +1398,14 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
   // Export owner detail separately from the compatible aggregate families,
   // so summing one family never counts both owners and their total.
   output.append(
+      "# HELP lavik_storage_worker_read_flight_eligible_attempts_total "
+      "Eligible "
+      "physical-read attempts including retries and batch wave rechecks.\n"
+      "# TYPE lavik_storage_worker_read_flight_eligible_attempts_total "
+      "counter\n"
+      "# HELP lavik_storage_worker_read_flight_metadata_bypass_total Eligible "
+      "attempts bypassed because registry metadata is unavailable.\n"
+      "# TYPE lavik_storage_worker_read_flight_metadata_bypass_total counter\n"
       "# HELP lavik_storage_worker_read_flight_leaders_total Admitted physical "
       "producers.\n"
       "# TYPE lavik_storage_worker_read_flight_leaders_total counter\n"
@@ -1407,11 +1430,23 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       "# HELP lavik_storage_worker_read_flights_pending Current pending "
       "physical producers.\n"
       "# TYPE lavik_storage_worker_read_flights_pending gauge\n"
+      "# HELP lavik_storage_worker_read_flight_waiters_pending Requests "
+      "attached to pending physical reads, including producers.\n"
+      "# TYPE lavik_storage_worker_read_flight_waiters_pending gauge\n"
       "# HELP lavik_storage_worker_shared_read_bytes Reserved or retained "
       "shared arena bytes including framing.\n"
-      "# TYPE lavik_storage_worker_shared_read_bytes gauge\n");
+      "# TYPE lavik_storage_worker_shared_read_bytes gauge\n"
+      "# HELP lavik_storage_worker_shared_read_peak_bytes Shared read arena "
+      "high-water mark since startup.\n"
+      "# TYPE lavik_storage_worker_shared_read_peak_bytes gauge\n");
   for (const auto& flight : storage_metrics.read_flights_) {
     const std::string_view labels = g_worker_labels[flight.worker_id_];
+    AppendMetricText(
+        &output, "lavik_storage_worker_read_flight_eligible_attempts_total{",
+        labels, "} ", flight.eligible_attempts_, "\n");
+    AppendMetricText(&output,
+                     "lavik_storage_worker_read_flight_metadata_bypass_total{",
+                     labels, "} ", flight.metadata_bypass_, "\n");
     AppendMetricText(&output, "lavik_storage_worker_read_flight_leaders_total{",
                      labels, "} ", flight.stats_.leaders, "\n");
     AppendMetricText(&output, "lavik_storage_worker_read_flight_joins_total{",
@@ -1433,8 +1468,13 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
                      labels, "} ", flight.stats_.shared_budget, "\n");
     AppendMetricText(&output, "lavik_storage_worker_read_flights_pending{",
                      labels, "} ", flight.pending_, "\n");
+    AppendMetricText(&output,
+                     "lavik_storage_worker_read_flight_waiters_pending{",
+                     labels, "} ", flight.waiters_pending_, "\n");
     AppendMetricText(&output, "lavik_storage_worker_shared_read_bytes{", labels,
                      "} ", flight.shared_bytes_, "\n");
+    AppendMetricText(&output, "lavik_storage_worker_shared_read_peak_bytes{",
+                     labels, "} ", flight.shared_peak_bytes_, "\n");
   }
   for (const storage::StorageDeviceMetrics& device : storage_metrics.devices_) {
     std::string labels =

@@ -2090,7 +2090,13 @@ class StorageEngine::Impl {
     // Owner-local producers outlive cancelled request frames, but are reclaimed
     // after backend quiescence and before their buffer pool is destroyed.
     std::unique_ptr<ReadFlightRegistry> read_flights_;
+    // Kept outside the optional registry so failed metadata admission remains
+    // observable. Creation is attempted once: after failure every eligible
+    // attempt bypasses, so diagnostics can derive that total without another
+    // hot-path counter or check. Retrying creation would need separate counts.
+    std::uint64_t read_flight_eligible_attempts_ = 0;
     bool read_flights_attempted_ = false;
+    bool read_flight_metadata_failed_ = false;
     // Startup prefetch may outlive its decoder on checkpoint fallback. A
     // delegated SPDK completion can run on another worker; drain this count
     // before reusing the borrowed maintenance buffers in the next phase.
