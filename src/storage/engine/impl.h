@@ -1770,11 +1770,6 @@ class StorageEngine::Impl {
 
   struct FullSyncCollection;
   struct WorkerStore {
-    explicit WorkerStore(unsigned memory_owner = CurrentMemoryAccountingShard())
-        : memory_owner_(memory_owner) {}
-
-    unsigned memory_owner_;
-
     Impl* engine_ = nullptr;
     // Created only by grouped point writers; all access and waiter wakeups
     // stay on this key owner. The store outlives every request lock set.

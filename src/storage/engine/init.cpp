@@ -364,7 +364,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   // registered pools exist. That exact allocation remains with the worker for
   // recovery and maintenance. All synchronous uses finish before handoff.
   stores_.reserve(worker_count);
-  stores_.push_back(std::make_unique<WorkerStore>(1));
+  stores_.push_back(std::make_unique<WorkerStore>());
   absl::Status prepared = stores_[0]->buffers_.PrepareMaintenanceBuffers(
       0, options_.buffers_.alignment_);
   if (!prepared.ok()) return prepared;
@@ -997,7 +997,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   recovery_next_log_ms_.store(recovery_started_ms_ + 5000,
                               std::memory_order_relaxed);
   for (unsigned i = 0; i < worker_count; ++i) {
-    if (i != 0) stores_.push_back(std::make_unique<WorkerStore>(i + 1));
+    if (i != 0) stores_.push_back(std::make_unique<WorkerStore>());
     WorkerStore& store = *stores_[i];
     // Record and UUID insertion reserve a new page together with any bucket
     // growth before mutating durable staging. The arena must not reserve the
@@ -2228,8 +2228,7 @@ absl::Status StorageEngine::Impl::EnsureDatabaseIndexes(WorkerStore& store,
     RecordMemoryRejection();
     return MemoryLimitError("OOM logical database indexes");
   }
-  RetainedAllocationDomain domain{.owner_shard_ = store.memory_owner_,
-                                  .externally_admitted_ = true};
+  const auto& domain = store.record_index_entry_arena_->allocation_domain();
   auto& db = store.database_indexes_[db_id];
   db.primary_ = decltype(db.primary_)(RetainedAllocator<RecordIndex>(domain));
   db.grouped_ =
