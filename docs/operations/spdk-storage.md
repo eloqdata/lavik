@@ -138,14 +138,13 @@ driver state and rerun the same allowlisted config after enabling the mode.
 
 ## Start Lavik and check the configuration
 
-Set the extracted binary's absolute path and adjust the bind address and CPU
-list to your machine. The default worker count follows the CPU affinity, so
-`taskset -c 0-15` selects 16 workers. The example omits `v0.1.0-beta.1`
-defaults: kernel TCP, loopback address, port 6379, pinned workers, and disabled
-metrics:
+Use a current source build for this example and set its absolute binary path.
+Adjust the bind address and CPU list to your machine. The default worker count
+follows the CPU affinity, so `taskset -c 0-15` selects 16 workers. Other options
+use their defaults:
 
 ```bash
-LAVIK_BINARY='/opt/lavik-v0.1.0-beta.1-linux-x86_64/lavik'
+LAVIK_BINARY='/absolute/path/to/lavik/build/lavik'
 LAVIK_EAL_ARGS=''
 LAVIK_DATA_ARGS=()
 for bdf in $LAVIK_NVME_PCI; do
@@ -156,15 +155,18 @@ sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   env BYCORF_EAL_ARGS="$LAVIK_EAL_ARGS" BYCORF_DPDK_MEMORY_MB=8192 \
   taskset -c 0-15 "$LAVIK_BINARY" \
   --storage=spdk \
-  --spdk-max-completions-per-poll=16 \
   "${LAVIK_DATA_ARGS[@]}"
 ```
 
 Both the EAL allowlist and the `--data-file` list must cover the intended
 controllers/storage set. The latter uses SPDK URIs, never `/dev/nvme...`
-paths. The completion cap of 16 overrides the default of 8 to match the
-benchmark; foreground pre-poll keeps its default of 5 µs. The benchmark
-report records its other explicit settings.
+paths.
+
+Current source builds default `spdk-max-completions-per-poll` to `0`, which
+removes the worker-wide completion cap and uses SPDK's completion budget.
+A positive value can still be selected at startup or through
+`CONFIG SET spdk-max-completions-per-poll <value>` to limit completion batches.
+This setting does not affect io_uring storage.
 
 Use another terminal with a Redis-compatible CLI to inspect the running
 server. Query the same bind address and port used at launch:
@@ -174,10 +176,8 @@ redis-cli -h 127.0.0.1 -p 6379 PING
 redis-cli -h 127.0.0.1 -p 6379 CONFIG GET spdk-max-completions-per-poll
 ```
 
-Expect `PONG` and `16`, respectively. The foreground pre-poll option
-keeps its startup default; verify `spdk_foreground_pre_poll_us=5` in the startup
-log rather than through `CONFIG GET`. Inspect startup logs
-for SPDK initialization and the selected namespaces before loading data.
+Expect `PONG` and `0`, respectively. Inspect startup logs for SPDK
+initialization and the selected namespaces before loading data.
 
 With SPDK storage, `SPDK/EAL memory phase=storage-open` logs a snapshot after
 all data workers have allocated their fixed storage buffers and opened their

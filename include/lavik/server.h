@@ -84,7 +84,8 @@ struct ServerOptions {
   unsigned foreground_budget_us_ = 1000;
   unsigned background_budget_us_ = 10;
   unsigned background_warrant_percent_ = 1;
-  unsigned spdk_max_completions_per_poll_ = 8;
+  // Zero leaves completion batching to SPDK without a worker-wide cap.
+  unsigned spdk_max_completions_per_poll_ = 0;
   unsigned spdk_foreground_pre_poll_us_ = 5;
   long mimalloc_purge_delay_ms_ = kDefaultMimallocPurgeDelayMs;
   std::int64_t slowlog_log_slower_than_us_ = kDefaultSlowLogThresholdMicros;
