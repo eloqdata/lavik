@@ -62,6 +62,31 @@ bool ReadU64(std::string_view input, std::size_t* offset,
   return true;
 }
 
+// Share framing checks without constructing a StatusOr for each rejected
+// point-lookup candidate. Only the public result/error path builds a status.
+// On failure the cursor and destination remain unchanged.
+const char* ReadHashEntry(std::string_view payload, std::size_t* cursor,
+                          bool last, HashEntryView* entry) {
+  std::size_t offset = *cursor;
+  std::uint32_t field_bytes = 0;
+  std::uint32_t value_bytes = 0;
+  if (!ReadU32(payload, &offset, &field_bytes) ||
+      !ReadU32(payload, &offset, &value_bytes) || offset > payload.size() ||
+      field_bytes > kMaxStringBytes || value_bytes > kMaxStringBytes ||
+      field_bytes > payload.size() - offset ||
+      value_bytes > payload.size() - offset - field_bytes) {
+    return "Hash entry is truncated";
+  }
+  const auto end = offset + field_bytes + value_bytes;
+  if (last && end != payload.size()) {
+    return "Hash value has trailing bytes";
+  }
+  *entry = {.field_ = payload.substr(offset, field_bytes),
+            .value_ = payload.substr(offset + field_bytes, value_bytes)};
+  *cursor = end;
+  return nullptr;
+}
+
 }  // namespace
 
 absl::StatusOr<std::size_t> AppendHashEntrySize(std::size_t encoded_bytes,
@@ -117,26 +142,40 @@ absl::StatusOr<HashEntryView> HashValueReader::Next() {
   if (remaining_ == 0) {
     return absl::OutOfRangeError("Hash reader is exhausted");
   }
-  std::size_t offset = offset_;
-  std::uint32_t field_bytes = 0;
-  std::uint32_t value_bytes = 0;
-  if (!ReadU32(payload_, &offset, &field_bytes) ||
-      !ReadU32(payload_, &offset, &value_bytes) || offset > payload_.size() ||
-      field_bytes > kMaxStringBytes || value_bytes > kMaxStringBytes ||
-      field_bytes > payload_.size() - offset ||
-      value_bytes > payload_.size() - offset - field_bytes) {
-    return absl::InternalError("Hash entry is truncated");
+  HashEntryView entry;
+  if (const auto* error =
+          ReadHashEntry(payload_, &offset_, remaining_ == 1, &entry)) {
+    return absl::InternalError(error);
   }
-  HashEntryView entry{
-      .field_ = payload_.substr(offset, field_bytes),
-      .value_ = payload_.substr(offset + field_bytes, value_bytes)};
-  offset += field_bytes + value_bytes;
-  if (remaining_ == 1 && offset != payload_.size()) {
-    return absl::InternalError("Hash value has trailing bytes");
-  }
-  offset_ = offset;
   --remaining_;
   return entry;
+}
+
+absl::StatusOr<std::optional<std::string_view>> HashValueReader::Find(
+    std::string_view field) {
+  // Keep the scan cursor local; only the final result publishes the consumed
+  // prefix back to the reader, including when a later entry is malformed.
+  auto offset = offset_;
+  auto remaining = remaining_;
+  const auto payload = payload_;
+  while (remaining != 0) {
+    HashEntryView entry;
+    if (const auto* error =
+            ReadHashEntry(payload, &offset, remaining == 1, &entry)) {
+      offset_ = offset;
+      remaining_ = remaining;
+      return absl::InternalError(error);
+    }
+    --remaining;
+    if (entry.field_ == field) {
+      offset_ = offset;
+      remaining_ = remaining;
+      return entry.value_;
+    }
+  }
+  offset_ = offset;
+  remaining_ = 0;
+  return std::nullopt;
 }
 
 absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {

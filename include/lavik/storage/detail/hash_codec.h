@@ -59,6 +59,11 @@ class HashValueReader {
   std::size_t size() const { return size_; }
   // Failure does not advance the reader. Calling past the last entry fails.
   absl::StatusOr<HashEntryView> Next();
+  // Consumes through the first matching remaining field; the unused tail is
+  // not examined. Every traversed entry has the same checks as Next(). A
+  // malformed entry remains current on failure; a miss exhausts the reader.
+  // The returned value borrows the original payload, including empty values.
+  absl::StatusOr<std::optional<std::string_view>> Find(std::string_view field);
 
  private:
   HashValueReader(std::string_view payload, std::size_t count)
