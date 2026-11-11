@@ -162,9 +162,15 @@ sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
 
 Both the EAL allowlist and the `--data-file` list must cover the intended
 controllers/storage set. The latter uses SPDK URIs, never `/dev/nvme...`
-paths. The completion cap of 16 overrides the default of 8 to match the
-benchmark; foreground pre-poll keeps its default of 5 µs. The benchmark
-report records its other explicit settings.
+paths. The completion cap of 16 overrides the `v0.1.0-beta.1` default of 8
+to match the benchmark; foreground pre-poll keeps its default of 5 µs.
+The benchmark report records its other explicit settings.
+
+Current source builds default `spdk-max-completions-per-poll` to `0`, which
+removes the worker-wide completion cap and uses SPDK's completion budget.
+A positive value can still be selected at startup or through
+`CONFIG SET spdk-max-completions-per-poll <value>` to limit completion batches.
+This setting does not affect io_uring storage.
 
 Use another terminal with a Redis-compatible CLI to inspect the running
 server. Query the same bind address and port used at launch:
