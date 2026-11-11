@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 #include "lavik/storage/detail/stream_records.h"
 
@@ -38,13 +39,28 @@ void Put(std::string& output, std::uint64_t value, unsigned width) {
   }
 }
 
-std::uint64_t Get(std::string_view input, std::size_t offset, unsigned width) {
-  std::uint64_t value = 0;
-  for (unsigned i = 0; i < width; ++i) {
-    value |= std::uint64_t(static_cast<unsigned char>(input[offset + i]))
-             << (i * 8);
+template <unsigned Width>
+std::uint64_t Get(std::string_view input, std::size_t offset) {
+  static_assert(Width == 4 || Width == 8);
+  // Callers have checked the complete field window. memcpy permits unaligned
+  // pages and lets the compiler use one word load without aliasing violations
+  // or reading beyond a four-byte offset at the end of the payload. The
+  // durable representation stays little-endian on either host byte order.
+  using Word = std::conditional_t<Width == 4, std::uint32_t, std::uint64_t>;
+  if constexpr (std::endian::native == std::endian::little ||
+                std::endian::native == std::endian::big) {
+    Word value;
+    std::memcpy(&value, input.data() + offset, sizeof(value));
+    if constexpr (std::endian::native == std::endian::big)
+      return std::byteswap(value);
+    return value;
+  } else {
+    std::uint64_t value = 0;
+    for (unsigned i = 0; i < Width; ++i)
+      value |= std::uint64_t(static_cast<unsigned char>(input[offset + i]))
+               << (i * 8);
+    return value;
   }
-  return value;
 }
 
 }  // namespace
@@ -58,7 +74,7 @@ absl::StatusOr<IndexedOrderedReader> IndexedOrderedReader::Open(
     return absl::DataLossError("invalid indexed ordered arrays");
   const auto data = body.size() - count * stride - 4;
   const auto offsets = data + (sorted ? count * 8 : 0);
-  if (Get(body, offsets, 4) != 0 || Get(body, offsets + count * 4, 4) != data)
+  if (Get<4>(body, offsets) != 0 || Get<4>(body, offsets + count * 4) != data)
     return absl::DataLossError("invalid indexed ordered sentinels");
   return IndexedOrderedReader(body, count, data, offsets, sorted);
 }
@@ -68,7 +84,7 @@ absl::StatusOr<double> IndexedOrderedReader::Score(std::size_t index) const {
     return absl::OutOfRangeError("indexed ordered slot out of range");
   if (!sorted_) return 0.0;
   const auto score =
-      std::bit_cast<double>(Get(body_, data_bytes_ + index * 8, 8));
+      std::bit_cast<double>(Get<8>(body_, data_bytes_ + index * 8));
   if (std::isnan(score))
     return absl::DataLossError("NaN indexed ordered score");
   return score;
@@ -78,8 +94,8 @@ absl::StatusOr<OrderedCollectionEntryView> IndexedOrderedReader::At(
     std::size_t index) const {
   auto score = Score(index);
   if (!score.ok()) return score.status();
-  const auto begin = Get(body_, offsets_ + index * 4, 4);
-  const auto end = Get(body_, offsets_ + (index + 1) * 4, 4);
+  const auto begin = Get<4>(body_, offsets_ + index * 4);
+  const auto end = Get<4>(body_, offsets_ + (index + 1) * 4);
   if (begin > end || end > data_bytes_ || end - begin > kMaxStringBytes)
     return absl::DataLossError("invalid indexed ordered interval");
   return OrderedCollectionEntryView{body_.substr(begin, end - begin), *score};
@@ -93,11 +109,11 @@ absl::Status IndexedOrderedReader::VisitAll(Visitor&& visitor) const {
   // repeated slot checks nor a StatusOr result for every member and score.
   std::size_t begin = 0;
   for (std::size_t i = 0; i < count_; ++i) {
-    const auto end = Get(body_, offsets_ + (i + 1) * 4, 4);
+    const auto end = Get<4>(body_, offsets_ + (i + 1) * 4);
     if (begin > end || end > data_bytes_ || end - begin > kMaxStringBytes)
       return absl::DataLossError("invalid indexed ordered interval");
     const auto score =
-        sorted_ ? std::bit_cast<double>(Get(body_, data_bytes_ + i * 8, 8))
+        sorted_ ? std::bit_cast<double>(Get<8>(body_, data_bytes_ + i * 8))
                 : 0.0;
     if (std::isnan(score))
       return absl::DataLossError("NaN indexed ordered score");
@@ -241,9 +257,9 @@ absl::Status IndexedOrderedSplice::EditSortedSetMember(
 
 std::string_view IndexedOrderedSplice::SourceBytes(
     const Part& part) const noexcept {
-  const auto begin = Get(source_.body_, source_.offsets_ + part.first_ * 4, 4);
+  const auto begin = Get<4>(source_.body_, source_.offsets_ + part.first_ * 4);
   const auto end =
-      Get(source_.body_, source_.offsets_ + (part.first_ + part.count_) * 4, 4);
+      Get<4>(source_.body_, source_.offsets_ + (part.first_ + part.count_) * 4);
   return source_.body_.substr(begin, end - begin);
 }
 
@@ -254,8 +270,8 @@ std::string_view IndexedOrderedSplice::Value(const Part& part,
     return inputs_[reverse_inputs_ ? inputs_.size() - 1 - index : index];
   }
   const auto slot = part.first_ + index;
-  const auto begin = Get(source_.body_, source_.offsets_ + slot * 4, 4);
-  const auto end = Get(source_.body_, source_.offsets_ + (slot + 1) * 4, 4);
+  const auto begin = Get<4>(source_.body_, source_.offsets_ + slot * 4);
+  const auto end = Get<4>(source_.body_, source_.offsets_ + (slot + 1) * 4);
   return source_.body_.substr(begin, end - begin);
 }
 
@@ -350,7 +366,7 @@ std::optional<std::string_view> IndexedOrderedSplice::Next() noexcept {
     // Unshifted source offsets need no regeneration. Other offsets use only
     // fixed framing storage, consumed before the next call, like v1 lengths.
     if (!part.inserted_ && item_ == 0 &&
-        offset_ == Get(source_.body_, source_.offsets_ + part.first_ * 4, 4)) {
+        offset_ == Get<4>(source_.body_, source_.offsets_ + part.first_ * 4)) {
       offset_ += SourceBytes(part).size();
       ++part_;
       return source_.body_.substr(source_.offsets_ + part.first_ * 4,
@@ -409,7 +425,7 @@ absl::StatusOr<OrderedCompactReader> OrderedCompactReader::Open(
   const bool sorted = kind == OrderedCollectionKind::kSortedSet;
   if (ValidKind(kind) && expected_count != 0 && encoded.size() >= 8 &&
       encoded.starts_with(sorted ? kSortedSetMagicV2 : kListMagicV2) &&
-      Get(encoded, 4, 4) == expected_count) {
+      Get<4>(encoded, 4) == expected_count) {
     auto indexed =
         IndexedOrderedReader::Open(kind, encoded.substr(8), expected_count);
     if (!indexed.ok()) return indexed.status();
@@ -421,7 +437,7 @@ absl::StatusOr<OrderedCompactReader> OrderedCompactReader::Open(
   if (!ValidKind(kind) || expected_count == 0 || expected_count > UINT32_MAX ||
       encoded.size() < 8 ||
       !encoded.starts_with(sorted ? kSortedSetMagicV1 : kListMagicV1) ||
-      Get(encoded, 4, 4) != expected_count ||
+      Get<4>(encoded, 4) != expected_count ||
       expected_count > (encoded.size() - 8) / framing)
     return absl::DataLossError("invalid ordered full-image framing");
   return OrderedCompactReader(encoded, expected_count, sorted);
@@ -438,8 +454,8 @@ absl::StatusOr<OrderedCompactEntryView> OrderedCompactReader::Next() {
   if (remaining_ == 0 || framing > bytes_.size() - offset_)
     return absl::DataLossError("truncated ordered full-image entry");
   const auto score =
-      sorted_ ? std::bit_cast<double>(Get(bytes_, offset_, 8)) : 0;
-  const auto size = Get(bytes_, offset_ + (sorted_ ? 8 : 0), 4);
+      sorted_ ? std::bit_cast<double>(Get<8>(bytes_, offset_)) : 0;
+  const auto size = Get<4>(bytes_, offset_ + (sorted_ ? 8 : 0));
   if (std::isnan(score) || size > kMaxStringBytes ||
       size > bytes_.size() - offset_ - framing)
     return absl::DataLossError("invalid ordered full-image entry");
@@ -547,7 +563,7 @@ absl::StatusOr<std::vector<OrderedCollectionEntry>> DecodeOrderedCompactValue(
   const bool sorted = kind == OrderedCollectionKind::kSortedSet;
   const std::size_t framing = sorted ? 12 : 4;
   if (!encoded.starts_with(sorted ? kSortedSetMagicV1 : kListMagicV1) ||
-      Get(encoded, 4, 4) != expected_count ||
+      Get<4>(encoded, 4) != expected_count ||
       expected_count > (encoded.size() - 8) / framing) {
     return absl::DataLossError("invalid ordered full-image framing");
   }
@@ -559,9 +575,9 @@ absl::StatusOr<std::vector<OrderedCollectionEntry>> DecodeOrderedCompactValue(
       return absl::DataLossError("truncated ordered full-image entry");
     }
     const auto score =
-        sorted ? std::bit_cast<double>(Get(encoded, offset, 8)) : 0;
+        sorted ? std::bit_cast<double>(Get<8>(encoded, offset)) : 0;
     if (sorted) offset += 8;
-    const auto size = Get(encoded, offset, 4);
+    const auto size = Get<4>(encoded, offset);
     offset += 4;
     if (std::isnan(score) || size > kMaxStringBytes ||
         size > encoded.size() - offset) {
