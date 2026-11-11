@@ -553,14 +553,10 @@ absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
 
   // Published fields are unique by construction. The storage loader applies
   // the record's checksum policy; a point lookup only parses through its match.
-  for (std::size_t i = 0; i < reader->size(); ++i) {
-    auto entry = reader->Next();
-    if (!entry.ok()) [[unlikely]]
-      return absl::DataLossError(entry.status().message());
-    if (entry->field_ == field)
-      return std::optional<std::string_view>{entry->value_};
-  }
-  return std::nullopt;
+  auto found = reader->Find(field);
+  if (!found.ok()) [[unlikely]]
+    return absl::DataLossError(found.status().message());
+  return found;
 }
 
 absl::Status FindCompactHashFields(std::string_view payload,

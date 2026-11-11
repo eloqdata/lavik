@@ -736,6 +736,42 @@ TEST(GroupedHashTest, CompactReaderPreservesBinaryViewsAndCopiedPosition) {
   EXPECT_EQ(first->field_, value.entries_[0].field_);
 }
 
+TEST(GroupedHashTest, CompactReaderFindConsumesThroughMatchAndKeepsErrors) {
+  auto value = Value(3);
+  value.entries_[0].field_ = std::string("a\0b", 3);
+  value.entries_[0].value_.clear();
+  auto encoded = EncodeHashValue(value);
+  ASSERT_TRUE(encoded.ok());
+  auto reader = HashValueReader::Open(*encoded);
+  ASSERT_TRUE(reader.ok());
+  auto empty = reader->Find(value.entries_[0].field_);
+  ASSERT_TRUE(empty.ok());
+  ASSERT_TRUE(empty->has_value());
+  EXPECT_TRUE((**empty).empty());
+  auto copy = *reader;
+  auto last = reader->Find(value.entries_[2].field_);
+  ASSERT_TRUE(last.ok());
+  ASSERT_TRUE(last->has_value());
+  EXPECT_EQ(**last, value.entries_[2].value_);
+  EXPECT_GE((**last).data(), encoded->data());
+  EXPECT_LE((**last).data() + (**last).size(),
+            encoded->data() + encoded->size());
+  EXPECT_EQ(reader->Next().status().code(), absl::StatusCode::kOutOfRange);
+  auto second = copy.Next();
+  ASSERT_TRUE(second.ok());
+  EXPECT_EQ(second->field_, value.entries_[1].field_);
+
+  auto broken = *encoded;
+  broken.replace(broken.find("field-1") - 8, 4, 4, '\xff');
+  auto bad = HashValueReader::Open(broken);
+  ASSERT_TRUE(bad.ok());
+  EXPECT_TRUE(bad->Find(value.entries_[0].field_).ok());
+  const auto failure = bad->Find("absent");
+  EXPECT_EQ(failure.status().message(), "Hash entry is truncated");
+  EXPECT_EQ(bad->Next().status(), failure.status());
+  EXPECT_EQ(bad->Find("absent").status(), failure.status());
+}
+
 TEST(GroupedHashTest, CompactReaderRejectsMalformedUnselectedBytes) {
   auto encoded = EncodeHashValue(Value(2));
   ASSERT_TRUE(encoded.ok()) << encoded.status();
