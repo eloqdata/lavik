@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 EloqData Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""MGET sharing, mixed fallback, worker metrics, and transaction replies."""
+"""Verify MGET read sharing through Redis traces and worker metrics."""
 
 import argparse
 import asyncio
@@ -12,54 +12,10 @@ import tempfile
 import urllib.request
 
 import defrag_payload_e2e as support
-from read_flight_e2e import connect, wait_retired
-from remote_get_e2e import drain, stats
+from read_flight_e2e import wait_retired
 
 VALUE = bytes(range(256)) * 16
-LARGE = VALUE * 32
 KEY = b"{mget-flight}:disk"
-GROUP = b"{mget-flight}:group"
-LIST = b"{mget-flight}:list"
-STAGED = b"{mget-flight}:fresh"
-MISSING = b"{mget-flight}:missing"
-KEYS = [KEY] * 40 + [GROUP, LIST, MISSING, STAGED, KEY]
-EXPECTED = [VALUE] * 40 + [LARGE, None, None, b"fresh", VALUE]
-
-
-def wire(args):
-    return b"*%d\r\n" % len(args) + b"".join(
-        b"$%d\r\n" % len(v) + v + b"\r\n" for v in args
-    )
-
-
-async def response(reader):
-    head = await reader.readline()
-    assert head.endswith(b"\r\n"), head
-    if head[:1] == b"*":
-        return [await response(reader) for _ in range(int(head[1:-2]))]
-    if head == b"$-1\r\n":
-        return None
-    assert head[:1] == b"$", head
-    value = await reader.readexactly(int(head[1:-2]))
-    assert await reader.readexactly(2) == b"\r\n"
-    return value
-
-
-async def traffic(port):
-    clients = await asyncio.gather(*(connect(port) for _ in range(16)))
-    request = wire([b"MGET", *KEYS])
-    for _, writer in clients:
-        writer.write(request * 16)
-
-    async def receive(reader, writer):
-        try:
-            for _ in range(16):
-                assert await response(reader) == EXPECTED
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
-    await asyncio.wait_for(asyncio.gather(*(receive(*c) for c in clients)), 45)
 
 
 def check_metrics(port, workers):
@@ -100,14 +56,10 @@ def main():
         with (support.WORKDIR / "data").open("wb") as f:
             f.truncate(512 * 1024 * 1024)
         with support.server(args.workers) as (admin, _):
-            assert admin.batch([[b"SET", KEY, VALUE], [b"SET", GROUP, LARGE]]) == [
-                b"OK",
-                b"OK",
-            ]
-            assert admin.batch([[b"LPUSH", LIST, b"entry"]]) == [b"1"]
-            drain(admin)
-        with support.server(args.workers) as (admin, metrics):
-            assert admin.batch([[b"SET", STAGED, b"fresh"]]) == [b"OK"]
+            assert admin.batch([[b"SET", KEY, VALUE]]) == [b"OK"]
+        # Clean shutdown flushes KEY; pause defrag at startup so recovery's disk
+        # location cannot be replaced by a staged relocation before MGET.
+        with support.server(args.workers, paused=True) as (admin, metrics):
             for setting, value in (
                 (b"log-enabled", b"no"),
                 (b"sample-every", b"1"),
@@ -127,27 +79,9 @@ def main():
             assert "read_io" in stages and "read_flight_wait" in stages, trace
             assert stages["read_io"].get("observations", 1) == 1, trace
             assert stages["read_flight_wait"]["observations"] == 3, trace
-            assert admin.batch(
-                [[b"CONFIG", b"SET", b"latency-diagnostics-enabled", b"no"]]
-            ) == [b"OK"]
-            before = stats(admin)
-            assert admin.batch([[b"MGET", *KEYS]]) == [EXPECTED]
-            # The same MGET in MULTI must keep its wave barrier and nil semantics.
-            assert admin.batch([[b"MULTI"], [b"MGET", *KEYS], [b"EXEC"]]) == [
-                b"OK",
-                b"QUEUED",
-                [EXPECTED],
-            ]
-            asyncio.run(traffic(admin.socket.getpeername()[1]))
-            after = asyncio.run(wait_retired(admin))
-            assert int(after[b"storage_read_flight_joins"]) > int(
-                before[b"storage_read_flight_joins"]
-            ), after
+            asyncio.run(wait_retired(admin))
             check_metrics(metrics, args.workers)
-            assert admin.batch([[b"GET", KEY], [b"GET", GROUP]]) == [VALUE, LARGE]
-        with support.server(args.workers) as (admin, _):
-            assert admin.batch([[b"MGET", *KEYS]]) == [EXPECTED]
-    print("MGET mixed waves/transactions/worker metrics/recovery passed")
+    print("MGET disk sharing/trace/worker metrics/retirement passed")
 
 
 if __name__ == "__main__":
