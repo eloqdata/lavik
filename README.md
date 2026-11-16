@@ -109,7 +109,7 @@ p99.9 latency bars grow from right to left on the same row. The full
 <img src="perf_reports/lavik-storage-peers-1tb/ranked-320.svg" alt="320 connections: paired horizontal QPS and p99.9 latency bars for each database, sorted by QPS within GET and SET" width="900">
 
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-aerospike-ycsb/README.md),
-covering workloads A/B/C/D and their tail latencies.
+covering Lavik v0.3.0 with io_uring on workloads A/B/C/D and their tail latencies.
 
 ## Installation
 
