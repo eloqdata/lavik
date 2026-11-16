@@ -1,81 +1,77 @@
-# Lavik v0.2.0 and Aerospike: YCSB throughput and tail latency
+# Lavik v0.3.0 (io_uring) and Aerospike: YCSB throughput and tail latency
 
 **English** | [简体中文](README.zh-CN.md)
 
-The complete **A/B/C/D × 100K/unlimited** matrix was rerun on newly provisioned Azure hosts: **16 formal 300-second windows**. Each database was independently loaded with **100M records of 10 × 128 B fields**. All measured and warmup phases have zero errors.
+The complete **A/B/C/D × 100K/unlimited** comparison contains **16 formal 300-second windows**. Each database independently loads **100M records of 10 × 128 B fields**. All measured and warmup phases have zero errors. Lavik v0.3.0 uses the io_uring storage backend.
 
-Measured unlimited total-throughput differences relative to Aerospike: A **+9.06%**, B **+23.30%**, C **+21.67%**, D **+24.08%**.
+Unlimited A/B/C/D throughput exceeds Aerospike by **+7.22%** / **+34.25%** / **+39.19%** / **+34.72%**, respectively. A READ p99.9 is **4.895 ms** for Lavik versus **2.751 ms** for Aerospike; higher throughput still carries a tail-latency tradeoff. These are single-window observations.
 
-Throughput and tail latency trade off: Lavik has **higher p99.9 in 4 of seven unlimited operation cells**. The largest relative difference is **A / READ: 4.399 ms versus 2.225 ms (1.98×)**. These are single-window observations.
-
-CPU allocation and host policy differ: Aerospike retains the original host policy, while Lavik uses 12 workers and 4 CPUs for system-task and benchmark-NIC IRQ policy. Operation cells show **operation QPS; p99 / p99.9 (ms)**.
+The client VM has **32 vCPUs**; this matrix assigns YCSB **CPUs 0–15**, with 256 workers. Aerospike uses all 16 server CPUs; Lavik uses 12 workers and four CPUs for system tasks and NIC IRQs. Operation cells show **operation QPS; p99 / p99.9 (ms)**.
 
 ## 100K target
 
 ![100K target](ycsb-100k.svg)
 
-| Workload | Operation | Aerospike | Lavik |
+| Workload | Operation | Aerospike CE 8.1.2.4 | Lavik v0.3.0 · io_uring |
 | --- | --- | --- | --- |
-| A | Total QPS | 99,916 | 99,959 |
-| A | READ | 49,954; 0.700 / 0.797 | 49,974; 0.695 / 0.837 |
-| A | UPDATE | 49,962; 0.646 / 0.741 | 49,985; 0.655 / 0.797 |
-| B | Total QPS | 99,932 | 99,976 |
-| B | READ | 94,931; 0.731 / 0.861 | 94,980; 0.704 / 0.920 |
-| B | UPDATE | 5,001; 0.681 / 0.805 | 4,996; 0.674 / 0.803 |
-| C | Total QPS | 99,909 | 99,968 |
-| C | READ | 99,909; 0.724 / 0.845 | 99,968; 0.745 / 0.873 |
-| D-Uniform | Total QPS | 99,934 | 99,973 |
-| D-Uniform | READ | 94,937; 0.709 / 0.840 | 94,971; 0.695 / 0.786 |
-| D-Uniform | INSERT | 4,997; 0.662 / 0.785 | 5,002; 0.676 / 0.768 |
+| A | Total QPS | 99,851 | 99,963 |
+| A | READ | 49,924; 0.337 / 0.441 | 49,979; 0.338 / 0.449 |
+| A | UPDATE | 49,927; 0.290 / 0.390 | 49,984; 0.312 / 0.424 |
+| B | Total QPS | 99,912 | 99,955 |
+| B | READ | 94,922; 0.362 / 0.475 | 94,957; 0.334 / 0.436 |
+| B | UPDATE | 4,990; 0.313 / 0.412 | 4,998; 0.327 / 0.413 |
+| C | Total QPS | 99,956 | 99,960 |
+| C | READ | 99,956; 0.381 / 0.494 | 99,960; 0.359 / 0.457 |
+| D-Uniform | Total QPS | 99,875 | 99,958 |
+| D-Uniform | READ | 94,876; 0.350 / 0.446 | 94,966; 0.329 / 0.440 |
+| D-Uniform | INSERT | 4,999; 0.312 / 0.409 | 4,992; 0.324 / 0.442 |
 
 ## Unlimited
 
 ![Unlimited](ycsb-unlimited.svg)
 
-| Workload | Operation | Aerospike | Lavik |
+| Workload | Operation | Aerospike CE 8.1.2.4 | Lavik v0.3.0 · io_uring |
 | --- | --- | --- | --- |
-| A | Total QPS | 436,866 | 476,454 |
-| A | READ | 218,424; 1.164 / 2.225 | 238,229; 1.140 / 4.399 |
-| A | UPDATE | 218,442; 1.037 / 1.900 | 238,225; 0.903 / 2.179 |
-| B | Total QPS | 396,293 | 488,622 |
-| B | READ | 376,491; 1.178 / 2.095 | 464,203; 0.895 / 1.902 |
-| B | UPDATE | 19,802; 1.061 / 1.835 | 24,418; 0.831 / 1.716 |
-| C | Total QPS | 396,447 | 482,358 |
-| C | READ | 396,447; 1.105 / 1.919 | 482,358; 0.933 / 1.754 |
-| D-Uniform | Total QPS | 397,541 | 493,262 |
-| D-Uniform | READ | 377,664; 1.150 / 2.004 | 468,616; 0.928 / 2.305 |
-| D-Uniform | INSERT | 19,876; 1.040 / 1.797 | 24,646; 0.865 / 2.229 |
+| A | Total QPS | 507,269 | 543,901 |
+| A | READ | 253,635; 1.365 / 2.751 | 271,934; 1.672 / 4.895 |
+| A | UPDATE | 253,634; 1.182 / 2.149 | 271,968; 0.728 / 2.010 |
+| B | Total QPS | 462,756 | 621,264 |
+| B | READ | 439,629; 1.264 / 2.699 | 590,203; 0.714 / 1.853 |
+| B | UPDATE | 23,127; 1.099 / 2.107 | 31,060; 0.632 / 1.586 |
+| C | Total QPS | 457,859 | 637,276 |
+| C | READ | 457,859; 1.284 / 2.020 | 637,276; 0.665 / 1.763 |
+| D-Uniform | Total QPS | 462,741 | 623,412 |
+| D-Uniform | READ | 439,597; 1.259 / 2.036 | 592,239; 0.702 / 1.828 |
+| D-Uniform | INSERT | 23,144; 1.098 / 1.750 | 31,173; 0.646 / 1.637 |
 
 ## Environment and method
 
 | Item | Configuration |
 | --- | --- |
-| Server | Azure Standard_L16aos_v4; Japan East zone 2; AMD EPYC 9V74; 8 physical / 16 logical CPUs; 128 GiB nominal RAM |
-| Client | Standard_F32als_v6; Java 17; YCSB pinned to CPUs 0–15 |
-| OS | Ubuntu 24.04; Linux 6.17.0-1022-azure on both VMs |
-| Storage | 6 × 1,919,850,381,312 B local NVMe; RAID0, 512 KiB chunk; two fully zeroed 1,099,494,850,560 B raw partitions |
-| Database | Lavik v0.2.0 standard x86_64; Aerospike CE 8.1.2.4-4 |
-| YCSB | eloqdata/YCSB a47bf01c4f197d2ff2eecbbebd9743da5a1cae47; KEYLANE.HREPLACE renamed LAVIK.HREPLACE |
+| Server | Azure Standard_L16aos_v4; Japan East zone 2; AMD EPYC 9V74; 8 physical / 16 logical CPUs; 128 GiB |
+| Client | Standard_F32als_v6; 32 vCPUs; Java 17; YCSB affinity 0–15 |
+| OS | Ubuntu 24.04; Linux 7.0.0-1017-azure |
+| Lavik storage | 6 × 1,919,850,381,312 B full raw NVMe devices (~11.52 TB); io_uring |
+| Aerospike storage | Same six NVMe; RAID0, 512 KiB stripe; one fully zeroed 1,099,494,850,560 B raw partition (~1.10 TB) |
+| Database | Lavik v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5; Aerospike CE 8.1.2.4-4 |
+| YCSB | eloqdata/YCSB a47bf01c4f197d2ff2eecbbebd9743da5a1cae47; LAVIK.HREPLACE |
 | A / B / C / D | 50% read + 50% update / 95% read + 5% update / 100% read / 95% read + 5% insert |
-| Final records | Aerospike 107,563,558; Lavik 108,996,321 |
+| Final records | Aerospike 108,544,472; Lavik 110,951,860 |
+| Measured | 2026-11-16 (UTC) |
 
-- Each database loads 100M records once, stops cleanly and recovers before measurement. Eight distributed records with all field hashes are checked across recovery. The initial field payload is 119.21 GiB, excluding keys and metadata.
-- Aerospike runs first, then Lavik; workloads run C/A/B/D, 100K then unlimited. Each cell has a separate 1M-operation warmup JVM and a new 256-worker measurement JVM. A non-binding 2B-operation cap lets the 300-second timer end the run. Initial JIT/ramp-up remains included.
-- Reads use a uniform distribution. D reads only the original 100M keys; warmup/measured inserts use disjoint 2B/4B (100K) and 6B/8B (unlimited) starting IDs. D changes final dataset sizes according to achieved throughput.
-- All ten fields are read and written. Lavik uses HGETALL / LAVIK.HREPLACE / HMSET; Aerospike uses all-bin reads / REPLACE_ONLY / CREATE_ONLY. Both bindings use 10,000 ms timeouts; Aerospike Java client 3.1.2 and Jedis 3.9.0 are unchanged.
-- Aerospike changes only required cluster/listener/namespace/replication/device settings. Lavik uses io_uring, shutdown checkpointing, metrics, and the separate 12+4 host policy. Defrag is verified enabled throughout. CPU/IRQ policy is restored after the run.
-- Every phase reconciles client success counts, server command counters and record-count deltas. Lavik NIC completion IRQs are checked for zero worker-CPU interrupts during each phase. Exact commands, effective settings, counters and logs are retained.
-- QPS is successful operations divided by actual YCSB runtime. Per-operation percentiles come from complete-window ordinary HDR histograms, never averaged interval percentiles. Intended histograms remain in logs. Equal worker counts do not imply equal TCP connection counts.
-- One measurement per cell; no confidence intervals. CPU allocation, caches, flushing and persistence differ, and successful responses do not imply equal synchronous durability. This rerun uses Japan East; the historical run used Japan West, so region, host placement and time also differ.
+**Physical capacity and layout differ between products**, although the starting logical dataset is identical. This compares the documented deployment configurations, not an isolated storage-engine effect.
 
-- Aerospike CE 8.1.2.4-4: 2026-10-21T15:00:19Z – 2026-10-21T15:41:22Z (UTC).
-- Lavik v0.2.0: 2026-10-21T15:46:26Z – 2026-10-21T16:27:24Z (UTC).
-
-[Point data](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21/metadata/results.csv) · [Provenance](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21/metadata/provenance.json) · [Validation](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21/metadata/validation.json) · [Raw logs and receipts](https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21)
+- Independently load 100M records per database, stop cleanly, recover, and verify exact record counts plus all-field hashes for eight distributed samples. The initial field payload is 119.21 GiB.
+- Run Aerospike then Lavik; each uses C/A/B/D, 100K then unlimited. Every cell has a separate 1M-operation warmup JVM followed by a fresh 256-worker JVM measuring 300 seconds. The 2B-operation cap is non-binding. Initial JIT/ramp-up remains included.
+- D is a **Uniform variant, not standard YCSB D's latest distribution**. Reads stay in the original 100M keys; warmup/measured insert IDs start at 2B/4B for 100K and 6B/8B for unlimited. The disjoint ranges avoid collisions. Time-bounded D produces different final record counts.
+- Read and update all ten fields. Lavik uses HGETALL / LAVIK.HREPLACE / HMSET; Aerospike uses all-bin reads / REPLACE_ONLY / CREATE_ONLY. Both bindings use 10,000 ms timeouts with Aerospike Java 3.1.2 / Jedis 3.9.0.
+- Lavik uses six full raw devices, shutdown checkpointing and the 12+4 CPU/IRQ policy. Every phase reconciles client/server counts, record growth and IRQ policy; formal windows have zero errors and zero sampled server CPU steal, and final recovery checks pass.
+- QPS is successful operations divided by actual YCSB runtime. Percentiles come from complete-window ordinary HDR histograms, not averaged progress percentiles; Intended histograms remain in logs. Equal worker counts do not imply equal TCP connection counts.
+- Each condition has one formal window, in fixed order; no confidence intervals are claimed. CPU allocation, caches, flushing and persistence differ; successful responses do not imply equal synchronous durability. Raw logs, parameters and checksums are archived separately; reproduction commands follow below.
 
 ## Run commands
 
-These Bash commands use the measured settings; adapt paths, addresses and NIC PCI identity to the deployment. Start with two independent, fully zeroed empty raw RAID0 partitions, exposed as `aerospike-device` and `lavik-device`. Run databases sequentially and load each once. Preserve the original host policy for Aerospike, then apply Lavik isolation; restore the original values afterward.
+These Bash commands use the measured settings; adapt paths, addresses and NIC PCI identity to the deployment. For Aerospike, prepare one fully zeroed raw RAID0 partition as described above, exposed as `aerospike-device`. After its matrix, stop Aerospike and dismantle the scratch RAID; prepare the six dedicated empty NVMe devices for Lavik and replace `/dev/YOUR_NVME_1` through `/dev/YOUR_NVME_6` with their verified paths. Run databases sequentially and load each once. Preserve the original host policy for Aerospike, then apply Lavik isolation; restore the original values afterward.
 
 ### Aerospike configuration
 
@@ -84,7 +80,7 @@ Save as `/opt/bench020/ycsb/aerospike.conf`:
 ```conf
 # Single-node YCSB device namespace. Performance settings use server defaults.
 service {
-    cluster-name ycsb-default-20261021
+    cluster-name ycsb-default-20261116
 }
 logging {
     console {
@@ -93,7 +89,7 @@ logging {
 }
 network {
     service {
-        address 10.96.1.4
+        address YOUR_SERVER_PRIVATE_IP
         port 3000
     }
     heartbeat {
@@ -127,7 +123,7 @@ sudo mkdir -p /opt/aerospike
 sudo cp -a /opt/bench020/aerospike-package/opt/aerospike/usr /opt/aerospike/
 
 sudo systemd-run \
-  --unit aerospike-ycsb-default-20261021.service \
+  --unit aerospike-ycsb-default-20261116.service \
   --collect \
   -p TimeoutStopSec=300 \
   -p StandardOutput=append:/opt/bench020/ycsb/aerospike-server.stdout \
@@ -140,7 +136,7 @@ sudo systemd-run \
 
 ```bash
 sudo systemd-run \
-  --unit lavik-ycsb-tuned-20261021.service \
+  --unit lavik-ycsb-tuned-20261116.service \
   --collect \
   -p TimeoutStopSec=300 \
   -p StandardOutput=append:/opt/bench020/ycsb/hreplace-server.stdout \
@@ -149,13 +145,18 @@ sudo systemd-run \
   --slice=lavik-bench.slice \
   -p AllowedCPUs=0-11 \
   -p CPUAffinity=0-11 \
-  -p LimitNOFILE=20000 /opt/bench020/downloads/lavik-v0.2.0-linux-x86_64/lavik \
-  --bind 10.96.1.4 \
+  -p LimitNOFILE=65535 /opt/bench020/downloads/lavik-v0.3.0-linux-x86_64/lavik \
+  --bind YOUR_SERVER_PRIVATE_IP \
   --port 16379 \
   --metrics-port 19100 \
   --threads 12 \
   --shutdown-checkpoint \
-  --data-file /opt/bench020/ycsb/lavik-device \
+  --data-file /dev/YOUR_NVME_1 \
+  --data-file /dev/YOUR_NVME_2 \
+  --data-file /dev/YOUR_NVME_3 \
+  --data-file /dev/YOUR_NVME_4 \
+  --data-file /dev/YOUR_NVME_5 \
+  --data-file /dev/YOUR_NVME_6 \
   --log-dir /opt/bench020/ycsb/lavik-server-logs
 ```
 
@@ -174,7 +175,7 @@ printf 'f000\n' | sudo tee /sys/devices/virtual/workqueue/cpumask
 sudo python3 - <<'PYCODE'
 from pathlib import Path
 import os
-vfs = list(Path('/sys/class/net/eth1').glob('lower_*'))
+vfs = list(Path('/sys/class/net/eth0').glob('lower_*'))
 assert len(vfs) == 1
 pci = (vfs[0].resolve() / 'device').resolve().name
 irqs = [line.split(':', 1)[0].strip()
@@ -205,27 +206,27 @@ DB=aerospike                       # use DB=lavik for the second database
 if [ "$DB" = aerospike ]; then
   YCSB_ROOT=/opt/bench020/ycsb-aerospike-dist
   BINDING=aerospike
-  DB_ARGS=(-p as.host=10.96.1.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000)
+  DB_ARGS=(-p as.host=YOUR_SERVER_PRIVATE_IP -p as.namespace=ycsb -p as.timeout=10000)
 else
   YCSB_ROOT=/opt/bench020/ycsb-redis-dist
   BINDING=redis
-  DB_ARGS=(-p redis.host=10.96.1.4 -p redis.port=16379 -p redis.scanindex=none
-           -p redis.timeout=10000 -p redis.cluster=false)
+  DB_ARGS=(-p redis.host=YOUR_SERVER_PRIVATE_IP -p redis.port=16379 -p redis.scanindex=none
+           -p redis.timeout=10000)
 fi
 mkdir -p results
 COMMON=(-s -threads 256 -P "$YCSB_ROOT/workloads/workloada"
-  -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant
-  -p readallfields=true -p writeallfields=true -p insertorder=hashed
-  -p measurementtype=hdrhistogram -p measurement.interval=both
-  -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10)
+  -p fieldlength=128
+  -p writeallfields=true
+  -p measurement.interval=both
+  -p hdrhistogram.percentiles=50,95,99,99.9,99.99)
 
 # Fresh load: run once on an empty database.
 taskset -c 0-15 /usr/bin/python3 "$YCSB_ROOT/bin/ycsb" load "$BINDING" "${COMMON[@]}" "${DB_ARGS[@]}" \
-  -p recordcount=100000000 -p insertstart=0 -p insertcount=100000000 \
+  -p recordcount=100000000 \
   > "results/$DB-load.log" 2>&1
 ```
 
-After loading, verify exactly 100,000,000 successful INSERTs, server record counts and field lengths. Stop cleanly, restart with the same launch command, and confirm recovered samples before running the matrix below. Stop with `sudo systemctl stop aerospike-ycsb-default-20261021.service` or `sudo systemctl stop lavik-ycsb-tuned-20261021.service`; do not recreate or zero the partitions. Wait until all 4096 Aerospike master partitions are ready, or Lavik recovery is complete with the expected DBSIZE.
+After loading, verify exactly 100,000,000 successful INSERTs, server record counts and field lengths. Stop cleanly, restart with the same launch command, and confirm recovered samples before running the matrix below. Stop with `sudo systemctl stop aerospike-ycsb-default-20261116.service` or `sudo systemctl stop lavik-ycsb-tuned-20261116.service`; do not recreate or clear the storage between load and recovery. Wait until all 4096 Aerospike master partitions are ready, or Lavik recovery is complete with the expected DBSIZE.
 
 ```bash
 # Run after load/recovery verification; retain this client shell's variables.
@@ -234,10 +235,10 @@ if [ "$DB" = lavik ]; then
 fi
 for workload in C A B D; do
   case "$workload" in
-    A) READ=0.5;  UPDATE=0.5;  INSERT=0 ;;
-    B) READ=0.95; UPDATE=0.05; INSERT=0 ;;
-    C) READ=1;    UPDATE=0;    INSERT=0 ;;
-    D) READ=0.95; UPDATE=0;    INSERT=0.05 ;;
+    A) MIX=() ;;
+    B) MIX=(-p readproportion=0.95 -p updateproportion=0.05) ;;
+    C) MIX=(-p readproportion=1 -p updateproportion=0) ;;
+    D) MIX=(-p readproportion=0.95 -p updateproportion=0 -p insertproportion=0.05) ;;
   esac
   for target in 100000 0; do
     RATE=()
@@ -251,13 +252,11 @@ for workload in C A B D; do
       if [ "$workload" = D ]; then
         if [ "$target" -gt 0 ]; then start=2000000000; else start=6000000000; fi
         if [ "$phase" = measured ]; then start=$((start + 2000000000)); fi
-        RECORDS=(-p "recordcount=$start" -p insertstart=0 -p insertcount=100000000)
+        RECORDS=(-p "recordcount=$start" -p insertcount=100000000)
       fi
       taskset -c 0-15 /usr/bin/python3 "$YCSB_ROOT/bin/ycsb" run "$BINDING" \
         "${COMMON[@]}" "${DB_ARGS[@]}" "${RATE[@]}" "${LIMIT[@]}" "${RECORDS[@]}" \
-        -p requestdistribution=uniform -p "readproportion=$READ" \
-        -p "updateproportion=$UPDATE" -p "insertproportion=$INSERT" \
-        -p scanproportion=0 -p readmodifywriteproportion=0 \
+        -p requestdistribution=uniform "${MIX[@]}" \
         > "results/$DB-$workload-$target-$phase.log" 2>&1
     done
   done
