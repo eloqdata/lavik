@@ -53,10 +53,7 @@ TCP with io_uring by default, with an optional
 ## Benchmark
 
 Browse the [performance reports](perf_reports/README.md) for full results,
-test configurations, and methodology. The Redis/Valkey results use the
-**Lavik v0.3.0**, measured November 15, 2026 (UTC).
-The linked disk-backed and Aerospike comparisons retain
-their historical v0.2.0 measurements.
+test configurations, and methodology.
 
 <a id="in-memory-redis-and-valkey"></a>
 
@@ -73,22 +70,22 @@ Redis 8.10.2 and Valkey 9.1.2 held **1M keys** in memory on the same VM;
 all values were **1 KiB**. The chart shows throughput and p99.9 latency
 across connection counts.
 
-<img src="perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/2vcpu-combined.svg" alt="2 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 1M and 100M keys and Redis and Valkey with 1M keys" width="800">
+<img src="perf_reports/lavik-vs-memory-databases/2vcpu-combined.svg" alt="2 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 1M and 100M keys and Redis and Valkey with 1M keys" width="800">
 
-[2-vCPU test details and methodology](perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/README.md)
+[2-vCPU test details and methodology](perf_reports/lavik-vs-memory-databases/README.md)
 · [16-vCPU results](#16-vcpus)
 · [Disk-backed comparisons](#disk-backed-kv-systems)
 
 #### 16 vCPUs
 
-The [Redis/Valkey comparison](perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/README.md)
+The [Redis/Valkey comparison](perf_reports/lavik-vs-memory-databases/README.md)
 tested [Lavik v0.3.0](https://github.com/eloqdata/lavik/releases/tag/v0.3.0),
 Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
 on an Azure Standard_L16aos_v4 VM. Lavik was also tested with **1 billion keys**.
 The 10M tests use **16 client threads and 30-second windows**; the 1B test uses
 **32 client threads and 60-second windows**. Both use 160/320/640/1280 connections.
 
-<img src="perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/16vcpu-combined.svg" alt="16 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 10M and 1B keys and Redis and Valkey with 10M keys" width="800">
+<img src="perf_reports/lavik-vs-memory-databases/16vcpu-combined.svg" alt="16 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 10M and 1B keys and Redis and Valkey with 10M keys" width="800">
 
 At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
 peak GET and SET throughput, reaching **1,168,681 GET QPS** and **959,837 SET QPS**.
@@ -101,8 +98,7 @@ With **1 billion keys (1TB)**, Lavik reached **1,143,839 GET QPS** and
 
 ### Disk-backed KV systems
 
-The historical **v0.2.0** [1TB storage comparison](perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.md),
-measured October 21–22, 2026 (UTC), tests
+The [1TB storage comparison](perf_reports/lavik-storage-peers-1tb/README.md) tests
 Lavik, Dragonfly, Garnet, Apache Kvrocks, Pika and Tendis on an Azure
 Standard_L16aos_v4 VM with **1 billion keys and 1 KiB values**.
 Results below use **320 connections** and **32 client threads**, with a 60-second
@@ -110,9 +106,9 @@ window per point, sorted by QPS for each command. QPS bars grow from left to rig
 p99.9 latency bars grow from right to left on the same row. The full
 **160/320/640/1280-connection** sweep is available in the linked report.
 
-<img src="perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/ranked-320.svg" alt="320 connections: paired horizontal QPS and p99.9 latency bars for each database, sorted by QPS within GET and SET" width="900">
+<img src="perf_reports/lavik-storage-peers-1tb/ranked-320.svg" alt="320 connections: paired horizontal QPS and p99.9 latency bars for each database, sorted by QPS within GET and SET" width="900">
 
-See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21/README.md),
+See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-aerospike-ycsb/README.md),
 covering workloads A/B/C/D and their tail latencies.
 
 ## Installation

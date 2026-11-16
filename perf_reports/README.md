@@ -16,23 +16,21 @@ limitations under the License.
 
 # Performance reports
 
-Lavik benchmark results, test configurations, and reproduction commands.
+Each benchmark topic has one report at a stable path. Refresh that report when
+new measurements are available; record the tested version, commit and date
+inside the report. Earlier report revisions remain in Git history.
+
 Each report provides an English `README.md` and a Simplified Chinese
 `README.zh-CN.md`.
 
-每份报告默认展示英文版，点击“简体中文”进入中文版。
+每类测试使用固定目录，更新结果时直接替换同类报告；测试版本、提交和日期写在报告内。
 
-| Report | Test date | English | 简体中文 |
-|---|---|---|---|
-| v0.3.0 versus in-memory databases: 2 / 16 vCPUs, up to 1B keys | 2026-11-15 | [English](lavik-v0.3.0-vs-memory-databases-2026-11-15/README.md) | [简体中文](lavik-v0.3.0-vs-memory-databases-2026-11-15/README.zh-CN.md) |
-| v0.2.0 versus in-memory databases: 2 / 16 vCPUs, up to 1B keys | 2026-10-21 | [English](lavik-v0.2.0-vs-memory-databases-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-vs-memory-databases-2026-10-21/README.zh-CN.md) |
-| v0.2.0: 1TB versus Dragonfly, Garnet, Kvrocks, Pika and Tendis | 2026-10-21–2026-10-22 | [English](lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.zh-CN.md) |
-| v0.2.0: Aerospike YCSB A/B/C/D throughput and tail latency | 2026-10-21 | [English](lavik-v0.2.0-aerospike-ycsb-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-aerospike-ycsb-2026-10-21/README.zh-CN.md) |
-| v0.1.0: 1TB versus Dragonfly, Garnet, Kvrocks, Pika and Tendis | 2026-10-13–14 | [English](lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.md) | [简体中文](lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.zh-CN.md) |
-| v0.1.0 on 2 vCPUs: latest Redis / Valkey + Lavik 100M-key capacity | 2026-10-13 | [English](lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md) |
-| v0.1.0 release: Redis 8.10.2 / Valkey 9.1.2 and Lavik 1TB, defrag enabled | 2026-10-13 | [English](lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.zh-CN.md) |
-| SPDK 48-hour online stability | 2026-08-15 | [English](lavik-spdk-48h-stability-2026-08-15/README.md) | [简体中文](lavik-spdk-48h-stability-2026-08-15/README.zh-CN.md) |
-| v0.1.0 release: Aerospike YCSB A/B/C/D throughput and tail latency, defrag enabled | 2026-10-13 | [English](lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.zh-CN.md) |
+| Report | English | 简体中文 |
+|---|---|---|
+| In-memory Redis / Valkey: 2 / 16 vCPUs, up to 1B keys | [English](lavik-vs-memory-databases/README.md) | [简体中文](lavik-vs-memory-databases/README.zh-CN.md) |
+| 1TB versus Dragonfly, Garnet, Kvrocks, Pika and Tendis | [English](lavik-storage-peers-1tb/README.md) | [简体中文](lavik-storage-peers-1tb/README.zh-CN.md) |
+| Aerospike YCSB A/B/C/D throughput and tail latency | [English](lavik-aerospike-ycsb/README.md) | [简体中文](lavik-aerospike-ycsb/README.zh-CN.md) |
+| SPDK 48-hour online stability | [English](lavik-spdk-48h-stability/README.md) | [简体中文](lavik-spdk-48h-stability/README.zh-CN.md) |
 
-Evidence availability and measurement limits are described in each report. Historical reproduction commands can depend on the
-original machines, dedicated devices, software revisions, and external raw logs.
+Evidence availability, reproduction commands and measurement limits are described
+in each report.
