@@ -4,7 +4,7 @@
 
 ## 结论
 
-16 vCPU、10M keys 下，Lavik 达到 **1,168,681 GET ops/s、959,837 SET ops/s**，均高于本轮两款内存数据库的峰值。2 vCPU、1M keys 下，Lavik GET 峰值 **215,689 ops/s** 低于 Valkey 的 **238,151**，SET 峰值 **239,535 ops/s** 高于两者。另测 Lavik NVMe 上的 100M / 1B keys，容量曲线的数据量是内存对照的 **100 倍**。[逐点数据](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-points.csv)。
+16 vCPU、10M keys 下，Lavik 达到 **1,168,681 GET ops/s、959,837 SET ops/s**，均高于本轮两款内存数据库的峰值。2 vCPU、1M keys 下，Lavik GET 峰值 **215,689 ops/s** 低于 Valkey 的 **238,151**，SET 峰值 **239,535 ops/s** 高于两者。另测 Lavik NVMe 上的 100M / 1B keys，容量曲线的数据量是内存对照的 **100 倍**。[逐点数据](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-points.csv)。
 
 本轮同机重测 v0.2.0 后，未发现测试矩阵中持续的明显回退。短窗口尾延迟异常及复测在下方单独保留；这不构成统计上的等价性证明。
 
@@ -110,7 +110,7 @@
 
 两个短窗口 p99.9 复测曾分别升高约 78%（2 vCPU / 1M / GET / 160）和 28%（2 vCPU / 100M / SET / 160）。重新装载数据、每版各测三轮 120 秒后，中位数为 **1.871 → 1.863 ms** 和 **2.063 → 2.063 ms**，QPS 变化为 −0.34% / +3.55%。复测没有替换首轮结果；窗口百分位数的中位数不等于合并样本百分位数。
 
-[44 个同条件对照](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-comparison.csv) · [复测中位数和范围](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-recheck-summary.csv) · [全部 272 个窗口](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-points.csv)。
+[44 个同条件对照](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-comparison.csv) · [复测中位数和范围](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-recheck-summary.csv) · [全部 272 个窗口](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-points.csv)。
 
 ## 硬件与方法
 
@@ -129,16 +129,16 @@
 - memtier 2.5.1 使用十进制键 `1..N`、1,024 字节值、均匀随机 GET 与覆盖 SET，各数据集独立装载。先 GET 后 SET，连接数递增。除 1B 无额外 GET 预热外，各配置先进行 10 秒 GET 预热。2 vCPU 与 1B 使用 `--distinct-client-seed`；10M 沿用历史种子策略。
 - Lavik 使用 SPDK、2 / 16 个 worker。非默认设置为 `--tomb-raider-interval-ms=0`、`--spdk-max-completions-per-poll=16` 上表的 hugepage 预留，以及 1B 的 `--shutdown-checkpoint`。completion cap 沿用历史报告；不要与使用默认 cap 的 SPDK YCSB 实验混淆。
 - Redis 8.10.2 / Valkey 9.1.2 为优化 jemalloc 构建，`save ""` 关闭自动 RDB 快照。装载后手工 SAVE，各 I/O 线程配置重新载入基线。完整线程扫描见上表。
-- THP 为 `never`，overcommit 为 1。每个配置前后检查精确键数和五个样本值长度。272 个正式窗口均通过响应/错误检查，GET 零 miss，服务端采样 steal 均为零。[逐窗口遥测](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-telemetry.csv) 包含 RSS 和客户端 CPU；SPDK hugepage 不含在 RSS 中。16 vCPU / 10M 的客户端最高占用约 14.3/16 个分配 CPU，因此峰值不能证明服务器的绝对上限。
+- THP 为 `never`，overcommit 为 1。每个配置前后检查精确键数和五个样本值长度。272 个正式窗口均通过响应/错误检查，GET 零 miss，服务端采样 steal 均为零。[逐窗口遥测](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-telemetry.csv) 包含 RSS 和客户端 CPU；SPDK hugepage 不含在 RSS 中。16 vCPU / 10M 的客户端最高占用约 14.3/16 个分配 CPU，因此峰值不能证明服务器的绝对上限。
 
 相对十月报告，本轮内核由 6.17.0-1022-azure 更新，2 vCPU 的客户端改为 L16aos_v5，对照产品构建不包含 TLS（两轮流量均为明文）。因此回归判断使用**本轮同机 v0.2.0 重测**，不能直接减去旧报告数值。
 
 ## 证据与复现
 
-[完整证据](https://github.com/eloqdata/lavik-agent/tree/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15) 与 v0.2.0 数据一同保存在 **eloqdata/lavik-agent**，链接固定至提交 `f96e385dea7e`。[Metadata](https://github.com/eloqdata/lavik-agent/tree/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata) 保留完整 I/O 扫描、首轮点、复测与遥测。CSV 的 `source` 字段对应[原始归档](https://github.com/eloqdata/lavik-agent/tree/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/raw)内的 receipt 路径；归档逐字节保留测量计数、延迟直方图、控制台输出、命令、装载/预热记录及主机检查。[来源记录](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/provenance.json) 包含二进制身份、原始归档哈希和路径映射。
+[完整证据](https://github.com/eloqdata/lavik-agent/tree/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15) 与 v0.2.0 数据一同保存在 **eloqdata/lavik-agent**，链接固定至提交 `0988de68a0f3`。[Metadata](https://github.com/eloqdata/lavik-agent/tree/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata) 保留完整 I/O 扫描、首轮点、复测与遥测。CSV 的 `source` 字段对应[原始归档](https://github.com/eloqdata/lavik-agent/tree/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/raw)内的 receipt 路径；归档逐字节保留测量计数、延迟直方图、控制台输出、命令、装载/预热记录及主机检查。[来源记录](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/provenance.json) 包含二进制身份、原始归档哈希和路径映射。
 
-数据仓库的 [SHA-256 清单](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/SHA256SUMS) 校验归档和元数据，[原始文件清单](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/raw/MANIFEST.json) 记录逐文件哈希。[verify.py](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/verify.py) 检查归档字节并复核 272 个测量点、44 个版本对照和八组复测。本仓库仅保留报告和图表，数据与辅助脚本均位于证据仓库。
+数据仓库的 [SHA-256 清单](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/SHA256SUMS) 校验归档和元数据，[原始文件清单](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/raw/MANIFEST.json) 记录逐文件哈希。[verify.py](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/verify.py) 检查归档字节并复核 272 个测量点、44 个版本对照和八组复测。本仓库仅保留报告和图表，数据与辅助脚本均位于证据仓库。
 
-按上述硬件、版本、装载规模、顺序、CPU 绑定和非默认控制项复现；专用设备准备参见 [SPDK 存储指南](../../docs/operations/spdk-storage.md)。在固定版本的证据目录运行 `python3 plot.py` 可生成两张 SVG（[绘图脚本](https://github.com/eloqdata/lavik-agent/blob/f96e385dea7e6a1857291b5ddf4cb9c9cd1bf13b/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/plot.py)，需要 Matplotlib）。Lavik 默认控制项已对照实测提交的 [`ServerOptions`](../../include/lavik/server.h) 核实，上文仅列出覆盖项。
+按上述硬件、版本、装载规模、顺序、CPU 绑定和非默认控制项复现；专用设备准备参见 [SPDK 存储指南](../../docs/operations/spdk-storage.md)。在固定版本的证据目录运行 `python3 plot.py` 可生成两张 SVG（[绘图脚本](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/plot.py)，需要 Matplotlib）。Lavik 默认控制项已对照实测提交的 [`ServerOptions`](../../include/lavik/server.h) 核实，上文仅列出覆盖项。
 
 多数条件仅一个窗口，补测次数单独标明；未给出置信区间，运行顺序未随机化。产品间成功响应不代表相同同步持久化语义。容量比较有意采用不同键数；同数据量请看 1M / 10M 曲线。[历史 v0.2.0 报告](../lavik-v0.2.0-vs-memory-databases-2026-10-21/README.zh-CN.md)。
