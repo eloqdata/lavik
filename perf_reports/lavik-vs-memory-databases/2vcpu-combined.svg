@@ -1006,7 +1006,7 @@ L 776.16 402.48
    </g>
   </g>
   <g id="text_57">
-   <text style="font-weight: 700; font-size: 16px; font-family: 'DejaVu Sans'; text-anchor: middle" x="504" y="21.5875" transform="rotate(-0 504 21.5875)">2 vCPUs | Lavik v0.3.0 vs Redis / Valkey</text>
+   <text style="font-weight: 700; font-size: 16px; font-family: 'DejaVu Sans'; text-anchor: middle" x="504" y="21.5875" transform="rotate(-0 504 21.5875)">2 vCPUs | Lavik vs Redis / Valkey</text>
   </g>
   <g id="text_58">
    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle" x="504" y="460.917656" transform="rotate(-0 504 460.917656)">1 KiB values | Fixed I/O setting per peer / command | Capacity curve has 100x more keys</text>
