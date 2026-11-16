@@ -10,7 +10,7 @@ Compare Lavik, Redis 8.10.2 and Valkey 9.1.2 on two server sizes, including Lavi
 | 16 | Lavik / Redis / Valkey 10M | 16 / 0–15 | 160 / 320 / 640 / 1280 | 30 | 88 |
 | 16 | Lavik 1B | 32 / 0–31 | 160 / 320 / 640 / 1280 | 60 | 8 |
 
-The v0.3.0 tag points to measured commit `dcb2dda96452610b9aa2625ff2a26abb3303f9b5`. Tests used its pre-release standard x86_64 build, which reports `0.3.0-dev`.
+Tested version: **Lavik v0.3.0**, commit `dcb2dda96452610b9aa2625ff2a26abb3303f9b5`.
 
 ## 2 vCPUs: 1M and 100M keys
 
@@ -167,7 +167,7 @@ Ranges use post-point snapshots. INFO memory follows each product’s accounting
 | OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both hosts |
 | Storage | 1 × 1,439,887,785,984-byte dedicated local NVMe; SPDK/VFIO |
 | Network | Kernel TCP; same VNet and availability zone; accelerated networking |
-| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
+| Lavik | Lavik v0.3.0, standard x86_64 build; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
 
 #### Test method
 
@@ -190,7 +190,7 @@ Ranges use post-point snapshots. INFO memory follows each product’s accounting
 | OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both hosts |
 | Storage | 6 × 1,919,850,381,312-byte dedicated local NVMe; SPDK/VFIO |
 | Network | Kernel TCP; same VNet and availability zone; accelerated networking |
-| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
+| Lavik | Lavik v0.3.0, standard x86_64 build; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
 
 #### Test method
 
@@ -210,7 +210,7 @@ Ranges use post-point snapshots. INFO memory follows each product’s accounting
 | OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both VMs |
 | Storage | 6 × 1,919,850,381,312-byte dedicated NVMe; SPDK/VFIO; 8 GiB EAL/hugepage reservation |
 | Network | Private VNet; kernel TCP; accelerated networking |
-| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
+| Lavik | Lavik v0.3.0, standard x86_64 build; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
 
 - Decimal keys 1..1,000,000,000, no prefix or TTL, 1,024-byte values: 953.67 GiB logical value payload, excluding keys, index and storage overhead.
 - Fresh sequential fill: exactly 1B SETs, 32 threads and 640 total connections. Formal sweeps use independent client seeds, uniform random GET or overwriting SET, and 60 seconds per point. GET precedes SET; concurrency increases within each sweep. No additional GET warmup.
@@ -227,7 +227,7 @@ Each point has one formal window; no confidence intervals are claimed. Successfu
 
 ## Reproduction commands
 
-Replace placeholder addresses, PCI identities and binary paths with those of your test hosts. The measured build was produced as follows after installing dependencies from the [build guide](../../docs/operations/building-and-packaging.md). `LAVIK_PACKAGE_VERSION=regression` matches the measured package name.
+Replace placeholder addresses, PCI identities and binary paths with those of your test hosts. Build v0.3.0 as follows after installing dependencies from the [build guide](../../docs/operations/building-and-packaging.md).
 
 ```bash
 git clone https://github.com/eloqdata/lavik.git lavik-build
@@ -236,7 +236,7 @@ git checkout dcb2dda96452610b9aa2625ff2a26abb3303f9b5
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
-LAVIK_PACKAGE_KERNEL_BYPASS=ON LAVIK_PACKAGE_VERSION=regression ./scripts/package_release.sh
+LAVIK_PACKAGE_KERNEL_BYPASS=ON ./scripts/package_release.sh
 ```
 
 ### 2 vCPU

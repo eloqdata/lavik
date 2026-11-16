@@ -54,8 +54,8 @@ TCP with io_uring by default, with an optional
 
 Browse the [performance reports](perf_reports/README.md) for full results,
 test configurations, and methodology. The Redis/Valkey results use the
-**Lavik v0.3.0 source commit**, measured November 15, 2026 (UTC), with a
-pre-release build. The linked disk-backed and Aerospike comparisons retain
+**Lavik v0.3.0**, measured November 15, 2026 (UTC).
+The linked disk-backed and Aerospike comparisons retain
 their historical v0.2.0 measurements.
 
 <a id="in-memory-redis-and-valkey"></a>

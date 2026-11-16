@@ -10,7 +10,7 @@
 | 16 | Lavik / Redis / Valkey 10M | 16 / 0–15 | 160 / 320 / 640 / 1280 | 30 | 88 |
 | 16 | Lavik 1B | 32 / 0–31 | 160 / 320 / 640 / 1280 | 60 | 8 |
 
-v0.3.0 tag 与实测提交 `dcb2dda96452610b9aa2625ff2a26abb3303f9b5` 一致；测试使用该提交发布前构建的标准 x86_64 包，版本输出为 `0.3.0-dev`。
+测试版本：**Lavik v0.3.0**，提交 `dcb2dda96452610b9aa2625ff2a26abb3303f9b5`。
 
 ## 2 vCPU：1M 与 100M key
 
@@ -167,7 +167,7 @@ Lavik 10M / 1B 与 Redis / Valkey 10M 均扫描 160/320/640/1280 总连接。10M
 | OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both hosts |
 | Storage | 1 × 1,439,887,785,984-byte dedicated local NVMe; SPDK/VFIO |
 | Network | Kernel TCP; same VNet and availability zone; accelerated networking |
-| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
+| Lavik | Lavik v0.3.0, standard x86_64 build; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
 
 #### 测试方法
 
@@ -190,7 +190,7 @@ Lavik 10M / 1B 与 Redis / Valkey 10M 均扫描 160/320/640/1280 总连接。10M
 | OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both hosts |
 | Storage | 6 × 1,919,850,381,312-byte dedicated local NVMe; SPDK/VFIO |
 | Network | Kernel TCP; same VNet and availability zone; accelerated networking |
-| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
+| Lavik | Lavik v0.3.0, standard x86_64 build; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
 
 #### 测试方法
 
@@ -210,7 +210,7 @@ Lavik 10M / 1B 与 Redis / Valkey 10M 均扫描 160/320/640/1280 总连接。10M
 | OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both VMs |
 | Storage | 6 × 1,919,850,381,312-byte dedicated NVMe; SPDK/VFIO; 8 GiB EAL/hugepage reservation |
 | Network | Private VNet; kernel TCP; accelerated networking |
-| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
+| Lavik | Lavik v0.3.0, standard x86_64 build; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
 
 - key 为十进制 1..1,000,000,000，无前缀、无 TTL，value 为 1,024 字节。逻辑 value 净载荷为 953.67 GiB，不含 key、索引与存储开销。
 - 从空盘顺序装载精确 10 亿次 SET，使用 32 线程、640 总连接。正式扫描使用独立客户端随机种子、全范围均匀随机 GET 或覆盖 SET，每点 60 秒。先 GET 后 SET，连接数递增；不额外预热 GET。
@@ -227,7 +227,7 @@ Lavik 10M / 1B 与 Redis / Valkey 10M 均扫描 160/320/640/1280 总连接。10M
 
 ## 复现命令
 
-以下命令使用占位地址、PCI 标识和二进制路径，请按测试机替换。实测构建方式如下；先按[构建指南](../../docs/operations/building-and-packaging.md)安装依赖。`LAVIK_PACKAGE_VERSION=regression` 对应实测包名。
+以下命令使用占位地址、PCI 标识和二进制路径，请按测试机替换。先按[构建指南](../../docs/operations/building-and-packaging.md)安装依赖，再按以下命令构建 v0.3.0。
 
 ```bash
 git clone https://github.com/eloqdata/lavik.git lavik-build
@@ -236,7 +236,7 @@ git checkout dcb2dda96452610b9aa2625ff2a26abb3303f9b5
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
-LAVIK_PACKAGE_KERNEL_BYPASS=ON LAVIK_PACKAGE_VERSION=regression ./scripts/package_release.sh
+LAVIK_PACKAGE_KERNEL_BYPASS=ON ./scripts/package_release.sh
 ```
 
 ### 2 vCPU
