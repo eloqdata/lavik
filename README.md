@@ -39,8 +39,8 @@ TCP with io_uring by default, with an optional
 
 - **Grow beyond RAM.** Keep a compact key index in memory and values on NVMe;
   serve hundreds of millions of keys from files, raw devices, or SPDK storage.
-- **In-memory-class throughput.** With 10M keys, Lavik v0.2.0 reached
-  **1.16M GET QPS** and **945K SET QPS**, exceeding Redis and Valkey's peak
+- **In-memory-class throughput.** With 10M keys, Lavik v0.3.0 reached
+  **1.17M GET QPS** and **960K SET QPS**, exceeding Redis and Valkey's peak
   throughput in that test. See [full results](#in-memory-redis-and-valkey).
 - **Keep your Redis tools.** RESP2/RESP3, familiar data structures, Lua,
   transactions, Pub/Sub, authentication, TLS, and RDB import/export.
@@ -53,8 +53,10 @@ TCP with io_uring by default, with an optional
 ## Benchmark
 
 Browse the [performance reports](perf_reports/README.md) for full results,
-test configurations, and methodology. The results below use **Lavik v0.2.0**,
-measured on October 21–22, 2026 (UTC).
+test configurations, and methodology. The Redis/Valkey results use the
+**Lavik v0.3.0**, measured November 15, 2026 (UTC).
+The linked disk-backed and Aerospike comparisons retain
+their historical v0.2.0 measurements.
 
 <a id="in-memory-redis-and-valkey"></a>
 
@@ -65,41 +67,42 @@ measured on October 21–22, 2026 (UTC).
 #### 2 vCPUs
 
 **100× the data, comparable peak throughput—on the same 2-vCPU machine.**
-Lavik v0.2.0 served **100M keys (95.37 GiB of values)** from NVMe on a
+Lavik v0.3.0 served **100M keys (95.37 GiB of values)** from NVMe on a
 **2-vCPU / 16-GiB** Azure VM, reaching **216K GET ops/s and 231K SET ops/s**.
 Redis 8.10.2 and Valkey 9.1.2 held **1M keys** in memory on the same VM;
 all values were **1 KiB**. The chart shows throughput and p99.9 latency
 across connection counts.
 
-<img src="perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21/2vcpu-combined.svg" alt="2 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 1M and 100M keys and Redis and Valkey with 1M keys" width="800">
+<img src="perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/2vcpu-combined.svg" alt="2 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 1M and 100M keys and Redis and Valkey with 1M keys" width="800">
 
-[2-vCPU test details and methodology](perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21/README.md)
+[2-vCPU test details and methodology](perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/README.md)
 · [16-vCPU results](#16-vcpus)
 · [Disk-backed comparisons](#disk-backed-kv-systems)
 
 #### 16 vCPUs
 
-The [Redis/Valkey comparison](perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21/README.md)
-tested [Lavik v0.2.0](https://github.com/eloqdata/lavik/releases/tag/v0.2.0),
+The [Redis/Valkey comparison](perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/README.md)
+tested [Lavik v0.3.0](https://github.com/eloqdata/lavik/releases/tag/v0.3.0),
 Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
 on an Azure Standard_L16aos_v4 VM. Lavik was also tested with **1 billion keys**.
 The 10M tests use **16 client threads and 30-second windows**; the 1B test uses
 **32 client threads and 60-second windows**. Both use 160/320/640/1280 connections.
 
-<img src="perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21/16vcpu-combined.svg" alt="16 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 10M and 1B keys and Redis and Valkey with 10M keys" width="800">
+<img src="perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/16vcpu-combined.svg" alt="16 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 10M and 1B keys and Redis and Valkey with 10M keys" width="800">
 
 At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
-peak GET and SET throughput, reaching **1,156,956 GET QPS** and **945,384 SET QPS**.
-GET peak throughput was **18.5% higher than Redis and 26.6% higher than Valkey**;
-SET was **9.4% and 19.1% higher**, respectively.
+peak GET and SET throughput, reaching **1,168,681 GET QPS** and **959,837 SET QPS**.
+GET peak throughput was **20.3% higher than Redis and 27.1% higher than Valkey**;
+SET was **9.7% and 19.8% higher**, respectively.
 
-With **1 billion keys (1TB)**, Lavik reached **1,129,597 GET QPS** and
-**910,356 SET QPS**—throughput comparable to Redis and Valkey holding
+With **1 billion keys (1TB)**, Lavik reached **1,143,839 GET QPS** and
+**929,346 SET QPS**—throughput comparable to Redis and Valkey holding
 10 million keys in memory, with **100 times as much data**.
 
 ### Disk-backed KV systems
 
-The [1TB storage comparison](perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.md) tests
+The historical **v0.2.0** [1TB storage comparison](perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.md),
+measured October 21–22, 2026 (UTC), tests
 Lavik, Dragonfly, Garnet, Apache Kvrocks, Pika and Tendis on an Azure
 Standard_L16aos_v4 VM with **1 billion keys and 1 KiB values**.
 Results below use **320 connections** and **32 client threads**, with a 60-second
