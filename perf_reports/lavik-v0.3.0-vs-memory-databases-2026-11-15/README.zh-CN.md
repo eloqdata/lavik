@@ -1,37 +1,43 @@
-# Lavik v0.3.0 与内存 Redis / Valkey 对比
+# Lavik v0.3.0 与内存数据库对比：2 vCPU / 16 vCPU
 
-[English](README.md) · 测试日期：2026-11-15（UTC）
+[English](README.md) | **简体中文**
 
-## 结论
+在两种服务器规格上对比 Lavik、Redis 8.10.2 和 Valkey 9.1.2，包含 Lavik 的 100M / 1B key 容量测试。报告展示 **180 个正式对比点**，value 均为 **1 KiB**，测试日期为 **2026-11-15（UTC）**。
 
-16 vCPU、10M keys 下，Lavik 达到 **1,168,681 GET ops/s、959,837 SET ops/s**，均高于本轮两款内存数据库的峰值。2 vCPU、1M keys 下，Lavik GET 峰值 **215,689 ops/s** 低于 Valkey 的 **238,151**，SET 峰值 **239,535 ops/s** 高于两者。另测 Lavik NVMe 上的 100M / 1B keys，容量曲线的数据量是内存对照的 **100 倍**。[逐点数据](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-points.csv)。
+| Server vCPUs | Datasets | Client threads / CPUs | Total connections | Seconds / point | Points |
+| --- | --- | --- | --- | --- | --- |
+| 2 | Lavik 1M / 100M; Redis / Valkey 1M | 16 / 0–15 | 16 / 32 / 80 / 160 / 320 / 640 / 1280 | 30 | 84 |
+| 16 | Lavik / Redis / Valkey 10M | 16 / 0–15 | 160 / 320 / 640 / 1280 | 30 | 88 |
+| 16 | Lavik 1B | 32 / 0–31 | 160 / 320 / 640 / 1280 | 60 | 8 |
 
-本轮同机重测 v0.2.0 后，未发现测试矩阵中持续的明显回退。短窗口尾延迟异常及复测在下方单独保留；这不构成统计上的等价性证明。
+v0.3.0 tag 与实测提交 `dcb2dda96452610b9aa2625ff2a26abb3303f9b5` 一致；测试使用该提交发布前构建的标准 x86_64 包，版本输出为 `0.3.0-dev`。
 
-实测源码提交为 [`dcb2dda96452`](https://github.com/eloqdata/lavik/commit/dcb2dda96452610b9aa2625ff2a26abb3303f9b5)，与 [v0.3.0](https://github.com/eloqdata/lavik/releases/tag/v0.3.0) tag 一致。测试使用发布前构建的标准 x86-64-v2/SPDK 包，版本输出为 `0.3.0-dev`，并非之后上传的 release 二进制。二进制 SHA-256 为 `c442735274c7bcbfaa8b59268b1f5f0f45ac36782ef48314e3b8e49f1857bf10`。CSV 中的 `main` 指这个确切提交。
+## 2 vCPU：1M 与 100M key
 
-## 2 vCPU
+100M key 的 GET / SET 峰值为 **215,536 / 230,794 ops/s**，分别保留 1M 数据集峰值的 **99.9% / 96.4%**。1M 同数据量对照中，Valkey GET 最高（238,151 ops/s），Lavik SET 最高（239,535 ops/s）。峰值可能对应不同连接数，下表另列同连接数结果。
 
-![2 vCPU throughput and p99.9](2vcpu-combined.svg)
+### 吞吐与 p99.9 延迟
 
-每个对照产品、每种命令选取**完整连接数扫描**中峰值最高的一个 I/O 线程配置，吞吐和延迟曲线均固定使用它，不逐点拼接配置。表格包含全部连接数（包括 1280）。峰值表的延迟与该吞吐峰值来自**同一窗口**。
+<img src="2vcpu-combined.svg" alt="2 vCPU GET and SET throughput and p99.9 latency" width="800">
 
 | Command | Product / keys | Workers / I/O threads | Connections | Peak ops/s | p99.9 ms |
 | --- | --- | --- | --- | --- | --- |
-| GET | Lavik v0.3.0 / 1M | 2 | 80 | 215,689 | 0.671 |
-| GET | Lavik v0.3.0 / 100M | 2 | 80 | 215,536 | 0.647 |
+| GET | Lavik 0.3.0 / 1M | 2 | 80 | 215,689 | 0.671 |
+| GET | Lavik 0.3.0 / 100M | 2 | 80 | 215,536 | 0.647 |
 | GET | Redis 8.10.2 / 1M | 2 | 1280 | 208,441 | 18.687 |
 | GET | Valkey 9.1.2 / 1M | 2 | 80 | 238,151 | 0.503 |
-| SET | Lavik v0.3.0 / 1M | 2 | 160 | 239,535 | 1.599 |
-| SET | Lavik v0.3.0 / 100M | 2 | 320 | 230,794 | 3.887 |
+| SET | Lavik 0.3.0 / 1M | 2 | 160 | 239,535 | 1.599 |
+| SET | Lavik 0.3.0 / 100M | 2 | 320 | 230,794 | 3.887 |
 | SET | Redis 8.10.2 / 1M | 2 | 32 | 190,106 | 0.255 |
 | SET | Valkey 9.1.2 / 1M | 2 | 32 | 220,455 | 0.215 |
 
-### 相同连接数
+每种命令的每个对照产品，按完整扫描中的最高峰值选择**一个固定 I/O 线程配置**，整条吞吐和延迟曲线均使用它，不逐点拼接配置。峰值表的延迟来自相同窗口。 **2 vCPU 图仅展示 16–320 连接；表格保留 640 / 1280 连接。**
+
+### 相同连接数对比
 
 每格为 **ops/s / p99.9 ms**。
 
-| Command | Connections | Lavik v0.3.0 / 1M | Lavik v0.3.0 / 100M | Redis 8.10.2 / 1M | Valkey 9.1.2 / 1M |
+| Command | Connections | Lavik 0.3.0 / 1M | Lavik 0.3.0 / 100M | Redis 8.10.2 / 1M | Valkey 9.1.2 / 1M |
 | --- | --- | --- | --- | --- | --- |
 | GET | 16 | 127,675 / 0.279 | 126,953 / 0.199 | 164,117 / 0.167 | 217,251 / 0.143 |
 | GET | 32 | 214,755 / 0.359 | 215,425 / 0.263 | 195,499 / 0.279 | 233,187 / 0.263 |
@@ -57,28 +63,45 @@
 | Valkey 9.1.2 | 1 | 186,115 (160) | 183,241 (1280) |
 | Valkey 9.1.2 | 2 | 238,151 (80) | 220,455 (32) |
 
-## 16 vCPU
+![All measured throughput configurations](2vcpu-all-configurations.svg)
 
-![16 vCPU throughput and p99.9](16vcpu-combined.svg)
+### 内存与客户端诊断
 
-每个对照产品、每种命令选取**完整连接数扫描**中峰值最高的一个 I/O 线程配置，吞吐和延迟曲线均固定使用它，不逐点拼接配置。表格包含全部连接数（包括 1280）。峰值表的延迟与该吞吐峰值来自**同一窗口**。
+| Product / keys | INFO used_memory (MiB) | Process RSS (MiB) | Max average client CPU / cores | Max server steal / % |
+| --- | --- | --- | --- | --- |
+| Lavik 0.3.0 / 1M | 318.8–318.8 | 186.9–197.2 | 2.095 | 0.0000 |
+| Lavik 0.3.0 / 100M | 4,604.3–4,604.3 | 4,270.4–4,280.5 | 1.954 | 0.0000 |
+| Redis 8.10.2 / 1M | 1,264.7–1,265.0 | 1,283.9–2,202.3 | 1.472 | 0.0000 |
+| Valkey 9.1.2 / 1M | 1,268.1–1,268.6 | 1,286.5–2,111.2 | 1.464 | 0.0000 |
 
-| Command | Product / keys | Workers / I/O threads | Connections | Peak ops/s | p99.9 ms |
-| --- | --- | --- | --- | --- | --- |
-| GET | Lavik v0.3.0 / 10M | 16 | 1280 | 1,168,681 | 6.207 |
-| GET | Lavik v0.3.0 / 1B | 16 | 1280 | 1,143,839 | 3.887 |
-| GET | Redis 8.10.2 / 10M | 16 | 1280 | 971,136 | 7.167 |
-| GET | Valkey 9.1.2 / 10M | 16 | 1280 | 919,758 | 7.391 |
-| SET | Lavik v0.3.0 / 10M | 16 | 1280 | 959,837 | 7.199 |
-| SET | Lavik v0.3.0 / 1B | 16 | 1280 | 929,346 | 5.279 |
-| SET | Redis 8.10.2 / 10M | 16 | 1280 | 874,635 | 7.231 |
-| SET | Valkey 9.1.2 / 10M | 8 | 1280 | 801,428 | 7.583 |
+范围来自正式点后的快照。INFO 内存使用各产品自身统计口径；RSS 不含 SPDK 大页预留。Lavik 另预留 2,048 MiB 大页。客户端 CPU 为整个测量进程的平均占用，不是单线程峰值。部分 16 vCPU / 10M 测量接近客户端分配 CPU 上限，因此这些峰值不代表服务端的绝对容量上限。
 
-### 相同连接数
+## 16 vCPU：10M 与 1B key
+
+Lavik 10M / 1B 与 Redis / Valkey 10M 均扫描 160/320/640/1280 总连接。10M 使用 **16 客户端线程、30 秒窗口**；1B 使用 **32 客户端线程、60 秒窗口**。各条件均为本轮新测数据。
+
+### 吞吐与 p99.9 延迟
+
+<img src="16vcpu-combined.svg" alt="16 vCPU GET and SET throughput and p99.9 latency" width="800">
+
+| Command | Product / keys | Workers / I/O threads | Client threads | Connections | Peak ops/s | p99.9 ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| GET | Lavik 0.3.0 / 10M | 16 | 16 | 1280 | 1,168,681 | 6.207 |
+| GET | Lavik 0.3.0 / 1B | 16 | 32 | 1280 | 1,143,839 | 3.887 |
+| GET | Redis 8.10.2 / 10M | 16 | 16 | 1280 | 971,136 | 7.167 |
+| GET | Valkey 9.1.2 / 10M | 16 | 16 | 1280 | 919,758 | 7.391 |
+| SET | Lavik 0.3.0 / 10M | 16 | 16 | 1280 | 959,837 | 7.199 |
+| SET | Lavik 0.3.0 / 1B | 16 | 32 | 1280 | 929,346 | 5.279 |
+| SET | Redis 8.10.2 / 10M | 16 | 16 | 1280 | 874,635 | 7.231 |
+| SET | Valkey 9.1.2 / 10M | 8 | 16 | 1280 | 801,428 | 7.583 |
+
+每种命令的每个对照产品，按完整扫描中的最高峰值选择**一个固定 I/O 线程配置**，整条吞吐和延迟曲线均使用它，不逐点拼接配置。峰值表的延迟来自相同窗口。
+
+### 相同连接数对比
 
 每格为 **ops/s / p99.9 ms**。
 
-| Command | Connections | Lavik v0.3.0 / 10M | Lavik v0.3.0 / 1B | Redis 8.10.2 / 10M | Valkey 9.1.2 / 10M |
+| Command | Connections | Lavik 0.3.0 / 10M | Lavik 0.3.0 / 1B | Redis 8.10.2 / 10M | Valkey 9.1.2 / 10M |
 | --- | --- | --- | --- | --- | --- |
 | GET | 160 | 376,725 / 0.903 | 382,250 / 0.823 | 388,562 / 0.871 | 464,368 / 0.879 |
 | GET | 320 | 615,731 / 1.551 | 671,976 / 0.927 | 598,530 / 1.367 | 644,655 / 1.399 |
@@ -104,41 +127,383 @@
 | Valkey 9.1.2 | 8 | 849,172 (1280) | 801,428 (1280) |
 | Valkey 9.1.2 | 16 | 919,758 (1280) | 785,046 (1280) |
 
-## 同机 v0.2.0 回归检查
+![All measured throughput configurations](16vcpu-all-configurations.svg)
 
-基线为官方 v0.2.0 包，提交 `2908f86f2770e9c6e8acc6585b3bedb4b44d1cd5`，在本轮相同机器上重测。44 个首轮同条件对照的 QPS 差异为 **−2.5% 至 +5.9%**。首轮最大降幅出现在 16 vCPU / 10M / SET / 160 连接；三轮复测中位数为 **428,765 → 431,976 ops/s（+0.75%）**，范围重叠。
+### 1B 延迟明细
 
-两个短窗口 p99.9 复测曾分别升高约 78%（2 vCPU / 1M / GET / 160）和 28%（2 vCPU / 100M / SET / 160）。重新装载数据、每版各测三轮 120 秒后，中位数为 **1.871 → 1.863 ms** 和 **2.063 → 2.063 ms**，QPS 变化为 −0.34% / +3.55%。复测没有替换首轮结果；窗口百分位数的中位数不等于合并样本百分位数。
+| Command | Connections | Client threads | Ops/s | p50 ms | p99 ms | p99.9 ms | p99.99 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| GET | 160 | 32 | 382,250 | 0.415 | 0.735 | 0.823 | 1.615 |
+| GET | 320 | 32 | 671,976 | 0.479 | 0.799 | 0.927 | 1.231 |
+| GET | 640 | 32 | 1,009,460 | 0.623 | 1.191 | 1.719 | 4.223 |
+| GET | 1280 | 32 | 1,143,839 | 1.079 | 2.079 | 3.887 | 8.255 |
+| SET | 160 | 32 | 443,004 | 0.367 | 0.671 | 0.807 | 4.799 |
+| SET | 320 | 32 | 692,511 | 0.455 | 0.799 | 0.919 | 1.279 |
+| SET | 640 | 32 | 877,731 | 0.719 | 1.223 | 2.271 | 13.759 |
+| SET | 1280 | 32 | 929,346 | 1.359 | 2.175 | 5.279 | 18.943 |
 
-[44 个同条件对照](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-comparison.csv) · [复测中位数和范围](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-recheck-summary.csv) · [全部 272 个窗口](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-points.csv)。
+### 内存与客户端诊断
 
-## 硬件与方法
+| Product / keys | INFO used_memory (MiB) | Process RSS (MiB) | Max average client CPU / cores | Max server steal / % |
+| --- | --- | --- | --- | --- |
+| Lavik 0.3.0 / 10M | 2,177.2–2,177.2 | 952.1–958.9 | 14.332 | 0.0000 |
+| Lavik 0.3.0 / 1B | 41,989.3–41,989.4 | 39,869.0–39,878.9 | 18.146 | 0.0000 |
+| Redis 8.10.2 / 10M | 12,678.0–12,681.3 | 12,798.3–12,874.5 | 12.896 | 0.0000 |
+| Valkey 9.1.2 / 10M | 12,654.7–12,655.8 | 12,773.6–13,020.3 | 11.970 | 0.0000 |
 
-| Item | 2 vCPU | 16 vCPU |
-| --- | --- | --- |
-| Server | Standard_L2aos_v5; EPYC 9V45; 1 physical / 2 logical CPUs; 16 GiB | Standard_L16aos_v4; EPYC 9V74; 8 physical / 16 logical CPUs; 128 GiB |
-| Region | East US, zone 3 | Japan East, zone 2 |
-| Client | Standard_L16aos_v5; CPUs 0–15 | Standard_F32als_v6; CPUs 0–15 (10M), 0–31 (1B) |
-| NVMe | 1 × 1,439,887,785,984 bytes | 6 × 1,919,850,381,312 bytes |
-| Hugepages | 2 GiB | 8 GiB |
-| Client threads / window | 16 / 30s | 16 / 30s (10M); 32 / 60s (1B) |
-| Connections | 16 / 32 / 80 / 160 / 320 / 640 / 1280 | 160 / 320 / 640 / 1280 |
+范围来自正式点后的快照。INFO 内存使用各产品自身统计口径；RSS 不含 SPDK 大页预留。Lavik 另预留 8,192 MiB 大页。客户端 CPU 为整个测量进程的平均占用，不是单线程峰值。部分 16 vCPU / 10M 测量接近客户端分配 CPU 上限，因此这些峰值不代表服务端的绝对容量上限。
 
-各主机为 Ubuntu 24.04 / Linux 7.0.0-1017-azure。服务端和独立客户端位于同一 VNet、可用区，使用加速网络。产品及版本在相同服务端顺序运行。
+## 环境与测试方法
 
-- memtier 2.5.1 使用十进制键 `1..N`、1,024 字节值、均匀随机 GET 与覆盖 SET，各数据集独立装载。先 GET 后 SET，连接数递增。除 1B 无额外 GET 预热外，各配置先进行 10 秒 GET 预热。2 vCPU 与 1B 使用 `--distinct-client-seed`；10M 沿用历史种子策略。
-- Lavik 使用 SPDK、2 / 16 个 worker。非默认设置为 `--tomb-raider-interval-ms=0`、`--spdk-max-completions-per-poll=16` 上表的 hugepage 预留，以及 1B 的 `--shutdown-checkpoint`。completion cap 沿用历史报告；不要与使用默认 cap 的 SPDK YCSB 实验混淆。
-- Redis 8.10.2 / Valkey 9.1.2 为优化 jemalloc 构建，`save ""` 关闭自动 RDB 快照。装载后手工 SAVE，各 I/O 线程配置重新载入基线。完整线程扫描见上表。
-- THP 为 `never`，overcommit 为 1。每个配置前后检查精确键数和五个样本值长度。272 个正式窗口均通过响应/错误检查，GET 零 miss，服务端采样 steal 均为零。[逐窗口遥测](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/memtier-telemetry.csv) 包含 RSS 和客户端 CPU；SPDK hugepage 不含在 RSS 中。16 vCPU / 10M 的客户端最高占用约 14.3/16 个分配 CPU，因此峰值不能证明服务器的绝对上限。
+### 2 vCPU
 
-相对十月报告，本轮内核由 6.17.0-1022-azure 更新，2 vCPU 的客户端改为 L16aos_v5，对照产品构建不包含 TLS（两轮流量均为明文）。因此回归判断使用**本轮同机 v0.2.0 重测**，不能直接减去旧报告数值。
+#### 版本与硬件
 
-## 证据与复现
+| 项目 | 配置 |
+| --- | --- |
+| Server | Standard_L2aos_v5; 2 vCPU (1 physical core) / 16 GiB nominal RAM; AMD EPYC 9V45 96-Core Processor |
+| Client | Standard_L16aos_v5; separate VM; CPUs 0–15 |
+| Region | East US, zone 3 |
+| OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both hosts |
+| Storage | 1 × 1,439,887,785,984-byte dedicated local NVMe; SPDK/VFIO |
+| Network | Kernel TCP; same VNet and availability zone; accelerated networking |
+| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
 
-[完整证据](https://github.com/eloqdata/lavik-agent/tree/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15) 与 v0.2.0 数据一同保存在 **eloqdata/lavik-agent**，链接固定至提交 `0988de68a0f3`。[Metadata](https://github.com/eloqdata/lavik-agent/tree/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata) 保留完整 I/O 扫描、首轮点、复测与遥测。CSV 的 `source` 字段对应[原始归档](https://github.com/eloqdata/lavik-agent/tree/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/raw)内的 receipt 路径；归档逐字节保留测量计数、延迟直方图、控制台输出、命令、装载/预热记录及主机检查。[来源记录](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/metadata/provenance.json) 包含二进制身份、原始归档哈希和路径映射。
+#### 测试方法
 
-数据仓库的 [SHA-256 清单](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/SHA256SUMS) 校验归档和元数据，[原始文件清单](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/raw/MANIFEST.json) 记录逐文件哈希。[verify.py](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/verify.py) 检查归档字节并复核 272 个测量点、44 个版本对照和八组复测。本仓库仅保留报告和图表，数据与辅助脚本均位于证据仓库。
+- key 为十进制 `1..N`，无前缀，value 为 1,024 字节，无 TTL。Lavik 1M 和 100M 分别独立装载；Redis、Valkey 各使用 1M。
+- memtier 2.5.1 固定在客户端 16 个 CPU 上，全 key 范围均匀随机 GET 或覆盖 SET。连接数为 16, 32, 80, 160, 320, 640, 1280；每点测一次，基准与 1 亿条组 30 秒。全部定时测量均使用独立客户端随机种子。
+- 每个配置先预热 GET 10 秒，然后 GET、SET 各按连接数递增测量。所有产品在同一服务器串行运行，测量前已完成所有构建。
+- Lavik 使用 2 个 worker 和独占 NVMe/SPDK。非默认设置为 `--tomb-raider-interval-ms=0`、`--spdk-max-completions-per-poll=16` 和 2 GiB EAL/大页内存。每个测量点前后检查 defrag 状态。
+- Redis 8.10.2、Valkey 9.1.2 与旧报告版本一致，使用默认优化构建与 jemalloc，分别扫描 1, 2 个 I/O 线程。`save ""` 禁用定时快照；初次装载后手动 SAVE，各线程配置从相同 RDB 基线恢复。正式写入只进入内存。
+- THP 为 `never`，overcommit 为 1，每个配置前后核验精确 DBSIZE 和五个 value 长度，并检查装载请求数、零 GET 未命中、连接错误、版本和 CPU 亲和性。
 
-按上述硬件、版本、装载规模、顺序、CPU 绑定和非默认控制项复现；专用设备准备参见 [SPDK 存储指南](../../docs/operations/spdk-storage.md)。在固定版本的证据目录运行 `python3 plot.py` 可生成两张 SVG（[绘图脚本](https://github.com/eloqdata/lavik-agent/blob/0988de68a0f315269e1a77ec35de736a0bdd6ed0/perf_reports/lavik-v0.3.0-vs-memory-databases-2026-11-15/plot.py)，需要 Matplotlib）。Lavik 默认控制项已对照实测提交的 [`ServerOptions`](../../include/lavik/server.h) 核实，上文仅列出覆盖项。
+### 16 vCPU：10M
 
-多数条件仅一个窗口，补测次数单独标明；未给出置信区间，运行顺序未随机化。产品间成功响应不代表相同同步持久化语义。容量比较有意采用不同键数；同数据量请看 1M / 10M 曲线。[历史 v0.2.0 报告](../lavik-v0.2.0-vs-memory-databases-2026-10-21/README.zh-CN.md)。
+#### 版本与硬件
+
+| 项目 | 配置 |
+| --- | --- |
+| Server | Standard_L16aos_v4; 16 vCPU (8 physical cores) / 128 GiB nominal RAM; AMD EPYC 9V74 80-Core Processor |
+| Client | Standard_F32als_v6; separate VM; CPUs 0–15 |
+| Region | Japan East, zone 2 |
+| OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both hosts |
+| Storage | 6 × 1,919,850,381,312-byte dedicated local NVMe; SPDK/VFIO |
+| Network | Kernel TCP; same VNet and availability zone; accelerated networking |
+| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
+
+#### 测试方法
+
+- key 为十进制 `1..N`，无前缀，value 为 1,024 字节，无 TTL。各产品分别独立装载 10M 条。
+- memtier 2.5.1 固定在客户端 16 个 CPU 上，全 key 范围均匀随机 GET 或覆盖 SET。保留的连接数为 160, 320, 640, 1280；每点测一次、30 秒，沿用原报告的默认客户端种子。
+- 每个配置先预热 GET 10 秒，然后 GET、SET 各按连接数递增测量。所有产品在同一服务器串行运行，测量前已完成所有构建。
+- Lavik 使用 16 个 worker 和独占 NVMe/SPDK。非默认设置为 `--tomb-raider-interval-ms=0`、`--spdk-max-completions-per-poll=16` 和 8 GiB EAL/大页内存。每个测量点前后检查 defrag 状态。
+- Redis 8.10.2、Valkey 9.1.2 与旧报告版本一致，使用默认优化构建与 jemalloc，分别扫描 1, 2, 4, 8, 16 个 I/O 线程。`save ""` 禁用定时快照；初次装载后手动 SAVE，各线程配置从相同 RDB 基线恢复。正式写入只进入内存。
+- THP 为 `never`，overcommit 为 1，每个配置前后核验精确 DBSIZE 和五个 value 长度，并检查装载请求数、零 GET 未命中、连接错误、版本和 CPU 亲和性。
+
+### 16 vCPU：1B
+
+| Item | Configuration |
+| --- | --- |
+| Server | Standard_L16aos_v4; Japan East zone 2; AMD EPYC 9V74; 8 physical cores / 16 vCPUs; 128 GiB nominal RAM |
+| Client | Standard_F32als_v6; 32 vCPUs; memtier 2.5.1; 32 threads pinned to CPUs 0–31 |
+| OS | Ubuntu 24.04; Linux 7.0.0-1017-azure on both VMs |
+| Storage | 6 × 1,919,850,381,312-byte dedicated NVMe; SPDK/VFIO; 8 GiB EAL/hugepage reservation |
+| Network | Private VNet; kernel TCP; accelerated networking |
+| Lavik | Pre-release standard x86_64 build at v0.3.0; dcb2dda96452610b9aa2625ff2a26abb3303f9b5 |
+
+- key 为十进制 1..1,000,000,000，无前缀、无 TTL，value 为 1,024 字节。逻辑 value 净载荷为 953.67 GiB，不含 key、索引与存储开销。
+- 从空盘顺序装载精确 10 亿次 SET，使用 32 线程、640 总连接。正式扫描使用独立客户端随机种子、全范围均匀随机 GET 或覆盖 SET，每点 60 秒。先 GET 后 SET，连接数递增；不额外预热 GET。
+- Lavik 使用 16 个服务端 worker、SPDK、停机 checkpoint、tomb-raider interval 0、SPDK completion cap 16，其余继承已核验默认值。每点前后检查 defrag 状态；扫描前后核验精确 DBSIZE 与五个 value 长度。
+- 每格仅测一次，不给置信区间；吞吐和分位数来自完整窗口。
+
+装载客户端调用耗时 **21.3 分钟**，装载吞吐 **979,105 ops/s**。八个 1B 正式点最大平均客户端 CPU 使用 **18.146 核**，采样服务端 CPU steal 为 **0.0000%**。
+
+## 证据与测量限制
+
+本报告的 180 个正式对比点均完成了请求数、连接错误、GET miss、键数与样本长度核验。本轮另完成 44 个同机 v0.2.0 基线点和 48 个复测窗口，共 272 个有效测量窗口；原始输出、运行命令和 SHA-256 清单已单独归档，本文结果表仅使用首轮 v0.3.0 / Redis / Valkey 数据。
+
+每点仅一次正式测量，不提供置信区间。不同产品的成功响应不代表相同的同步持久化保证。容量组使用内存对照的 100 倍键数；同数据量请看 1M / 10M 组。相对十月报告，本轮内核更新至 7.0.0-1017-azure，2 vCPU 客户端改为 L16aos_v5；Redis / Valkey 均未启用 TLS 构建，两轮测试流量均为明文。跨轮绝对值差异不能直接归因于版本。
+
+## 复现命令
+
+以下命令使用占位地址、PCI 标识和二进制路径，请按测试机替换。实测构建方式如下；先按[构建指南](../../docs/operations/building-and-packaging.md)安装依赖。`LAVIK_PACKAGE_VERSION=regression` 对应实测包名。
+
+```bash
+git clone https://github.com/eloqdata/lavik.git lavik-build
+cd lavik-build
+git checkout dcb2dda96452610b9aa2625ff2a26abb3303f9b5
+git submodule update --init bycorf third_party/mimalloc
+git -C bycorf submodule update --init third_party/liburing third_party/abseil third_party/spdk third_party/dpdk
+git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
+LAVIK_PACKAGE_KERNEL_BYPASS=ON LAVIK_PACKAGE_VERSION=regression ./scripts/package_release.sh
+```
+
+### 2 vCPU
+
+服务端使用上述 L2aos_v5，客户端使用同可用区的 L16aos_v5；两端通过私网连接。准备上文构建的 Lavik 标准 x86_64 二进制、Redis 8.10.2、Valkey 9.1.2 和 memtier 2.5.1。Redis / Valkey 使用默认优化构建、jemalloc 5.3.0，编译参数为 `make -j12`。以下命令使用 Bash。
+
+#### 启动服务端
+
+```bash
+# Run on the server; replace the address and binary paths for your hosts.
+SERVER_IP=YOUR_SERVER_PRIVATE_IP
+LAVIK_BIN=/path/to/lavik-v0.3.0/lavik
+REDIS_BIN=/opt/bench020/bin/redis-server
+VALKEY_BIN=/opt/bench020/bin/valkey-server
+ulimit -n 65535
+sudo sysctl -w vm.overcommit_memory=1
+printf 'never\n' | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+Lavik 使用空的专用 NVMe namespace。启动前按 [SPDK 存储指南](../../docs/operations/spdk-storage.md) 识别测试盘并绑定 VFIO，本测试设置 `HUGEMEM=2048`、`BYCORF_DPDK_MEMORY_MB=2048`。分别加载 100 万条和 1 亿条；两次之间正常退出 Lavik、恢复 NVMe 驱动，再清空已确认的测试 namespace 并重新绑定，独立加载数据。
+
+```bash
+# Use the verified PCI address and namespace ID of your empty test NVMe.
+NVME_BDF=YOUR_NVME_PCI_ADDRESS
+NVME_NSID=1
+sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
+  env BYCORF_EAL_ARGS="-a ${NVME_BDF}" BYCORF_DPDK_MEMORY_MB=2048 \
+  taskset -c 0-1 "$LAVIK_BIN" \
+  --storage=spdk --bind="$SERVER_IP" \
+  --tomb-raider-interval-ms=0 --spdk-max-completions-per-poll=16 \
+  --log-dir="$PWD/lavik-logs" \
+  --data-file="spdk://${NVME_BDF}/${NVME_NSID}"
+```
+
+以上仅列出非默认参数；`taskset -c 0-1` 选择两个 CPU，Lavik 据此启动两个 worker。EAL 内存预留为 2 GiB，另外关闭周期 tombstone 扫描、将 SPDK completion cap 固定为 16。
+
+Redis 和 Valkey 分别测试 1、2 个 I/O 线程，每次只运行一个服务端：
+
+```bash
+# Initial fill: IO_THREADS=2. Then restart from the saved RDB with IO_THREADS=1 and 2.
+IO_THREADS=2
+IO_ARGS=(); if ((IO_THREADS > 1)); then IO_ARGS=(--io-threads "$IO_THREADS"); fi
+mkdir -p "$PWD/bench-data/redis" "$PWD/bench-data/valkey"
+
+# Redis 8.10.2
+taskset -c 0-1 "$REDIS_BIN" \
+  --bind "$SERVER_IP" --protected-mode no \
+  --dir "$PWD/bench-data/redis" \
+  --save "" \
+  "${IO_ARGS[@]}"
+
+# Valkey 9.1.2 (after stopping Redis)
+taskset -c 0-1 "$VALKEY_BIN" \
+  --bind "$SERVER_IP" --protected-mode no \
+  --dir "$PWD/bench-data/valkey" \
+  --save "" \
+  "${IO_ARGS[@]}"
+```
+
+#### 客户端灌数与测试
+
+按 Lavik 100 万、Lavik 1 亿、Redis IO=1/2、Valkey IO=1/2 的顺序运行。切换配置时修改 `N` 和 `RUN`。每个产品首次灌数前确认 `DBSIZE=0`。Redis / Valkey 首次灌数后执行一次 `SAVE`，再用 `SHUTDOWN NOSAVE` 退出；每组 I/O 线程配置都从同一基线 RDB 重启，跳过再次灌数，重新检查数据后执行预热与扫描。Lavik 两组均从空的测试 namespace 独立灌数。
+
+```bash
+# Bash, on the separate client, CPUs 0–15; memtier_benchmark 2.5.1.
+set -euo pipefail
+SERVER_IP=YOUR_SERVER_PRIVATE_IP
+N=1000000 # Use 100000000 for the large Lavik dataset.
+RUN=lavik-1m # lavik-100m, redis-io1, redis-io2, valkey-io1, valkey-io2
+mkdir -p "$RUN"
+ulimit -n 65535
+COMMON=(--server="$SERVER_IP" \
+  --threads=16 --key-minimum=1 --key-maximum="$N" \
+  --key-prefix= --data-size=1024 --hide-histogram \
+  --print-percentiles=50,99,99.9,99.99 --show-config)
+
+# Fill an empty dataset using disjoint sequential key streams: exactly N writes.
+taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=10 \
+  --requests="$((N / 160))" --ratio=1:0 --key-pattern=P:P \
+  --json-out-file="$RUN/fill.json" > "$RUN/fill.txt" 2>&1
+
+check_data() {
+  test "$(redis-cli -h "$SERVER_IP" --raw DBSIZE)" = "$N"
+  for key in 1 2 "$((N / 2))" "$((N - 1))" "$N"; do
+    test "$(redis-cli -h "$SERVER_IP" --raw STRLEN "$key")" = 1024
+  done
+}
+check_data
+
+# For each memory peer only: create its baseline RDB once after the first fill.
+# redis-cli -h "$SERVER_IP" SAVE
+
+# Warmup, then GET and SET sweeps. Reuse this part after loading a baseline RDB.
+taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=10 \
+  --distinct-client-seed --test-time=10 \
+  --command='GET __key__' --command-is-read \
+  --json-out-file="$RUN/warmup.json" > "$RUN/warmup.txt" 2>&1
+
+for kind in GET SET; do
+  if [ "$kind" = GET ]; then
+    COMMAND='GET __key__'; READ_FLAG=(--command-is-read)
+  else
+    COMMAND='SET __key__ __data__'; READ_FLAG=()
+  fi
+  for connections in 16 32 80 160 320 640 1280; do
+    taskset -c 0-15 memtier_benchmark "${COMMON[@]}" \
+      --clients="$((connections / 16))" --distinct-client-seed --test-time=30 \
+      --command="$COMMAND" "${READ_FLAG[@]}" \
+      --json-out-file="$RUN/${kind}-c${connections}.json" \
+      > "$RUN/${kind}-c${connections}.txt" 2>&1
+  done
+done
+check_data
+```
+
+每组结束后检查 GET 全部命中、连接错误为零，且 DBSIZE 保持不变。
+
+### 16 vCPU / 10M
+
+以下 Bash 命令对应实测参数；请按部署环境调整路径、地址和 PCI 身份。一次只运行一个数据库和一个压测客户端。每轮使用独立结果目录。
+
+#### Lavik SPDK
+
+按 [SPDK 存储指南](../../docs/operations/spdk-storage.md)核验六张专用临时 NVMe、准备 VFIO 和 8 GiB hugepages。10M 组从空盘独立灌入；不得覆盖系统盘或已有业务数据。完成后干净停止 Lavik、恢复内核驱动及 hugepage 预留，再测试内存数据库。以下为 10M 启动命令：
+
+```bash
+sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 env 'BYCORF_EAL_ARGS=-a NVME_1_PCI_ADDRESS -a NVME_2_PCI_ADDRESS -a NVME_3_PCI_ADDRESS -a NVME_4_PCI_ADDRESS -a NVME_5_PCI_ADDRESS -a NVME_6_PCI_ADDRESS' BYCORF_DPDK_MEMORY_MB=8192 taskset \
+  -c 0-15 /path/to/lavik-v0.3.0/lavik \
+  --storage=spdk \
+  --bind=YOUR_SERVER_PRIVATE_IP \
+  --tomb-raider-interval-ms=0 \
+  --spdk-max-completions-per-poll=16 \
+  --log-dir=/opt/bench020/results/large/memory/lavik-10m/logs \
+  --data-file=spdk://NVME_1_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_2_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_3_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_4_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_5_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_6_PCI_ADDRESS/1
+```
+
+启动后等待恢复及后台初始化完成，使用 `CONFIG GET defrag-paused` 核验为 `no`；各正式点前后再次核验。
+
+#### Redis / Valkey
+
+使用 jemalloc 5.3.0，构建命令为 `make -j12`。Redis 8.10.2 对应提交 `498ecd0d6d007db11ddb3aea9428552598a78622`，Valkey 9.1.2 对应 `7f1dffedff6de73058b2c2a389422b6ecd56c8fb`。首次灌入使用 16 I/O 线程。
+
+```bash
+# On the server; start one product/configuration at a time.
+PRODUCT=redis # redis or valkey
+IO_THREADS=16 # tested: 1, 2, 4, 8, 16
+IO_ARGS=(); if ((IO_THREADS > 1)); then IO_ARGS=(--io-threads "$IO_THREADS"); fi
+DATA_DIR=/opt/bench020/results/large/data/$PRODUCT
+mkdir -p "$DATA_DIR"
+ulimit -n 65535
+taskset -c 0-15 "/opt/bench020/bin/$PRODUCT-server" \
+  --bind YOUR_SERVER_PRIVATE_IP --protected-mode no \
+  --dir "$DATA_DIR" --save "" \
+    "${IO_ARGS[@]}"
+```
+
+#### 灌入、预热和连接数扫描
+
+```bash
+# On the client: memtier_benchmark 2.5.1.
+KEYS=10000000
+SECONDS_PER_POINT=30
+SEED=()
+mkdir -p results
+ulimit -n 65535
+COMMON=(--server=YOUR_SERVER_PRIVATE_IP
+  --threads=16 --key-minimum=1 --key-maximum="$KEYS"
+  --key-prefix= --data-size=1024 --hide-histogram
+  --print-percentiles=50,99,99.9,99.99 --show-config)
+
+# Once per fresh dataset; each key is written once across 640 clients.
+taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=40 \
+  --json-out-file=results/fill.json --requests="$((KEYS / 640))" \
+  --ratio=1:0 --key-pattern=P:P
+redis-cli -h YOUR_SERVER_PRIVATE_IP --raw DBSIZE
+redis-cli -h YOUR_SERVER_PRIVATE_IP STRLEN 1
+```
+
+对于 Redis/Valkey，首次灌入后执行下列基线命令；然后以 1、2、4、8、16 I/O 线程依次启动，每档等待 RDB 加载结束、DBSIZE=10000000，核验持久化配置，再执行下一段预热及测量。每档结束使用 `SHUTDOWN NOSAVE`，保持同一 `dump.rdb` 不变；不要重新灌入或在测量中执行 SAVE。Lavik 不执行这些 RDB 基线命令。
+
+```bash
+redis-cli -h YOUR_SERVER_PRIVATE_IP SAVE
+redis-cli -h YOUR_SERVER_PRIVATE_IP SHUTDOWN NOSAVE
+# On the server, record/check the unchanged RDB baseline hash:
+sha256sum "$DATA_DIR/dump.rdb"
+# After each restart, run these checks from the client:
+redis-cli -h YOUR_SERVER_PRIVATE_IP CONFIG GET save
+redis-cli -h YOUR_SERVER_PRIVATE_IP CONFIG GET appendonly
+redis-cli -h YOUR_SERVER_PRIVATE_IP INFO persistence
+```
+
+```bash
+# Run once for Lavik 10M and once per Redis/Valkey I/O-thread configuration.
+if [ "$KEYS" -eq 10000000 ]; then
+  taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=40 \
+    --json-out-file=results/warmup.json --test-time=10 \
+    --command='GET __key__' --command-is-read
+fi
+for OP in GET SET; do
+  COMMAND=(--command='GET __key__' --command-is-read)
+  if [ "$OP" = SET ]; then
+    COMMAND=(--command='SET __key__ __data__' )
+  fi
+  for CONNECTIONS in 160 320 640 1280; do
+    taskset -c 0-15 memtier_benchmark "${COMMON[@]}" \
+      --clients="$((CONNECTIONS / 16))" \
+      --json-out-file="results/$OP-c$CONNECTIONS.json" \
+      --test-time="$SECONDS_PER_POINT" "${COMMAND[@]}" "${SEED[@]}" \
+      > "results/$OP-c$CONNECTIONS.txt" 2>&1
+  done
+done
+redis-cli -h YOUR_SERVER_PRIVATE_IP --raw DBSIZE
+```
+
+### 16 vCPU / 1B
+
+按 [SPDK 操作指南](../../docs/operations/spdk-storage.md) 核验六块专用测试盘、准备 VFIO 与 8 GiB 大页。仅在空的测试介质上装载；启动后等待 PING，检查 defrag-paused 为 no。测量完成后干净停机，并按指南恢复内核驱动和大页预留。
+
+```bash
+sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 env \
+  BYCORF_EAL_ARGS='-a NVME_1_PCI_ADDRESS -a NVME_2_PCI_ADDRESS -a NVME_3_PCI_ADDRESS -a NVME_4_PCI_ADDRESS -a NVME_5_PCI_ADDRESS -a NVME_6_PCI_ADDRESS' \
+  BYCORF_DPDK_MEMORY_MB=8192 \
+  taskset -c 0-15 /path/to/lavik-v0.3.0/lavik \
+  --storage=spdk --bind=YOUR_SERVER_PRIVATE_IP --shutdown-checkpoint \
+  --tomb-raider-interval-ms=0 --spdk-max-completions-per-poll=16 \
+  --log-dir=/opt/bench020/results/large/storage/lavik-1b/logs \
+  --data-file=spdk://NVME_1_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_2_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_3_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_4_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_5_PCI_ADDRESS/1 \
+  --data-file=spdk://NVME_6_PCI_ADDRESS/1
+```
+
+在独立客户端运行：
+
+```bash
+SERVER=YOUR_SERVER_PRIVATE_IP
+mkdir -p results
+ulimit -n 65535
+COMMON=(--server="$SERVER" --threads=32 --key-minimum=1
+  --key-maximum=1000000000 --key-prefix= --data-size=1024
+  --hide-histogram --print-percentiles=50,99,99.9,99.99 --show-config)
+# 32 threads × 20 connections × 1,562,500 requests = 1,000,000,000 SETs.
+taskset -c 0-31 memtier_benchmark "${COMMON[@]}" --clients=20 \
+  --requests=1562500 --ratio=1:0 --key-pattern=P:P --json-out-file=results/fill.json
+redis-cli -h "$SERVER" --raw DBSIZE
+for key in 1 2 500000000 999999999 1000000000; do
+  test "$(redis-cli -h "$SERVER" --raw STRLEN "$key")" = 1024
+done
+# No additional GET warmup for Lavik 1B.
+for op in GET SET; do
+  COMMAND=(--command='GET __key__' --command-is-read)
+  if [[ "$op" == SET ]]; then COMMAND=(--command='SET __key__ __data__'); fi
+  for connections in 160 320 640 1280; do
+    redis-cli -h "$SERVER" CONFIG GET defrag-paused
+    taskset -c 0-31 memtier_benchmark "${COMMON[@]}" \
+      --clients="$((connections / 32))" --test-time=60 --distinct-client-seed \
+      "${COMMAND[@]}" --json-out-file="results/$op-c$connections.json" \
+      > "results/$op-c$connections.txt" 2>&1
+    redis-cli -h "$SERVER" CONFIG GET defrag-paused
+  done
+done
+redis-cli -h "$SERVER" --raw DBSIZE
+```
