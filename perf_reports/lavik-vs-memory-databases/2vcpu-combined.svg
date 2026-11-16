@@ -1013,54 +1013,52 @@ L 776.16 402.48
   </g>
   <g id="legend_1">
    <g id="line2d_85">
-    <path d="M 800.28 176.912969
-L 810.28 176.912969
-L 820.28 176.912969
+    <path d="M 800.28 190.916875
+L 810.28 190.916875
+L 820.28 190.916875
 " style="fill: none; stroke: #1768ac; stroke-width: 2; stroke-linecap: square"/>
     <g>
-     <use xlink:href="#ma45f73935a" x="810.28" y="176.912969" style="fill: #1768ac; stroke: #1768ac"/>
+     <use xlink:href="#ma45f73935a" x="810.28" y="190.916875" style="fill: #1768ac; stroke: #1768ac"/>
     </g>
    </g>
    <g id="text_59">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="828.28" y="180.412969" transform="rotate(-0 828.28 180.412969)">Lavik v0.3.0 / 1M</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="828.28" y="194.416875" transform="rotate(-0 828.28 194.416875)">Lavik v0.3.0 / 1M</text>
    </g>
    <g id="line2d_86">
-    <path d="M 800.28 201.91375
-L 810.28 201.91375
-L 820.28 201.91375
+    <path d="M 800.28 215.917656
+L 810.28 215.917656
+L 820.28 215.917656
 " style="fill: none; stroke: #ad6800; stroke-width: 2; stroke-linecap: square"/>
     <g>
-     <use xlink:href="#m5702a1f966" x="810.28" y="201.91375" style="fill: #ad6800; stroke: #ad6800; stroke-linejoin: miter"/>
+     <use xlink:href="#m5702a1f966" x="810.28" y="215.917656" style="fill: #ad6800; stroke: #ad6800; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_60">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="828.28" y="205.41375" transform="rotate(-0 828.28 205.41375)">Lavik v0.3.0 / 100M</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="828.28" y="219.417656" transform="rotate(-0 828.28 219.417656)">Lavik v0.3.0 / 100M</text>
    </g>
    <g id="line2d_87">
-    <path d="M 800.28 235.117656
-L 810.28 235.117656
-L 820.28 235.117656
+    <path d="M 800.28 240.918438
+L 810.28 240.918438
+L 820.28 240.918438
 " style="fill: none; stroke: #b64157; stroke-width: 2; stroke-linecap: square"/>
     <g>
-     <use xlink:href="#m809abb1783" x="810.28" y="235.117656" style="fill: #b64157; stroke: #b64157; stroke-linejoin: miter"/>
+     <use xlink:href="#m809abb1783" x="810.28" y="240.918438" style="fill: #b64157; stroke: #b64157; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_61">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'" transform="translate(828.28 231.415508)">Redis 8.10.2 / 1M</text>
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'" transform="translate(828.28 243.417461)">I/O: GET 2 · SET 2</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="828.28" y="244.418438" transform="rotate(-0 828.28 244.418438)">Redis 8.10.2 / 1M</text>
    </g>
    <g id="line2d_88">
-    <path d="M 800.28 274.122344
-L 810.28 274.122344
-L 820.28 274.122344
+    <path d="M 800.28 265.919219
+L 810.28 265.919219
+L 820.28 265.919219
 " style="fill: none; stroke: #008579; stroke-width: 2; stroke-linecap: square"/>
     <g>
-     <use xlink:href="#m23f07ffca9" x="810.28" y="274.122344" style="fill: #008579; stroke: #008579; stroke-linejoin: miter"/>
+     <use xlink:href="#m23f07ffca9" x="810.28" y="265.919219" style="fill: #008579; stroke: #008579; stroke-linejoin: miter"/>
     </g>
    </g>
    <g id="text_62">
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'" transform="translate(828.28 270.420195)">Valkey 9.1.2 / 1M</text>
-    <text style="font-size: 10px; font-family: 'DejaVu Sans'" transform="translate(828.28 282.422148)">I/O: GET 2 · SET 2</text>
+    <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: start" x="828.28" y="269.419219" transform="rotate(-0 828.28 269.419219)">Valkey 9.1.2 / 1M</text>
    </g>
   </g>
  </g>
