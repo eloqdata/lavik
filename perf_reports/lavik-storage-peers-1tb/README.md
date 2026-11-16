@@ -1,14 +1,14 @@
-# Lavik v0.2.0：1TB 数据与 Redis 兼容存储系统对比
+# Lavik v0.2.0: 1TB versus storage-backed Redis-compatible systems
 
-[English](README.md) | **简体中文**
+**English** | [简体中文](README.zh-CN.md)
 
-在新建 Azure Standard_L16aos_v4 上重新测量 Lavik、Dragonfly、Garnet、Kvrocks、Pika、Tendis。每种产品独立装载 **10 亿条 key × 1 KiB value（953.67 GiB 逻辑 value 净载荷）**，完成 **48 个正式测量点**。Lavik 的八个点与同批[内存数据库对比报告](../lavik-v0.2.0-vs-memory-databases-2026-10-21/README.zh-CN.md)共用，其余五种数据库重新独立装载、测量。
+Lavik, Dragonfly, Garnet, Kvrocks, Pika and Tendis were freshly measured on a new Azure Standard_L16aos_v4. Each independently loads **1B keys × 1 KiB values (953.67 GiB logical value payload)**. All **48 formal points** are complete. The eight Lavik points were measured with v0.2.0; the five peers each have a separate fresh load and measurement.
 
 UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-22T01:26:24.735000+00:00.
 
-本轮 Lavik 的 GET、SET 扫描峰值均最高，但 160 连接时 Garnet 的 GET 吞吐更高（419,982 对 375,966 ops/s）。在全部相同连接数的 GET/SET 点上，Lavik 的 p99.9 均最低；160 连接 GET 为 0.823 ms，Garnet 为 2.687 ms。上述结论仅描述本轮单次测量及所列配置。
+In this run, Lavik has the highest GET and SET sweep peaks, but Garnet leads GET throughput at 160 connections (419,982 versus 375,966 ops/s). Lavik has the lowest p99.9 at every matched GET/SET connection count; at 160 connections, GET p99.9 is 0.823 ms versus Garnet’s 2.687 ms. These observations apply to this single measured run and the stated configurations.
 
-## 吞吐与 p99.9 延迟
+## Throughput and p99.9 latency
 
 <img src="combined.svg" alt="GET and SET throughput and p99.9 latency" width="800">
 
@@ -27,7 +27,7 @@ UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-22T01:26:24.735000+00:00.
 | SET | Pika 3.5.7 | 320 | 94,438 | 8.831 |
 | SET | Tendis 2.8.4 | 160 | 204,258 | 6.783 |
 
-峰值可能来自不同连接数；以下为相同连接数的 **ops/s / p99.9 ms**。
+Peaks may occur at different connection counts. The matched-concurrency table shows **ops/s / p99.9 ms**.
 
 | Command | Connections | Lavik v0.2.0 | Dragonfly 2.0.2 | Garnet 2.2.1 | Kvrocks 2.17.0 | Pika 3.5.7 | Tendis 2.8.4 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -40,7 +40,7 @@ UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-22T01:26:24.735000+00:00.
 | SET | 640 | 861,911 / 1.727 | 550,147 / 30.335 | 832,135 / 7.263 | 111,034 / 29.055 | 89,450 / 65.023 | 138,691 / 12.351 |
 | SET | 1280 | 910,356 / 4.319 | 549,937 / 60.671 | 822,427 / 7.071 | 109,065 / 36.095 | 86,950 / 64.511 | 132,374 / 28.287 |
 
-## 客户端与内存诊断
+## Client and memory diagnostics
 
 | Product | Max average client CPU / cores | Max thread average / cores | Post-point RSS / MiB | Max server steal / % |
 | --- | --- | --- | --- | --- |
@@ -51,9 +51,9 @@ UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-22T01:26:24.735000+00:00.
 | Pika 3.5.7 | 6.455 | 0.349 | 34,770–58,832 | 0.0000 |
 | Tendis 2.8.4 | 4.456 | 0.164 | 45,683–79,879 | 0.0000 |
 
-客户端预算为 32 个 CPU；RSS 为正式点之后的进程快照范围，Lavik 另有 8 GiB 大页预留。
+The client budget is 32 CPUs. RSS ranges use post-point process snapshots; Lavik additionally reserves 8 GiB hugepages.
 
-## 环境、配置与方法
+## Environment, configuration and method
 
 | Item | Configuration |
 | --- | --- |
@@ -65,15 +65,15 @@ UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-22T01:26:24.735000+00:00.
 | Workload | Decimal keys 1..1,000,000,000; 1,024-byte values; random GET or overwriting SET; independent client seeds |
 | Window | 60 seconds per point; 32 client threads; 160 / 320 / 640 / 1280 connections |
 
-各产品在同一服务器串行运行，分别独立装载数据。先 GET、后 SET，每组按连接数递增测量。Dragonfly 和 Garnet 额外用 32 个客户端线程、160 连接预热 GET 180 秒；其他产品沿用原方法，不额外预热。所有构建在测量前完成。正式点均零连接错误，正式 GET 均零未命中；每次装载完成精确 10 亿次 SET，扫描前后抽样检查 value 长度。
+Products run sequentially, one independently loaded dataset each. GET precedes SET; concurrency increases within each sweep. Dragonfly and Garnet receive an additional 180-second GET warmup at 160 connections using 32 threads; other products follow the original method without that warmup. Builds finish before measurement. Every formal point has zero connection errors and every formal GET has zero misses. Each fill completes exactly one billion SET requests; value lengths are sampled before and after the sweep.
 
-Lavik defrag 全程启用；Garnet 使用 Lookup compaction，RocksDB 自动压缩保持启用。配置内存预算不同：Dragonfly 96 GiB；Garnet 64 GiB log、32 GiB read cache、16 GiB index；Kvrocks 80 GiB block cache；Pika 24 GiB block cache 与 32 GiB 应用缓存；Tendis 72 GiB 共享缓存。这些是预算，不是实测总 RSS。
+Lavik defrag stays enabled. Garnet uses Lookup compaction; RocksDB automatic compaction remains enabled. Configured memory budgets differ: Dragonfly 96 GiB; Garnet 64 GiB log, 32 GiB read cache and 16 GiB index; Kvrocks 80 GiB block cache; Pika 24 GiB block cache and 32 GiB application cache; Tendis 72 GiB shared cache. These are budgets, not measured total RSS.
 
-持久化路径不同：Lavik 使用 SPDK 存储；Dragonfly 使用分层文件，不做周期快照；Garnet 使用 storage log，不启用 AOF；Kvrocks、Tendis 关闭 WAL，Pika 关闭 binlog。成功响应不代表相同同步持久性。每点只测一次，不给置信区间。历史 1B 测试使用 16 个客户端线程并包含 80 连接；本次使用 32 线程、四档连接数，Dragonfly/Garnet 额外预热也改为 32 线程、160 连接；本次在 Japan East、旧测试在 Japan West。
+Persistence differs: Lavik uses SPDK storage; Dragonfly has a tiered file without periodic snapshots; Garnet has a storage log without AOF; Kvrocks and Tendis disable WAL, and Pika disables binlog. Successful responses do not imply equal synchronous durability guarantees. One measured run per point; no confidence intervals. The historical 1B test used 16 client threads and included 80 connections; this run uses 32 threads and four connection counts, with the additional Dragonfly/Garnet warmup also changed to 32 threads and 160 connections. The new hosts use Japan East, while the historical run used Japan West.
 
-对比产品版本与 0.1.0 报告一致：Dragonfly 2.0.2、Garnet 2.2.1（.NET 10.0.12）、Kvrocks 2.17.0、Pika 3.5.7、Tendis 2.8.4-rocksdb-v8.5.3。Pika 官方包内嵌版本显示 3.5.6，revision 为 `62a57f85534198e0d1033c32f1215c958bef8a5e`。
+Peer releases are unchanged from the v0.1.0 report: Dragonfly 2.0.2, Garnet 2.2.1 with .NET 10.0.12, Kvrocks 2.17.0, Pika 3.5.7 and Tendis 2.8.4-rocksdb-v8.5.3. The official Pika archive reports embedded version 3.5.6, revision `62a57f85534198e0d1033c32f1215c958bef8a5e`.
 
-## 装载记录
+## Load receipts
 
 | Product | Client invocation wall time / min | Reported fill ops/s |
 | --- | --- | --- |
@@ -84,15 +84,15 @@ Lavik defrag 全程启用；Garnet 使用 Lookup compaction，RocksDB 自动压�
 | Pika 3.5.7 | 208.5 | 82,423 |
 | Tendis 2.8.4 | 82.6 | 209,462 |
 
-[All points](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/metadata/results.csv) · [Provenance](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/metadata/provenance.json) · [Validation](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/metadata/validation.json) · [原始日志与测量凭据](https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21)
+[All points](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/metadata/results.csv) · [Provenance](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/metadata/provenance.json) · [Validation](https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/metadata/validation.json) · [Raw logs and receipts](https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21)
 
-装载墙钟耗时包含连接建立、客户端统计汇总及结果回传。
+Load wall time includes connection setup, client-side statistics aggregation and result transfer.
 
-## 运行命令
+## Run commands
 
-以下使用 Bash，按实际环境替换地址和安装路径。安装上述发布包及 memtier 2.5.1。每次只运行一个数据库，启动命令保持前台运行，干净停止后再启动下一个。文件系统步骤只使用经过核验的六块空临时盘。Lavik 独立灌入前，按 [SPDK 存储指南](../../docs/operations/spdk-storage.md)准备专用设备和 8 GiB hugepages。
+Use Bash and adjust addresses and installation paths. Install the release packages above and memtier 2.5.1. Run one server at a time; each startup command below stays in the foreground. Stop it cleanly before starting the next product. The filesystem setup uses only six verified empty scratch devices. For Lavik, use the [SPDK storage guide](../../docs/operations/spdk-storage.md) to prepare its dedicated devices and 8 GiB hugepages before its independent load.
 
-配置块仅包含相对测试版本配置模板的覆盖项。分别保存为注释指定的 `.overrides` 文件，再执行覆盖脚本；各系统使用同一套客户端负载。
+The configuration blocks contain overrides to the tested release templates. Save each block as the named `.overrides` file, then apply it with the supplied overlay script. The client workload is the same for all products.
 
 ### Storage and paths
 
