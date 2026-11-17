@@ -40,11 +40,12 @@ network/storage I/O, timers and wakeups. Its `NetBackend` and `StorageBackend`
 adapters borrow that ring and independently encapsulate network and storage
 backend selection; the DPDK adapter also borrows it. The worker initializes the
 ring before the adapters and stops both adapters before shutting down the ring.
-Bycorf also provides an independently optional RDMA registration facade via
-`BYCORF_ENABLE_RDMA`. It shares the worker ring for channel readiness and lazily
-acquires worker/context-scoped PDs. Registration handles retain MR/PD/context,
-while applications own backing memory and remote quiescence; Lavik does not
-currently select an RDMA serving transport. See Bycorf's
+Bycorf also provides independently optional RC connections and RDMA registration
+via `BYCORF_ENABLE_RDMA`. CM, CQ and device-async notifications share the worker
+ring, with worker-owned device contexts and fixed shared-CQ capacity. Closing
+retains event/poll state through terminal completion or ring quiescence.
+Registration handles retain MR/PD/context, while applications own backing memory
+and remote quiescence; Lavik does not currently select an RDMA serving transport. See Bycorf's
 [RDMA ownership](../../bycorf/docs/architecture/rdma.md).
 The optional DPDK network backend serves
 plaintext IPv4 TCP through Bycorf's private FreeBSD stack while preserving the
