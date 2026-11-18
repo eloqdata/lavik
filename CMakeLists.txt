@@ -1793,6 +1793,7 @@ if (BUILD_TESTING)
     tests/storage_write_buffer_test.cpp
     tests/redis_export_buffer_test.cpp
     tests/client_retirement_test.cpp
+    tests/compact_hash_reply_test.cpp
     tests/cluster_authority_test.cpp
     tests/cluster_command_test.cpp
     tests/cluster_topology_test.cpp

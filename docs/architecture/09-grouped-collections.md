@@ -548,7 +548,11 @@ entries into an admitted immutable snapshot of packed bytes and offsets,
 without an intermediate logical collection or a string allocation per entry.
 The result owns the snapshot across worker hops; reply construction borrows
 its selected field/value views only while that ownership remains alive.
-Compact full reads use the same result contract. Point reads and internal
+Connection-worker compact Hash full replies can instead encode synchronously
+while holding the physical read lease. Bounded projections borrow entry views
+directly into reply construction; larger projections retain the admitted packed
+snapshot. No borrowed payload survives reply encoding. Owner-side compact full
+reads use the owned result contract. Point reads and internal
 consumers retain their optional owned-value contract unless they explicitly
 request a snapshot.
 The parent joins every launched read before returning, including on error,

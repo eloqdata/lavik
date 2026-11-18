@@ -13937,8 +13937,15 @@ Task<CommandReply> ExecuteCommandBody(
                 compact = (**fast).view();
               else if (!absl::IsNotFound(fast->status()))
                 compact = fast->status();
-              reply = co_await ExecuteStorageCommand(request, reply_builder,
-                                                     false, &compact);
+              // The admitted read already owns the immutable payload. Full
+              // Hash projections can finish synchronously here instead of
+              // allocating storage-dispatch and Hash-command task frames.
+              if (auto projected = TryExecuteCompactHashRead(
+                      request.kind_, compact, reply_builder))
+                reply = std::move(*projected);
+              else
+                reply = co_await ExecuteStorageCommand(request, reply_builder,
+                                                       false, &compact);
             }
             co_return reply;
           }
