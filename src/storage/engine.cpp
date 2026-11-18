@@ -657,6 +657,13 @@ StorageEngine::RemoteReadAwaitable StorageEngine::TryRemoteRead(
                              trace);
 }
 
+StorageEngine::RemoteReadAwaitable StorageEngine::TryCompactRead(
+    std::uint8_t db_id, std::string_view key, std::uint16_t slot,
+    ValueType type, bool metadata_only, ReadLatencyTrace* trace) {
+  return RemoteReadAwaitable(*impl_, db_id, key, slot, type, metadata_only,
+                             trace, /*allow_local=*/true);
+}
+
 Task<absl::StatusOr<DiskValue>> StorageEngine::Get(
     std::uint8_t db_id, std::string_view key, ReadLatencyTrace* trace,
     std::optional<std::uint16_t> routed_partition_id) {

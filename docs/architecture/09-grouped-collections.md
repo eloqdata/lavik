@@ -551,10 +551,11 @@ its selected field/value views only while that ownership remains alive.
 Connection-worker compact Hash full replies can instead encode synchronously
 while holding the physical read lease. Bounded projections borrow entry views
 directly into reply construction; larger projections retain the admitted packed
-snapshot. No borrowed payload survives reply encoding. Owner-side compact full
-reads use the owned result contract. Point reads and internal
-consumers retain their optional owned-value contract unless they explicitly
-request a snapshot.
+snapshot. This direct path also admits standalone full Hash reads whose key is
+owned by the connection worker. No borrowed payload survives reply encoding.
+Fallback owner-side compact full reads use the owned result contract. Point
+reads and internal consumers retain their optional owned-value contract unless
+they explicitly request a snapshot.
 The parent joins every launched read before returning, including on error,
 and rechecks the population and view status after each join. Optional window
 admission covers scheduling metadata and task scratch; insufficient headroom
