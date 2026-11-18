@@ -881,6 +881,7 @@ the reusable containers have independent tests under `tests/containers/`.
 
 | Responsibility | Source |
 |---|---|
+| Compact Hash reply dispatch, borrowed views and physical lease lifetime | `src/redis/command.cpp`, `src/redis/hash_command.cpp`, `src/storage/engine/read.cpp`, `tests/compact_hash_reply_test.cpp` |
 | Prefix snapshots, mutation planning and persistent routing | `include/lavik/storage/detail/grouped/hash.h`, `src/storage/engine/grouped/hash.cpp` |
 | Owner-local group arbitration, ordered lock sets and waiter lifetime | `include/lavik/storage/detail/grouped/lock.h`, `src/storage/engine/grouped/lock.cpp`, `tests/grouped/lock_test.cpp` |
 | Logical collection encodings, shared indexed v2 bodies and per-element validation | `include/lavik/storage/detail/hash_codec.h`, `ordered_compact_codec.h`, `ordered_index.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |

@@ -1423,6 +1423,7 @@ current source code are authoritative for present storage behavior.
 
 | Claim | Repository source |
 |---|---|
+| Compact Hash reply dispatch, borrowed views and physical lease lifetime | `src/redis/command.cpp`, `src/redis/hash_command.cpp`, `src/storage/engine/read.cpp`, `tests/compact_hash_reply_test.cpp` |
 | Public lifecycle, routing, typed operations, locked transaction contract, snapshots, epochs, maintenance, and durability interfaces | `include/lavik/storage/engine.h` |
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
 | Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/lavik/storage/scan_hash_map.h`, `include/lavik/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/init.cpp`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
