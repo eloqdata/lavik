@@ -29,6 +29,8 @@ in-memory services.
 
 </div>
 
+Other languages: [简体中文](README.zh-CN.md)
+
 Lavik is a Linux C++23 key-value server that speaks RESP2 and RESP3. It keeps
 a compact key index in DRAM and stores data on files, raw block devices, or
 SPDK NVMe namespaces, so capacity scales with storage. Networking uses kernel
@@ -241,6 +243,7 @@ git -C bycorf submodule update --init third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
 CC=gcc-13 CXX=g++-13 ./scripts/configure_release.sh -DLAVIK_KERNEL_BYPASS=ON
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
+sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```
 
 `LAVIK_KERNEL_BYPASS` is a configure-time option. Pass it to the configure
