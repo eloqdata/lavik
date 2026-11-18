@@ -29,6 +29,8 @@ in-memory services.
 
 </div>
 
+Other languages: [简体中文](README.zh-CN.md)
+
 Lavik is a Linux C++23 key-value server that speaks RESP2 and RESP3. It keeps
 a compact key index in DRAM and stores data on files, raw block devices, or
 SPDK NVMe namespaces, so capacity scales with storage. Networking uses kernel
