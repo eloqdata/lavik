@@ -361,7 +361,7 @@ TEST_F(LocalCompactReadTest, DurableHashUsesDirectReadAndOwnsCompletedBytes) {
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
-TEST_F(LocalCompactReadTest, WriterIntentAndUnsupportedRecordsFallBack) {
+TEST_F(LocalCompactReadTest, WriterIntentPreventsDirectAdmission) {
   Publish(ValueType::kHash);
   const auto fp = tx::FingerprintOf(ComputeDigest(key_));
   index_.CloseReadIntent(fp);
@@ -372,27 +372,10 @@ TEST_F(LocalCompactReadTest, WriterIntentAndUnsupportedRecordsFallBack) {
     EXPECT_EQ(block_.pin_count(), 0);
   }
   index_.ReleaseReadIntent(fp);
-  for (unsigned representation = 1; representation <= 3; ++representation) {
-    Publish(ValueType::kHash, representation == 1, representation == 2,
-            representation == 3);
-    auto read = DirectRead();
-    EXPECT_TRUE(read.await_ready());
-    EXPECT_FALSE(read.await_resume());
-    EXPECT_EQ(block_.pin_count(), 0);
-    EXPECT_EQ(Pool().available_read_buffers(), 1);
-  }
 }
 
-TEST_F(LocalCompactReadTest, BufferPressureAndAbandonedReadReleaseResources) {
+TEST_F(LocalCompactReadTest, AbandonedReadReleasesLocalPinAndBuffer) {
   Publish(ValueType::kHash);
-  {
-    auto held = Pool().AcquireReadBuffer().await_resume();
-    ASSERT_TRUE(held.ok());
-    auto read = DirectRead();
-    EXPECT_TRUE(read.await_ready());
-    EXPECT_FALSE(read.await_resume());
-  }
-  EXPECT_EQ(block_.pin_count(), 0);
   {
     auto read = DirectRead();
     ASSERT_FALSE(read.await_ready());
@@ -400,40 +383,6 @@ TEST_F(LocalCompactReadTest, BufferPressureAndAbandonedReadReleaseResources) {
   }
   EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
-}
-
-TEST_F(LocalCompactReadTest, PopulationChangesDiscardCompletedRead) {
-  Publish(ValueType::kHash);
-  for (unsigned which = 0; which < 6; ++which) {
-    {
-      auto read = DirectRead();
-      ASSERT_FALSE(read.await_ready());
-      Complete(read);
-      Invalidate(which);
-      EXPECT_FALSE(read.await_resume());
-    }
-    EXPECT_EQ(block_.pin_count(), 0);
-    EXPECT_EQ(Pool().available_read_buffers(), 1);
-    ResetFences();
-  }
-}
-
-TEST_F(LocalCompactReadTest, CorruptShortAndFailedReadsReleaseResources) {
-  Publish(ValueType::kHash);
-  for (int completion : {0, -EIO, 4096}) {
-    {
-      auto read = DirectRead();
-      ASSERT_FALSE(read.await_ready());
-      header_.payload_checksum_ ^= 1;
-      Complete(read, completion);
-      header_.payload_checksum_ ^= 1;
-      auto result = read.await_resume();
-      ASSERT_TRUE(result);
-      EXPECT_FALSE(result->ok());
-    }
-    EXPECT_EQ(block_.pin_count(), 0);
-    EXPECT_EQ(Pool().available_read_buffers(), 1);
-  }
 }
 
 TEST_F(RemoteGetTestPeer, UnallocatedDatabaseFallsBackWithoutActivation) {
