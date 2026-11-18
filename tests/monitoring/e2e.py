@@ -403,10 +403,9 @@ def main():
             len(fixture.matching("LavikServerNotReady", receiver="critical")) == count
         )
         fixture.set(available=False)
-        wait_for(
-            "target down critical route",
-            lambda: fixture.matching("LavikTargetDown", receiver="critical"),
-        )
+        # Inhibition exists only while the old alert's keep_firing_for lasts.
+        # Observe it before waiting for the grouped webhook, which can arrive
+        # after that alert has expired. Notification delivery is checked below.
         wait_for(
             "target down inhibits previously firing readiness",
             lambda: [
@@ -414,6 +413,10 @@ def main():
                 for a in active("LavikServerNotReady", "critical")
                 if a["status"]["inhibitedBy"]
             ],
+        )
+        wait_for(
+            "target down critical route",
+            lambda: fixture.matching("LavikTargetDown", receiver="critical"),
         )
         fixture.set("lavik_server_ready 1\n")
         wait_for(
@@ -575,12 +578,8 @@ def main():
             ),
         )
         meta_fixture.set(available=False)
-        wait_for(
-            "Meta target down critical",
-            lambda: fixture.matching(
-                "LavikTargetDown", receiver="critical", instance=meta_address
-            ),
-        )
+        # As with Data readiness, check the transient inhibition before waiting
+        # for a webhook; the redundancy warning expires while Meta stays down.
         wait_for(
             "Meta target down inhibits redundancy warning",
             lambda: [
@@ -588,6 +587,12 @@ def main():
                 for a in active("LavikMetaVoterUnavailable", "warning", meta_address)
                 if a["status"]["inhibitedBy"]
             ],
+        )
+        wait_for(
+            "Meta target down critical",
+            lambda: fixture.matching(
+                "LavikTargetDown", receiver="critical", instance=meta_address
+            ),
         )
         meta_fixture.set(meta_healthy)
         wait_for(
