@@ -243,6 +243,7 @@ git -C bycorf submodule update --init third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
 CC=gcc-13 CXX=g++-13 ./scripts/configure_release.sh -DLAVIK_KERNEL_BYPASS=ON
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
+sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```
 
 `LAVIK_KERNEL_BYPASS` is a configure-time option. Pass it to the configure
