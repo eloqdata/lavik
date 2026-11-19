@@ -303,7 +303,8 @@ int main(int argc, char** argv) {
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   app.add_option("--flush-size-kb", flush_size_kb,
-                 "Dirty bytes that trigger a flush in KiB (does not delay "
+                 "Dirty-byte flush trigger and defrag record-read chunk size "
+                 "in KiB (does not delay "
                  "timer or durability flushes)")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);

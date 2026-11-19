@@ -87,8 +87,15 @@ The server and generated plan both default to `--flush-max-ms=100`. This bounds
 the age of a partially filled write block before periodic flushing requests
 submission; size-triggered writes can flush sooner. `--flush-size-kb` sets the
 dirty-byte trigger threshold, which defaults to 128 KiB. It does not limit an
-individual I/O: a flush uses the data already accumulated in its snapshot,
+individual write I/O: a flush uses the data already accumulated in its snapshot,
 submitting up to 1 MiB at a time without waiting to fill that amount. Explicit
 durability requests and the periodic timer can flush smaller tails. Data
 accumulated during an in-flight flush is queued again as soon as that flush
 finishes if the new tail has reached the threshold.
+
+The same `--flush-size-kb` setting bounds each record-block read during defrag
+and transaction cleaning. These maintenance reads await one aligned chunk at a
+time so foreground I/O can interleave; the complete block is assembled before
+record validation and relocation. Smaller values reduce read bursts but can
+slow reclamation. Check both latency and available-space trends during sustained
+writes when tuning this setting.

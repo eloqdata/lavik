@@ -909,14 +909,31 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     FixedBuffer block_data,
     std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed_txids,
     bool stop_on_shutdown) {
-  auto read = co_await ReadStorageBuffer(
-      *store.worker_, store.files_[source_file_id], block_data,
-      store.buffers_.workspace_registered(block_data), source_block_offset);
-  if (!read.ok() || *read != kStorageBlockBytes) {
-    source.defragging_ = false;
-    co_return read.ok() ? absl::Status(absl::StatusCode::kInternal,
-                                       "short block read during defrag")
-                        : read.status();
+  // Bound maintenance I/O in flight on the foreground device queue. An 8 MiB
+  // request can fan out into many NVMe commands before a later client read is
+  // submitted. Await each aligned chunk so foreground reads can interleave,
+  // while retaining the same immutable full-block image for record validation
+  // and relocation. Registration belongs to the original workspace; each
+  // subrange retains its registered index and stays within that workspace.
+  // Startup validates the shared flush setting against direct-I/O alignment.
+  const std::size_t read_chunk_bytes = options_.flush_size_bytes_;
+  const bool registered = store.buffers_.workspace_registered(block_data);
+  for (std::size_t offset = 0; offset < kStorageBlockBytes;
+       offset += read_chunk_bytes) {
+    FixedBuffer chunk{
+        .data_ = block_data.data_ + offset,
+        .size_ = std::min(read_chunk_bytes, kStorageBlockBytes - offset),
+        .index_ = block_data.index_,
+    };
+    auto read = co_await ReadStorageBuffer(
+        *store.worker_, store.files_[source_file_id], chunk, registered,
+        source_block_offset + offset);
+    if (!read.ok() || *read != chunk.size_) {
+      source.defragging_ = false;
+      co_return read.ok() ? absl::Status(absl::StatusCode::kInternal,
+                                         "short block read during defrag")
+                          : read.status();
+    }
   }
 
   // Every fence this pass produces is deposited into the store's per-block

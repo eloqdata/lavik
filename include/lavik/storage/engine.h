@@ -85,6 +85,8 @@ struct StorageEngineOptions {
   // Dirty bytes that request a flush without waiting for the age timer. A
   // ready snapshot submits its available bytes, up to the independent I/O cap;
   // timer, durability and shutdown flushes also submit smaller dirty prefixes.
+  // Also bounds each awaited record-block read during defrag and transaction
+  // cleaning. Startup validates power-of-two direct-I/O alignment.
   std::size_t flush_size_bytes_ = 128 * 1024;
   // Bounded, per-worker staging memory for commands waiting to enter the
   // shared in-memory replication backlog.

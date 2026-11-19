@@ -80,7 +80,7 @@ class Client:
 
 
 @contextlib.contextmanager
-def server(workers, *, paused=False):
+def server(workers, *, paused=False, flush_size_kb=None):
     p, m = free_ports()
     args = [
         BINARY,
@@ -99,6 +99,8 @@ def server(workers, *, paused=False):
         "--flush-max-ms=10",
         "--log-dir=" + str(WORKDIR / ("logs-" + str(workers))),
     ]
+    if flush_size_kb is not None:
+        args.append("--flush-size-kb=" + str(flush_size_kb))
     if paused:
         args.append("--defrag-paused")
     with (WORKDIR / "server.log").open("a") as log:
@@ -146,7 +148,7 @@ def chunks(items, size=64):
         yield items[i : i + size]
 
 
-def check_borrowed_payloads():
+def check_borrowed_payloads(flush_size_kb):
     WORKDIR.mkdir(exist_ok=False)
     with (WORKDIR / "data").open("wb") as file:
         file.truncate(256 * 1024 * 1024)
@@ -158,7 +160,13 @@ def check_borrowed_payloads():
     new = bytes(reversed(range(256))) * 8
     giant_key = b"giant-key-" + b"q" * 5000
     giant = bytes(range(256)) * (9 * 1024 * 1024 // 256)
-    with server(2) as (client, _):
+    # A live inline record spans multiple maintenance read chunks. Its CRC and
+    # bytes must survive assembling the scan image, cross-owner relocation,
+    # and cold recovery; the giant value separately covers external extents.
+    wide_key = b"wide-inline-value"
+    wide_value = (bytes(range(256)) * 1025) + b"chunk-boundary-tail"
+    with server(2, flush_size_kb=flush_size_kb) as (client, _):
+        assert client.batch([[b"SET", wide_key, wide_value]]) == [b"OK"]
         assert client.batch([[b"SET", giant_key, giant]]) == [b"OK"]
         assert client.batch([[b"SET", b"empty-value", b""]]) == [b"OK"]
         for group in chunks(keys):
@@ -167,7 +175,7 @@ def check_borrowed_payloads():
             )
     # Recovery remaps keys and physical blocks independently across three
     # owners. Defrag must keep borrowed views alive across remote submissions.
-    with server(3) as (client, metrics):
+    with server(3, flush_size_kb=flush_size_kb) as (client, metrics):
         changed = [key for i, key in enumerate(keys) if i % 5 != 0]
         for _ in range(2):
             for group in chunks(changed):
@@ -195,7 +203,8 @@ def check_borrowed_payloads():
         assert completed >= 2, "test did not complete actual relocation"
         (WORKDIR / "metrics.txt").write_text(text)
         print("completed defrag attempts:", completed, flush=True)
-    with server(2) as (client, _):
+    with server(2, flush_size_kb=flush_size_kb) as (client, _):
+        assert client.batch([[b"GET", wide_key]]) == [wide_value]
         assert client.batch([[b"GET", giant_key]]) == [giant]
         assert client.batch([[b"GET", b"empty-value"]]) == [b""]
         for offset in range(0, len(keys), 64):
@@ -302,8 +311,11 @@ def main():
         prefix="lavik-defrag-payload-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
     ) as directory:
         root = Path(directory)
-        WORKDIR = root / "borrowed"
-        check_borrowed_payloads()
+        # Non-default read chunks exercise partial-record boundaries on both
+        # sides of the default; the corruption cases retain the default size.
+        for flush_size_kb in (64, 256):
+            WORKDIR = root / ("borrowed-" + str(flush_size_kb))
+            check_borrowed_payloads(flush_size_kb)
         for obsolete in (False, True):
             WORKDIR = root / ("obsolete" if obsolete else "live")
             check_payload_crc(obsolete)
