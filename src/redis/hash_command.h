@@ -24,6 +24,13 @@ class ReplyBuilder;
 
 void InitHashCommandStorage(storage::StorageEngine* engine);
 
+// Synchronously encode HGETALL/HKEYS/HVALS from a caller-held compact lease.
+// Returns nullopt for other commands without consuming the snapshot or changing
+// the reply. Input views never escape; the builder owns the completed reply.
+std::optional<CommandReply> TryExecuteCompactHashRead(
+    CommandKind kind, const storage::CompactReadResult& compact,
+    ReplyBuilder& reply_builder);
+
 // A supplied compact snapshot bypasses storage only for standalone read-only
 // commands. Its payload lease must outlive the returned task; replies own any
 // data retained after completion. A null snapshot uses ordinary owner storage.

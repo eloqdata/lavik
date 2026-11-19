@@ -548,7 +548,11 @@ entries into an admitted immutable snapshot of packed bytes and offsets,
 without an intermediate logical collection or a string allocation per entry.
 The result owns the snapshot across worker hops; reply construction borrows
 its selected field/value views only while that ownership remains alive.
-Compact full reads use the same result contract. Point reads and internal
+Connection-worker compact Hash full replies can instead encode synchronously
+while holding the physical read lease. Bounded projections borrow entry views
+directly into reply construction; larger projections retain the admitted packed
+snapshot. No borrowed payload survives reply encoding. Owner-side compact full
+reads use the owned result contract. Point reads and internal
 consumers retain their optional owned-value contract unless they explicitly
 request a snapshot.
 The parent joins every launched read before returning, including on error,
@@ -877,6 +881,7 @@ the reusable containers have independent tests under `tests/containers/`.
 
 | Responsibility | Source |
 |---|---|
+| Compact Hash reply dispatch, borrowed views and physical lease lifetime | `src/redis/command.cpp`, `src/redis/hash_command.cpp`, `src/storage/engine/read.cpp`, `tests/compact_hash_reply_test.cpp` |
 | Prefix snapshots, mutation planning and persistent routing | `include/lavik/storage/detail/grouped/hash.h`, `src/storage/engine/grouped/hash.cpp` |
 | Owner-local group arbitration, ordered lock sets and waiter lifetime | `include/lavik/storage/detail/grouped/lock.h`, `src/storage/engine/grouped/lock.cpp`, `tests/grouped/lock_test.cpp` |
 | Logical collection encodings, shared indexed v2 bodies and per-element validation | `include/lavik/storage/detail/hash_codec.h`, `ordered_compact_codec.h`, `ordered_index.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |

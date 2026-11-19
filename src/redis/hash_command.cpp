@@ -16,12 +16,14 @@
 
 #include "hash_command.h"
 
+#include <array>
 #include <charconv>
 #include <limits>
 #include <ranges>
 
 #include "cluster_gate.h"
 #include "lavik/resp.h"
+#include "lavik/storage/detail/hash_codec.h"
 
 namespace lavik {
 
@@ -74,6 +76,11 @@ Task<CommandReply> ExecuteHashCommandImpl(
     const CommandRequest& request, const storage::Digest* digest,
     storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
     const storage::CompactReadResult* compact = nullptr) {
+  if (compact != nullptr) {
+    if (auto reply =
+            TryExecuteCompactHashRead(request.kind_, *compact, reply_builder))
+      co_return std::move(*reply);
+  }
   const auto& args = request.args_;
   if (request.kind_ == CommandKind::kHIncrBy ||
       request.kind_ == CommandKind::kHIncrByFloat) {
@@ -326,6 +333,82 @@ Task<CommandReply> ExecuteHashCommandImpl(
 }
 
 }  // namespace
+
+std::optional<CommandReply> TryExecuteCompactHashRead(
+    CommandKind kind, const storage::CompactReadResult& compact,
+    ReplyBuilder& reply_builder) {
+  storage::HashOperationKind projection;
+  switch (kind) {
+    case CommandKind::kHGetAll:
+      projection = storage::HashOperationKind::kGetAll;
+      break;
+    case CommandKind::kHKeys:
+      projection = storage::HashOperationKind::kKeys;
+      break;
+    case CommandKind::kHVals:
+      projection = storage::HashOperationKind::kValues;
+      break;
+    default:
+      return std::nullopt;
+  }
+  if (!compact.ok())
+    return BuiltReply(AppendStorageError(reply_builder, compact.status()));
+  const auto header = [&](std::size_t count) {
+    if (kind == CommandKind::kHGetAll)
+      reply_builder.AppendMapHeader(count);
+    else
+      reply_builder.AppendArrayHeader(count);
+  };
+  if (!*compact) {
+    header(0);
+    return BuiltReply(reply_builder.View());
+  }
+
+  // This synchronous stack workspace never enlarges a coroutine frame. Small
+  // projections borrow the physical read lease until RESP encoding completes,
+  // avoiding the owned snapshot, its two vectors and its payload copy. Larger
+  // projections keep the existing admitted output path rather than growing
+  // unaccounted scratch. Validate the entire image before emitting a header,
+  // so malformed tails cannot leave a partial successful reply.
+  constexpr std::size_t kInlineComponents = 32;
+  const std::size_t width = kind == CommandKind::kHGetAll ? 2 : 1;
+  const auto& value = **compact;
+  if (value.logical_size_ <= kInlineComponents / width) {
+    auto reader = storage::HashValueReader::Open(value.encoded_);
+    if (!reader.ok())
+      return BuiltReply(AppendStorageError(reply_builder, reader.status()));
+    if (reader->size() != value.logical_size_)
+      return BuiltReply(AppendStorageError(
+          reply_builder,
+          absl::InternalError(
+              "Hash element count does not match record metadata")));
+    std::array<std::string_view, kInlineComponents> components;
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok())
+        return BuiltReply(AppendStorageError(reply_builder, entry.status()));
+      if (kind != CommandKind::kHVals) components[count++] = entry->field_;
+      if (kind != CommandKind::kHKeys) components[count++] = entry->value_;
+    }
+    header(reader->size());
+    reply_builder.AppendBulkStrings(
+        std::span<const std::string_view>(components.data(), count));
+  } else {
+    storage::HashOperation operation;
+    operation.kind_ = projection;
+    operation.packed_output_ = true;
+    auto result =
+        storage::ReadCompactHash(compact, operation, storage::ValueType::kHash);
+    if (!result.ok())
+      return BuiltReply(AppendStorageError(reply_builder, result.status()));
+    header(result->length_);
+    reply_builder.AppendBulkStrings(
+        std::views::iota(std::size_t{0}, result->value_count()),
+        [&result](std::size_t i) noexcept { return result->value_view(i); });
+  }
+  return BuiltReply(reply_builder.View());
+}
 
 void InitHashCommandStorage(storage::StorageEngine* engine) {
   g_storage = engine;
