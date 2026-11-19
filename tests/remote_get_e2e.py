@@ -148,6 +148,41 @@ def assert_owner_parity(client, commands):
         assert got == want, (command, got, want)
 
 
+def check_hash_transaction(client, port, key):
+    # Readers must not see the state between two writes in one EXEC.
+    client.batch([[b"HSET", key, b"a", b"old", b"b", b"old"]])
+    drain(client)
+
+    def writer():
+        peer = CollectionClient(port)
+        try:
+            for i in range(300):
+                value = b"new" if i % 2 else b"old"
+                assert peer.batch(
+                    [
+                        [b"MULTI"],
+                        [b"HSET", key, b"a", value],
+                        [b"HSET", key, b"b", value],
+                        [b"EXEC"],
+                    ]
+                )[-1] == [0, 0]
+        finally:
+            peer.close()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        task = pool.submit(writer)
+        for _ in range(600):
+            got = client.batch([[b"HMGET", key, b"a", b"b"]])[0]
+            assert got in ([b"old", b"old"], [b"new", b"new"]), got
+            whole = client.batch([[b"HGETALL", key]])[0]
+            pairs = dict(zip(whole[::2], whole[1::2], strict=True))
+            assert pairs in (
+                {b"a": b"old", b"b": b"old"},
+                {b"a": b"new", b"b": b"new"},
+            ), pairs
+        task.result()
+
+
 def check_collections(port):
     client = CollectionClient(port)
     families = [
@@ -207,32 +242,7 @@ def check_collections(port):
         drain(client)
         assert_owner_parity(client, collection_reads(keys))
 
-        # A compact HMGET must see one complete record during atomic updates.
-        key = families[1][0]
-        client.batch([[b"HSET", key, b"a", b"old", b"b", b"old"]])
-        drain(client)
-
-        def writer():
-            peer = CollectionClient(port)
-            try:
-                for i in range(300):
-                    value = b"new" if i % 2 else b"old"
-                    assert peer.batch(
-                        [
-                            [b"MULTI"],
-                            [b"HSET", key, b"a", value, b"b", value],
-                            [b"EXEC"],
-                        ]
-                    )[-1] == [0]
-            finally:
-                peer.close()
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            task = pool.submit(writer)
-            for _ in range(600):
-                got = client.batch([[b"HMGET", key, b"a", b"b"]])[0]
-                assert got in ([b"old", b"old"], [b"new", b"new"]), got
-            task.result()
+        check_hash_transaction(client, port, families[1][0])
     finally:
         client.close()
 
@@ -311,8 +321,29 @@ def main():
         with (support.WORKDIR / "data").open("wb") as file:
             file.truncate(512 * 1024 * 1024)
         check()
+        # Every connection and key share one worker here, so full Hash reads
+        # exercise local direct admission, including overlapping EXEC writes.
+        support.WORKDIR = Path(directory) / "local"
+        support.WORKDIR.mkdir()
+        with (support.WORKDIR / "data").open("wb") as file:
+            file.truncate(512 * 1024 * 1024)
+        with support.server(1) as (admin, _):
+            port = admin.socket.getpeername()[1]
+            client = CollectionClient(port)
+            try:
+                key = b"local-hash"
+                check_hash_transaction(client, port, key)
+                drain(client)
+                for version in (b"2", b"3"):
+                    client.batch([[b"HELLO", version]])
+                    assert_owner_parity(
+                        client,
+                        [[kind, key] for kind in (b"HGETALL", b"HKEYS", b"HVALS")],
+                    )
+            finally:
+                client.close()
     print(
-        "remote compact reads, RESP2/3, fallback, transactions, FLUSHDB and recovery passed"
+        "local/remote compact reads, RESP2/3, fallback, transactions, FLUSHDB and recovery passed"
     )
 
 

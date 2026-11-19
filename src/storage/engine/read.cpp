@@ -309,23 +309,26 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
 
 StorageEngine::RemoteReadAwaitable::RemoteReadAwaitable(
     Impl& engine, std::uint8_t db_id, std::string_view key, std::uint16_t slot,
-    ValueType type, bool metadata_only, ReadLatencyTrace* trace)
+    ValueType type, bool metadata_only, ReadLatencyTrace* trace,
+    bool allow_local)
     : key_(key),
       slot_(slot),
       db_id_(db_id),
       type_(type),
       metadata_only_(metadata_only),
       trace_(trace) {
-  engine.PrepareRemoteRead(*this);
+  engine.PrepareRemoteRead(*this, allow_local);
 }
 
-void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
+void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result,
+                                            bool allow_local) {
   const auto db_id = result.db_id_;
   const auto key = result.key_;
   const auto slot = result.slot_;
   const unsigned owner = slot % worker_count_;
   auto& local = CurrentStore();
-  if (owner == local.worker_->id() || db_id >= options_.database_count_ ||
+  if ((!allow_local && owner == local.worker_->id()) ||
+      db_id >= options_.database_count_ ||
       replica_loading_.load(std::memory_order_acquire) ||
       replica_recovery_fenced_.load(std::memory_order_acquire) ||
       request_serving_fenced_until_restart_.load(std::memory_order_acquire))
@@ -577,9 +580,14 @@ StorageEngine::RemoteReadAwaitable::TracedReadIo::await_resume() {
 }
 
 void StorageEngine::RemoteReadAwaitable::Pin::Reset() {
-  if (std::exchange(owns_, false))
-    engine_->UnpinRemoteBlock(engine_->BlockStateAt(block_id_), owner_,
-                              block_id_);
+  if (!std::exchange(owns_, false)) return;
+  auto& block = engine_->BlockStateAt(block_id_);
+  // A local last-reader release can settle deferred maintenance immediately;
+  // foreign readers must continue notifying the physical owner instead.
+  if (bycorf::ThisWorker().id_ == owner_)
+    engine_->UnpinBlock(*engine_->stores_[owner_], block, block_id_);
+  else
+    engine_->UnpinRemoteBlock(block, owner_, block_id_);
 }
 StorageEngine::RemoteReadAwaitable::Pin::~Pin() { Reset(); }
 

@@ -13890,9 +13890,17 @@ Task<CommandReply> ExecuteCommandBody(
         const std::uint16_t slot = routed ? request.RoutedPartitionId()
                                           : storage::RedisSlot(args[key_arg]);
         const unsigned target = slot % g_storage->worker_count();
-        if (target != ThisWorker().id_ && request.spec_ != nullptr &&
+        const bool local_hash_projection =
+            request.kind_ == CommandKind::kHGetAll ||
+            request.kind_ == CommandKind::kHKeys ||
+            request.kind_ == CommandKind::kHVals;
+        if ((target != ThisWorker().id_ || local_hash_projection) &&
+            request.spec_ != nullptr &&
             request.spec_->remote_read_type_ != storage::ValueType::kNone) {
-          // Reuse the route hash for admission on the connection worker.
+          // Full Hash projections can use the same published-index admission
+          // on their owner. This avoids the general Hash read/write task chain
+          // without bypassing a writer's closed read-intent stripe. EXEC/Lua
+          // retain their separately locked dispatch path.
           std::unique_ptr<ReadLatencyTrace> private_read;
           ReadLatencyTrace* detail = nullptr;
           if (request.latency_trace_) {
@@ -13906,7 +13914,7 @@ Task<CommandReply> ExecuteCommandBody(
             }
             detail->owner_start_ns_ = LatencyMonotonicNanos();
           }
-          auto fast = co_await g_storage->TryRemoteRead(
+          auto fast = co_await g_storage->TryCompactRead(
               request.db_id_, args[key_arg], slot,
               request.spec_->remote_read_type_,
               request.spec_->remote_read_metadata_, detail);
@@ -13949,7 +13957,7 @@ Task<CommandReply> ExecuteCommandBody(
             }
             co_return reply;
           }
-          // A discarded remote result still consumed lookup/buffer/I/O work.
+          // A discarded direct result still consumed lookup/buffer/I/O work.
           // Keep those observations; owner entry replaces routing boundaries
           // and adds its own intervals to the same selected command.
         }

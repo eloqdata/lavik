@@ -1882,6 +1882,16 @@ class StorageEngine {
                                     bool metadata_only = false,
                                     ReadLatencyTrace* trace = nullptr);
 
+  // Same admission and lifetime contract as TryRemoteRead, also permitting a
+  // key owned by this worker. Published index read guards exclude active
+  // mutation intents before capturing/pinning an immutable disk record. Staged
+  // values and unavailable guards/buffers still request the ordinary owner
+  // path.
+  RemoteReadAwaitable TryCompactRead(std::uint8_t db_id, std::string_view key,
+                                     std::uint16_t slot, ValueType type,
+                                     bool metadata_only = false,
+                                     ReadLatencyTrace* trace = nullptr);
+
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
   // routed_partition_id reuses a route computed for this exact key before its
@@ -2299,7 +2309,7 @@ class StorageEngine::RemoteReadAwaitable {
 
   RemoteReadAwaitable(Impl& engine, std::uint8_t db_id, std::string_view key,
                       std::uint16_t slot, ValueType type, bool metadata_only,
-                      ReadLatencyTrace* trace);
+                      ReadLatencyTrace* trace, bool allow_local = false);
   bool Current(const Impl& engine) const noexcept;
 
   Result ready_;

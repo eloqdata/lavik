@@ -20,6 +20,7 @@ class RemoteGetTestPeer : public testing::Test {
 
   virtual std::size_t ReadSlotBytes() const { return 12 * kKiB; }
   virtual unsigned ReadChunks() const { return 1; }
+  virtual unsigned OwnerId() const { return 1; }
 
   void SetUp() override {
     saved_context_ = std::move(bycorf::MutableThisWorker());
@@ -39,11 +40,11 @@ class RemoteGetTestPeer : public testing::Test {
         std::make_unique<StorageEngine::Impl::WorkerStore>());
     engine.stores_[0]->engine_ = &engine;
     engine.stores_[0]->worker_ = &worker_;
-    auto& source = *engine.stores_[1];
+    auto& source = *engine.stores_[OwnerId()];
     source.engine_ = &engine;
-    source.worker_ = &owner_;
+    source.worker_ = OwnerId() == 0 ? &worker_ : &owner_;
     source.partitions_.resize(1);
-    source.partitions_[0].id_ = 1;
+    source.partitions_[0].id_ = OwnerId();
     source.index_bases_[0] = &index_;
     source.partitions_[0].indexes_ = {&source.index_bases_, 0};
     source.partitions_[0].grouped_objects_ = {&source.grouped_bases_, 0};
@@ -51,11 +52,11 @@ class RemoteGetTestPeer : public testing::Test {
     source.remote_reads_ready_.store(true);
     source.remote_population_generation_.store(2);
     engine.db_epochs_[0].store(1);
-    engine.remote_replication_epochs_[1].store(1);
+    engine.remote_replication_epochs_[OwnerId()].store(1);
     engine.devices_.push_back(StorageDevice{.capacity_blocks_ = 2});
     engine.block_state_lookup_.push_back({&block_, 1, 2});
     engine.stores_[0]->files_.push_back(bycorf::FixedFile{});
-    block_.Reset(1, 7);
+    block_.Reset(OwnerId(), 7);
     block_.allocated_ = true;
 
     RegisteredBufferPoolOptions options;
@@ -68,7 +69,7 @@ class RemoteGetTestPeer : public testing::Test {
 
     for (unsigned i = 0;; ++i) {
       key_ = "remote-" + std::to_string(i);
-      if (RedisSlot(key_) == 1) break;
+      if (RedisSlot(key_) == OwnerId()) break;
     }
     auto arena = std::make_shared<ScanHashMapEntryArena>(63);
     ASSERT_TRUE(arena->PreallocateDirectory());
@@ -84,8 +85,9 @@ class RemoteGetTestPeer : public testing::Test {
     header_.mutation_sequence_ = 9;
     header_.payload_checksum_ = Crc32c(std::as_bytes(std::span(value_)));
     const auto metadata = RecordLocation::PackedMetadata::Encode(
-        kBlockHeaderBytes + 8, header_.total_disk_bytes_, 1, false, false,
-        false, false, false, false, RecordKind::kValue, ValueType::kString);
+        kBlockHeaderBytes + 8, header_.total_disk_bytes_, OwnerId(), false,
+        false, false, false, false, false, RecordKind::kValue,
+        ValueType::kString);
     ASSERT_NE(
         index_.InsertNew(ComputeDigest(key_), key_,
                          RecordLocation(1, 9, 7, 0, value_.size(), metadata)),
@@ -101,7 +103,7 @@ class RemoteGetTestPeer : public testing::Test {
   }
 
   auto& Engine() { return *storage_.impl_; }
-  auto& Source() { return *Engine().stores_[1]; }
+  auto& Source() { return *Engine().stores_[OwnerId()]; }
   void SetDatabaseCount(std::uint8_t count) {
     Engine().options_.database_count_ = count;
   }
@@ -132,13 +134,19 @@ class RemoteGetTestPeer : public testing::Test {
                                   &trace_);
   }
 
+  auto DirectRead() {
+    return storage_.TryCompactRead(0, key_, OwnerId(), header_.value_type_,
+                                   false, &trace_);
+  }
+
   void Publish(ValueType type, bool grouped = false, bool staged = false,
                bool external = false) {
     header_.value_type_ = type;
     header_.logical_size_ = type == ValueType::kString ? value_.size() : 2;
     const auto metadata = RecordLocation::PackedMetadata::Encode(
-        kBlockHeaderBytes + 8, header_.total_disk_bytes_, 1, staged, external,
-        false, false, false, false, RecordKind::kValue, type, false, grouped);
+        kBlockHeaderBytes + 8, header_.total_disk_bytes_, OwnerId(), staged,
+        external, false, false, false, false, RecordKind::kValue, type, false,
+        grouped);
     auto writer = index_.CloseAllReaders();
     auto* entry = index_.Find(ComputeDigest(key_), key_);
     ASSERT_NE(entry, nullptr);
@@ -279,13 +287,13 @@ class RemoteGetTestPeer : public testing::Test {
     auto& engine = *storage_.impl_;
     switch (which) {
       case 0:
-        engine.stores_[1]->remote_population_generation_.fetch_add(2);
+        Source().remote_population_generation_.fetch_add(2);
         break;
       case 1:
         engine.db_epochs_[0].fetch_add(1);
         break;
       case 2:
-        engine.remote_replication_epochs_[1].fetch_add(1);
+        engine.remote_replication_epochs_[OwnerId()].fetch_add(1);
         break;
       case 3:
         engine.replica_loading_.store(true);
@@ -319,6 +327,63 @@ class RemoteGetTestPeer : public testing::Test {
   RecordHeader header_;
   ReadLatencyTrace trace_;
 };
+
+class LocalCompactReadTest : public RemoteGetTestPeer {
+ protected:
+  unsigned OwnerId() const override { return 0; }
+};
+
+TEST_F(LocalCompactReadTest, DurableHashUsesDirectReadAndOwnsCompletedBytes) {
+  Publish(ValueType::kHash);
+  {
+    auto remote_only = storage_.TryRemoteRead(0, key_, 0, ValueType::kHash);
+    ASSERT_TRUE(remote_only.await_ready());
+    EXPECT_FALSE(remote_only.await_resume());
+  }
+  Awaitable::Result result;
+  {
+    auto read = DirectRead();
+    ASSERT_FALSE(read.await_ready());
+    EXPECT_EQ(block_.pin_count(), 1);
+    // The logical read precedes a later writer. Only the physical pin remains
+    // through I/O; its bytes survive the awaitable's local last-pin release.
+    auto writer = index_.CloseAllReaders();
+    EXPECT_TRUE(writer.ready());
+    Complete(read);
+    result = read.await_resume();
+    ASSERT_TRUE(result && result->ok());
+    EXPECT_EQ(result->value().view().encoded_, value_);
+    EXPECT_EQ(result->value().view().logical_size_, 2);
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 0);
+  result.reset();
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LocalCompactReadTest, WriterIntentPreventsDirectAdmission) {
+  Publish(ValueType::kHash);
+  const auto fp = tx::FingerprintOf(ComputeDigest(key_));
+  index_.CloseReadIntent(fp);
+  {
+    auto read = DirectRead();
+    EXPECT_TRUE(read.await_ready());
+    EXPECT_FALSE(read.await_resume());
+    EXPECT_EQ(block_.pin_count(), 0);
+  }
+  index_.ReleaseReadIntent(fp);
+}
+
+TEST_F(LocalCompactReadTest, AbandonedReadReleasesLocalPinAndBuffer) {
+  Publish(ValueType::kHash);
+  {
+    auto read = DirectRead();
+    ASSERT_FALSE(read.await_ready());
+    EXPECT_EQ(block_.pin_count(), 1);
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
 
 TEST_F(RemoteGetTestPeer, UnallocatedDatabaseFallsBackWithoutActivation) {
   PrepareLazyDatabase();

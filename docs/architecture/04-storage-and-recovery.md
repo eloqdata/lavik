@@ -782,6 +782,10 @@ serving-generation admission. GET and read-only Hash, Set, List, Sorted Set/GEO
 and Stream commands share this path. Transaction-owned reads, multi-key reads
 and blocking operations retain their owner-side coordination. Repeated random
 replies retain their existing bounded snapshot streamer.
+Standalone full Hash projections also attempt this direct path when the
+connection worker owns the key, using the same published-index admission and
+immutable block pin. Closed mutation intents and unsupported representations
+retain the ordinary locked owner path.
 
 A short index reader guard on the key owner protects a complete-key compact
 location snapshot. Payload reads pin the block and validate its allocation

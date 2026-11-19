@@ -2400,7 +2400,7 @@ class StorageEngine::Impl {
                   std::uint64_t block_id);
   void UnpinRemoteBlock(BlockState& state, unsigned owner,
                         std::uint64_t block_id);
-  void PrepareRemoteRead(RemoteReadAwaitable& result);
+  void PrepareRemoteRead(RemoteReadAwaitable& result, bool allow_local);
   void FinalizeWorker(unsigned worker_id) noexcept;
   bool AbandonWorkerStateForProcessExit() noexcept;
 
