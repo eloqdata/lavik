@@ -79,6 +79,91 @@ void LogSpdkMemoryStats() {
 }
 #endif
 
+// Fixed metadata occupies an odd number of 4 KiB pages (one label followed
+// by A/B pairs). The 8 MiB data boundary therefore always leaves this page
+// available, even on v1 media. Its location depends on *labeled* capacity.
+constexpr std::uint64_t UpgradeLabelOffset(std::uint64_t blocks) {
+  return std::uint64_t{DataBlockBegin(blocks)} * kStorageBlockBytes -
+         kDirectIoAlignment;
+}
+static_assert(kStorageBlockBytes % (2 * kDirectIoAlignment) == 0);
+
+using LabelPage = std::array<std::byte, kDirectIoAlignment>;
+// Give the temporary copy a separate signature. Its CRC is verified after
+// restoring the normal signature, using the same codec as the primary.
+constexpr auto kUpgradeLabelMagic = ~kDeviceLabelMagic;
+
+absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
+    const std::string& path, std::uint64_t physical_blocks, FixedBuffer scratch,
+    bool& recovered_upgrade) {
+  LabelPage page;
+  auto status = ReadExactlyAt(path, page, kDeviceLabelOffset, scratch);
+  if (!status.ok()) return status;
+  DeviceLabel label;
+  if (DecodeDeviceLabel(page, &label)) return label;
+  bool uninitialized = IsZero(page);
+
+  // A torn primary can lose even its capacity. Probe the last page of each
+  // possible metadata prefix (at most nine reads at the 1 PiB device limit).
+  // The path may have grown or shrunk since labeling. Check the candidate
+  // against its own capacity and let Prepare validate the current path size.
+  const auto prefixes = std::min<std::uint64_t>(
+      physical_blocks, DataBlockBegin(kLocalBlockIdLimit));
+  for (std::uint64_t prefix = 1; prefix <= prefixes; ++prefix) {
+    const auto offset = prefix * kStorageBlockBytes - kDirectIoAlignment;
+    status = ReadExactlyAt(path, page, offset, scratch);
+    if (!status.ok()) return status;
+    std::uint64_t magic;
+    std::memcpy(&magic, page.data(), sizeof(magic));
+    if (magic != kUpgradeLabelMagic) continue;
+    uninitialized = false;
+    std::memcpy(page.data(), &kDeviceLabelMagic, sizeof(kDeviceLabelMagic));
+    if (DecodeDeviceLabel(page, &label) &&
+        UpgradeLabelOffset(label.capacity_blocks_) == offset) {
+      recovered_upgrade = true;
+      return label;
+    }
+  }
+  if (uninitialized) return std::optional<DeviceLabel>{};
+  return absl::DataLossError(
+      "invalid device label and no valid upgrade copy: " + path);
+}
+
+absl::Status PublishDeviceLabel(const std::string& path, DeviceLabel label,
+                                std::uint32_t target_count, FixedBuffer scratch,
+                                bool recovered_upgrade) {
+  LabelPage page{};
+  const auto offset = UpgradeLabelOffset(label.capacity_blocks_);
+  assert(offset >= FixedMetadataBytes(label.capacity_blocks_));
+  if (!recovered_upgrade && label.version_ == kStorageFormatVersion &&
+      label.device_count_ == target_count) {
+    // The primary may have committed just before a crash. Retire any leftover
+    // shadow before allowing an operator to clear this label for
+    // reprovisioning.
+    auto status = ReadExactlyAt(path, page, offset, scratch);
+    if (!status.ok()) return status;
+    std::uint64_t magic;
+    std::memcpy(&magic, page.data(), sizeof(magic));
+    if (magic != kUpgradeLabelMagic) return absl::OkStatus();
+    page.fill(std::byte{});
+    return WriteExactlyAt(path, page, offset, true, scratch);
+  }
+  if (!recovered_upgrade) {
+    EncodeDeviceLabel(label, page);
+    std::memcpy(page.data(), &kUpgradeLabelMagic, sizeof(kUpgradeLabelMagic));
+    auto status = WriteExactlyAt(path, page, offset, true, scratch);
+    if (!status.ok()) return status;
+  }
+  // On retry the shadow may be the only valid copy. Leave it intact until
+  // the canonical v2 label has reached stable storage.
+  label.version_ = kStorageFormatVersion;
+  label.device_count_ = target_count;
+  auto status = WriteDeviceLabel(path, label, scratch);
+  if (!status.ok()) return status;
+  page.fill(std::byte{});
+  return WriteExactlyAt(path, page, offset, true, scratch);
+}
+
 std::vector<std::uint64_t> InitialEpochValues() {
   std::vector<std::uint64_t> values(kEpochValueCount, 1);
   std::fill(values.begin() + kCheckpointGenerationIndex, values.end(), 0);
@@ -384,6 +469,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   }
 
   labels.resize(options_.data_files_.size());
+  std::vector<bool> recovered_upgrades(labels.size());
   if (options_.reset_data_files_) {
     // Validate the complete target set before the first destructive write.
     // The normal preparation below repeats these checks while constructing
@@ -430,7 +516,12 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     }
   } else {
     for (std::size_t i = 0; i < options_.data_files_.size(); ++i) {
-      auto label = ReadDeviceLabel(options_.data_files_[i], startup_read);
+      bool recovered_upgrade = false;
+      auto label =
+          ReadDeviceLabel(options_.data_files_[i],
+                          path_info[i].size_bytes_ / kStorageBlockBytes,
+                          startup_read, recovered_upgrade);
+      recovered_upgrades[i] = recovered_upgrade;
       if (!label.ok()) return label.status();
       labels[i] = std::move(*label);
     }
@@ -735,22 +826,6 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       }
       labels[i] = label;
     }
-    // Publish all new labels before changing an old label's member count. An
-    // interrupted run therefore remains recognizable and safe to retry.
-    for (std::size_t i = 0; i < labels.size(); ++i) {
-      if (labels[i]->device_count_ == configured_device_count) {
-        continue;
-      }
-      labels[i]->device_count_ = configured_device_count;
-      absl::Status written = WriteDeviceLabel(
-          options_.data_files_[i], *labels[i],
-          device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_);
-      if (!written.ok()) {
-        return written;
-      }
-    }
-    spdlog::info("expanded storage set from {} to {} devices",
-                 previous_device_count, configured_device_count);
   } else if (!has_existing_device) {
     for (std::size_t i = 0; i < labels.size(); ++i) {
       DeviceLabel label{
@@ -1042,6 +1117,19 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     absl::Status zero_header =
         stores_[allocator->owner_]->zero_header_.Init(allocator->owner_);
     if (!zero_header.ok()) return zero_header;
+  }
+  // All read-only preflight checks have passed. Fence older readers before
+  // workers can publish any v2 blocks.
+  for (std::size_t i = 0; i < labels.size(); ++i) {
+    auto status = PublishDeviceLabel(
+        options_.data_files_[i], *labels[i], configured_device_count,
+        device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_,
+        recovered_upgrades[i]);
+    if (!status.ok()) return status;
+  }
+  if (has_existing_device && configured_device_count > previous_device_count) {
+    spdlog::info("expanded storage set from {} to {} devices",
+                 previous_device_count, configured_device_count);
   }
   // Metadata probing is complete. Return its temporary controller qpairs so
   // a controller advertising exactly worker_count queues can still start.

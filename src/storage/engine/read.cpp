@@ -1708,7 +1708,6 @@ bool StorageEngine::Impl::ReadExtentAwaitable::DecodeHeader(
     BlockHeader& header) const {
   return DecodeBlockHeaderPages(bytes, &header) &&
          header.kind_ == BlockKind::kPayloadExtent &&
-         header.block_id_ == ref_.block_id_ &&
          header.allocation_epoch_ == ref_.allocation_epoch_ &&
          header.extent_index_ == extent_index_ &&
          header.extent_payload_bytes_ == ref_.payload_bytes_ &&

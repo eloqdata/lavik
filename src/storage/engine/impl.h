@@ -268,7 +268,7 @@ DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size,
   ExtentManifestHeader header{};
   std::memcpy(&header, payload.data(), sizeof(header));
   if (header.magic_ != kExtentManifestMagic ||
-      header.version_ != kStorageFormatVersion || header.extent_count_ == 0 ||
+      header.version_ != kCommonFormatVersion || header.extent_count_ == 0 ||
       header.extent_count_ > kMaxStringExtents ||
       payload.size() !=
           sizeof(header) + static_cast<std::size_t>(header.extent_count_) *
@@ -300,7 +300,7 @@ DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size,
 inline std::string EncodeManifest(std::span<const ExtentRef> refs) {
   ExtentManifestHeader header{
       .magic_ = kExtentManifestMagic,
-      .version_ = kStorageFormatVersion,
+      .version_ = kCommonFormatVersion,
       .extent_count_ = static_cast<std::uint32_t>(refs.size())};
   std::string output(sizeof(header) + refs.size_bytes(), '\0');
   std::memcpy(output.data(), &header, sizeof(header));
@@ -1217,24 +1217,6 @@ inline absl::Status WriteExactlyAt(const std::string& path,
                           "close storage path after write failed: " + path);
   }
   return status;
-}
-
-inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
-    const std::string& path, FixedBuffer scratch = {}) {
-  std::array<std::byte, kDirectIoAlignment> page{};
-  absl::Status status = ReadExactlyAt(path, page, kDeviceLabelOffset, scratch);
-  if (!status.ok()) {
-    return status;
-  }
-  if (IsZero(page)) {
-    return std::optional<DeviceLabel>{};
-  }
-  DeviceLabel label{};
-  if (!DecodeDeviceLabel(page, &label)) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "invalid or corrupt device label: " + path);
-  }
-  return std::optional<DeviceLabel>{label};
 }
 
 inline absl::Status WriteDeviceLabel(const std::string& path,

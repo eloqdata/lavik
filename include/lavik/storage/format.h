@@ -35,11 +35,12 @@ inline constexpr std::size_t kBlockHeaderBytes =
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-// Pre-deployment format changes directly replace version 1. Compatibility
-// with earlier development media is intentionally unsupported because its
-// missing system-state lineage cannot be inferred safely. Lavik signatures
-// also reject media bearing obsolete development signatures.
-inline constexpr std::uint32_t kStorageFormatVersion = 1;
+// Shared baseline for independently encoded payloads, frames and metadata.
+// Give a layout its own version when it evolves; keep this baseline stable.
+inline constexpr std::uint32_t kCommonFormatVersion = 1;
+// Storage-set labels and block headers have their own compatibility history.
+inline constexpr std::uint32_t kStorageFormatVersionLegacyV1 = 1;
+inline constexpr std::uint32_t kStorageFormatVersion = 2;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
                                                     << kLocalBlockIdBits;
@@ -81,7 +82,7 @@ enum class MetadataPageKind : std::uint16_t {
 
 struct MetadataPageHeader {
   std::uint64_t magic_ = kMetadataPageMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kCommonFormatVersion;
   MetadataPageKind kind_ = MetadataPageKind::kEpochs;
   std::uint16_t header_bytes_ = 0;
   std::uint32_t page_index_ = 0;
@@ -284,14 +285,14 @@ enum class ValueType : std::uint8_t {
   kStream = 6,
 };
 
+// Current on-disk layout. Each reader already has the physical block address.
 struct BlockHeader {
   std::uint64_t magic_ = kBlockMagic;
-  std::uint64_t block_id_ = kInvalidBlockId;
+  std::uint64_t allocation_epoch_ = 0;
   std::uint32_t version_ = kStorageFormatVersion;
   std::uint32_t header_bytes_ = kBlockHeaderBytes;
   std::uint32_t block_bytes_ = kStorageBlockBytes;
   std::uint32_t writer_id_ = 0;
-  std::uint64_t allocation_epoch_ = 0;
   std::uint32_t committed_bytes_ = kBlockHeaderBytes;
   std::uint32_t record_count_ = 0;
   std::uint64_t max_lsn_ = 0;
@@ -315,13 +316,16 @@ struct BlockHeader {
   std::uint64_t checkpoint_generation_ = 0;
 };
 
+static_assert(sizeof(BlockHeader) == 112);
+static_assert(offsetof(BlockHeader, version_) == 16);
+
 // A logical replication event may span multiple frames and blocks. Every
 // fragment shares one LSN. The receiver publishes the event only after seeing
 // kLast, which keeps future large values atomic without retaining them whole
 // in memory.
 struct ReplicationFrameHeader {
   std::uint64_t magic_ = kReplicationFrameMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kCommonFormatVersion;
   std::uint16_t header_bytes_ = 0;
   ReplicationEventKind kind_ = ReplicationEventKind::kMutation;
   std::uint8_t flags_ = 0;
@@ -414,7 +418,7 @@ struct RecordHeader {
 
 struct ExtentManifestHeader {
   std::uint64_t magic_ = kExtentManifestMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kCommonFormatVersion;
   std::uint32_t extent_count_ = 0;
 };
 
@@ -434,7 +438,7 @@ struct ExtentRef {
 // the same valid value.
 struct SystemStateRoot {
   std::uint64_t magic_ = kSystemStateRootMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kCommonFormatVersion;
   std::uint32_t root_bytes_ = 0;
   std::uint64_t generation_ = 0;
   ExtentRef manifest_{};
@@ -550,7 +554,7 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
                         std::uint64_t* generation,
                         std::span<std::byte> payload) noexcept;
 
-// Encode into / decode from a single header slot page.
+// Write a v2 slot. Both versions decode independently of physical placement.
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept;
@@ -559,7 +563,7 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
 
 // Decode the winning slot from a block's full header region: the valid slot
 // with the larger (allocation_epoch, header_sequence). Returns the winning
-// slot index in `active_slot`, or false when neither slot is valid.
+// slot index in `active_slot` on success.
 bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
                             BlockHeader* header,
                             std::uint8_t* active_slot = nullptr) noexcept;

@@ -285,7 +285,6 @@ class RecordImage {
                       .payload_bytes_ = static_cast<std::uint32_t>(count),
                       .payload_checksum_ = Crc32c(bytes)};
         BlockHeader header{
-            .block_id_ = id,
             .allocation_epoch_ = ref.allocation_epoch_,
             .committed_bytes_ =
                 static_cast<std::uint32_t>(kBlockHeaderBytes + count),
@@ -322,14 +321,14 @@ class RecordImage {
   // bytes behind. In this image the retired transaction is above every live
   // block, so a restarted allocator cannot infer its history from the bitmap.
   void RetireTransactionBlock() {
-    std::erase(allocated_, records_.at(true).header_.block_id_);
+    std::erase(allocated_, records_.at(true).block_id_);
   }
 
   void RestoreLegacyTransactionHeader() {
     const auto& block = records_.at(true);
     std::array<std::byte, kBlockHeaderBytes> header{};
     Check(::pread(fd_, header.data(), header.size(),
-                  LocalBlockOffset(block.header_.block_id_)) ==
+                  LocalBlockOffset(block.block_id_)) ==
               static_cast<ssize_t>(header.size()),
           "reading reactivated transaction header failed");
     Check(std::all_of(header.begin(), header.end(),
@@ -340,9 +339,9 @@ class RecordImage {
     // the checkpoint's complete live graph or its allocation bitmap.
     std::array<std::byte, kDirectIoAlignment> page{};
     EncodeBlockHeader(block.header_, page);
-    WriteAt(fd_, page, LocalBlockOffset(block.header_.block_id_));
+    WriteAt(fd_, page, LocalBlockOffset(block.block_id_));
     WriteAt(fd_, block.payload_,
-            LocalBlockOffset(block.header_.block_id_) + kBlockHeaderBytes);
+            LocalBlockOffset(block.block_id_) + kBlockHeaderBytes);
     Check(::fdatasync(fd_) == 0, "syncing legacy transaction header failed");
   }
 
@@ -350,9 +349,9 @@ class RecordImage {
     for (auto& [tx, block] : records_) {
       std::array<std::byte, kDirectIoAlignment> page{};
       EncodeBlockHeader(block.header_, page);
-      WriteAt(fd_, page, LocalBlockOffset(block.header_.block_id_));
+      WriteAt(fd_, page, LocalBlockOffset(block.block_id_));
       WriteAt(fd_, block.payload_,
-              LocalBlockOffset(block.header_.block_id_) + kBlockHeaderBytes);
+              LocalBlockOffset(block.block_id_) + kBlockHeaderBytes);
     }
     std::vector<std::byte> bitmap(ScanBitmapBytes(kBlocks));
     for (const std::uint64_t id : allocated_) {
@@ -392,6 +391,7 @@ class RecordImage {
 
  private:
   struct RecordsBlock {
+    std::uint64_t block_id_ = kInvalidBlockId;
     BlockHeader header_;
     std::vector<std::byte> payload_;
   };
@@ -408,8 +408,8 @@ class RecordImage {
     auto& block = position->second;
     if (inserted) {
       const auto id = Allocate();
+      block.block_id_ = id;
       block.header_ = BlockHeader{
-          .block_id_ = id,
           .allocation_epoch_ = id + 100,
           .committed_bytes_ = kBlockHeaderBytes,
           .header_sequence_ = 1,

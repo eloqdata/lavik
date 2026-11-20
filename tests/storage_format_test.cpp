@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -85,12 +86,51 @@ TEST(StorageFormatTest, MixedRecordCrcPoliciesPreserveLegacyEncoding) {
   }
 }
 
+TEST(StorageFormatTest, MixedLocationDerivedAndLegacySlots) {
+  using namespace lavik::storage;
+  // Build a v1 wire fixture from its fixed offsets, independently of the
+  // current encoder. CRC covers the whole 4 KiB page in both formats.
+  std::array<std::byte, kBlockHeaderBytes> pages{};
+  auto legacy = std::span(pages).first<kBlockHeaderSlotBytes>();
+  const auto store = [&](std::size_t offset, auto value) {
+    std::memcpy(legacy.data() + offset, &value, sizeof(value));
+  };
+  store(0, kBlockMagic);
+  store(8,
+        kInvalidBlockId);  // Even a sentinel in this obsolete field is ignored.
+  store(16, std::uint32_t{1});
+  store(20, std::uint32_t{kBlockHeaderBytes});
+  store(24, std::uint32_t{kStorageBlockBytes});
+  store(32, std::uint64_t{9});  // allocation epoch
+  store(40, std::uint32_t{kBlockHeaderBytes});
+  store(56, std::uint32_t{1});  // sequence
+  store(64, std::uint32_t{1});  // writer count
+  store(68, std::uint8_t{1});   // record block
+  store(60, Crc32c(legacy));
+  BlockHeader header;
+  ASSERT_TRUE(DecodeBlockHeaderPages(pages, &header));
+  header.header_sequence_++;
+  auto current = std::span(pages).last<kBlockHeaderSlotBytes>();
+  EncodeBlockHeader(header, current);
+  std::uint64_t wire_epoch;
+  std::memcpy(&wire_epoch, current.data() + 8, sizeof(wire_epoch));
+  EXPECT_EQ(wire_epoch, 9u);
+  ASSERT_TRUE(DecodeBlockHeaderPages(pages, &header));
+  EXPECT_EQ(header.version_, kStorageFormatVersion);
+
+  current.back() ^= std::byte{1};
+  ASSERT_TRUE(DecodeBlockHeaderPages(pages, &header));
+  EXPECT_EQ(header.header_sequence_, 1u);
+
+  // Changing only the historical ID still invalidates the legacy slot CRC.
+  legacy[8] ^= std::byte{1};
+  EXPECT_FALSE(DecodeBlockHeaderPages(pages, &header));
+}
+
 TEST(StorageFormatTest, ExtentCrcPolicyIsProtectedByBlockHeader) {
   using namespace lavik::storage;
-  // Repurpose one reserved byte without changing persisted field offsets.
-  static_assert(offsetof(BlockHeader, extent_index_) == 72);
+  static_assert(offsetof(BlockHeader, extent_index_) == 64);
   BlockHeader header;
-  header.block_id_ = 1;
   header.layout_worker_count_ = 1;
   header.kind_ = BlockKind::kPayloadExtent;
   header.extent_no_crc_ = 1;
@@ -491,7 +531,9 @@ TEST(StorageFormatTest, ComputesRedisClusterSlotsAndHashTags) {
 
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   using namespace lavik::storage;
-  static_assert(kStorageFormatVersion == 1);
+  static_assert(kCommonFormatVersion == 1);
+  static_assert(kStorageFormatVersionLegacyV1 == 1);
+  static_assert(kStorageFormatVersion == 2);
 
   constexpr std::uint64_t device_id = kDeviceIdLimit - 2;
   constexpr std::uint32_t local_block =
@@ -504,7 +546,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   DeviceLabel label{
       .magic_ = kDeviceLabelMagic,
-      .version_ = kStorageFormatVersion,
+      .version_ = kStorageFormatVersionLegacyV1,
       .header_bytes_ = kDirectIoAlignment,
       .storage_set_id_ = 17,
       .device_id_ = device_id,
@@ -513,15 +555,20 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
       .block_bytes_ = kStorageBlockBytes,
   };
   std::array<std::byte, kDirectIoAlignment> label_page{};
-  EncodeDeviceLabel(label, label_page);
-  DeviceLabel decoded_label{};
-  ASSERT_TRUE(DecodeDeviceLabel(label_page, &decoded_label));
-  ASSERT_TRUE(decoded_label.storage_set_id_ == label.storage_set_id_);
-  ASSERT_TRUE(decoded_label.device_id_ == label.device_id_);
-  ASSERT_TRUE(decoded_label.capacity_blocks_ == label.capacity_blocks_);
-  ASSERT_TRUE(decoded_label.device_count_ == label.device_count_);
-  label_page.back() ^= std::byte{1};
-  ASSERT_TRUE(!DecodeDeviceLabel(label_page, &decoded_label));
+  for (const auto version :
+       {kStorageFormatVersionLegacyV1, kStorageFormatVersion}) {
+    label.version_ = version;
+    EncodeDeviceLabel(label, label_page);
+    DeviceLabel decoded_label{};
+    ASSERT_TRUE(DecodeDeviceLabel(label_page, &decoded_label));
+    EXPECT_EQ(decoded_label.version_, version);
+    ASSERT_TRUE(decoded_label.storage_set_id_ == label.storage_set_id_);
+    ASSERT_TRUE(decoded_label.device_id_ == label.device_id_);
+    ASSERT_TRUE(decoded_label.capacity_blocks_ == label.capacity_blocks_);
+    ASSERT_TRUE(decoded_label.device_count_ == label.device_count_);
+    label_page.back() ^= std::byte{1};
+    ASSERT_TRUE(!DecodeDeviceLabel(label_page, &decoded_label));
+  }
 
   std::array<std::byte, 37> metadata_payload{};
   for (std::size_t i = 0; i < metadata_payload.size(); ++i) {
@@ -559,7 +606,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   SystemStateRoot system_root{
       .magic_ = kSystemStateRootMagic,
-      .version_ = kStorageFormatVersion,
+      .version_ = kCommonFormatVersion,
       .root_bytes_ = sizeof(SystemStateRoot),
       .generation_ = 41,
       .manifest_ =
@@ -598,12 +645,11 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   BlockHeader header{
       .magic_ = kBlockMagic,
-      .block_id_ = block_id,
+      .allocation_epoch_ = 9,
       .version_ = kStorageFormatVersion,
       .header_bytes_ = kBlockHeaderBytes,
       .block_bytes_ = kStorageBlockBytes,
       .writer_id_ = 3,
-      .allocation_epoch_ = 9,
       .committed_bytes_ = kBlockHeaderBytes,
       .record_count_ = 0,
       .max_lsn_ = 0,
@@ -615,7 +661,6 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   EncodeBlockHeader(header, block_page);
   BlockHeader decoded_header{};
   ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
-  ASSERT_TRUE(decoded_header.block_id_ == block_id);
   ASSERT_TRUE(decoded_header.allocation_epoch_ == header.allocation_epoch_);
 
   // Double-slot resolution: the valid slot with the larger

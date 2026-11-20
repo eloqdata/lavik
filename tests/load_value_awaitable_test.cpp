@@ -1065,7 +1065,6 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     std::vector<std::byte> bytes(
         AlignDirect(kBlockHeaderBytes + value_.size()));
     BlockHeader header;
-    header.block_id_ = owner + 1;
     header.allocation_epoch_ = 7;
     header.kind_ = BlockKind::kPayloadExtent;
     header.extent_no_crc_ = no_crc;

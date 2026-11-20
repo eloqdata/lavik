@@ -78,6 +78,11 @@ class ScopedEnvironment {
   std::optional<std::string> old_;
 };
 
+struct ScannedBlock {
+  std::uint64_t block_id_;
+  BlockKind kind_;
+};
+
 class PrivateDisk {
  public:
   explicit PrivateDisk(
@@ -106,7 +111,9 @@ class PrivateDisk {
   void VisitRecords(Visit visit, bool include_indirect_keys = false) const {
     std::ifstream input(path_, std::ios::binary);
     std::vector<std::byte> bytes(kStorageBlockBytes);
-    while (input.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
+    for (std::uint64_t id = 0;
+         input.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+         ++id) {
       BlockHeader block;
       if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
                                       bytes.data(), kBlockHeaderBytes),
@@ -132,7 +139,7 @@ class PrivateDisk {
             reinterpret_cast<const char*>(bytes.data() + offset +
                                           record.header_bytes_),
             record.payload_bytes_);
-        visit(block, record, key, payload);
+        visit(ScannedBlock{id, block.kind_}, record, key, payload);
         offset += record.total_disk_bytes_;
       }
     }
@@ -144,7 +151,7 @@ class PrivateDisk {
   Auxiliaries(std::string_view wanted) const {
     std::map<std::uint64_t, std::set<std::pair<std::uint64_t, unsigned>>>
         result;
-    VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+    VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                      std::string_view key, std::string_view) {
       if (record.auxiliary_group_ && key == wanted)
         result[record.mutation_sequence_].emplace(record.group_prefix_,
@@ -159,7 +166,7 @@ class PrivateDisk {
   std::optional<bool> LatestRootGrouped(std::string_view wanted) const {
     std::optional<bool> result;
     std::uint64_t sequence = 0;
-    VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+    VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                      std::string_view key, std::string_view) {
       if (!record.auxiliary_group_ && key == wanted &&
           record.mutation_sequence_ >= sequence) {
@@ -182,7 +189,7 @@ class PrivateDisk {
   KeyLayout IndirectKeyLayout() const {
     KeyLayout layout;
     VisitRecords(
-        [&](const BlockHeader& block, const RecordHeader& record,
+        [&](const ScannedBlock& block, const RecordHeader& record,
             std::string_view key, std::string_view) {
           if (block.kind_ == BlockKind::kIndirectKeys) {
             Check(key.size() == sizeof(IndirectKeyId), "invalid key UUID size");
@@ -206,7 +213,7 @@ class PrivateDisk {
   // Use this only with fixtures whose entire disk contains the target keys.
   std::size_t GroupedStringRootCount() const {
     std::size_t count = 0;
-    VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+    VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                      std::string_view, std::string_view) {
       if (!record.auxiliary_group_ && record.grouped_ &&
           record.value_type_ == ValueType::kString)

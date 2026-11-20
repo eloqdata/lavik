@@ -117,7 +117,7 @@ absl::StatusOr<std::string> StorageEngine::Impl::EncodePromotionBase(
   }
   std::string output;
   PutU64(&output, kPromotionBaseMagic);
-  PutU32(&output, kStorageFormatVersion);
+  PutU32(&output, kCommonFormatVersion);
   PutU32(&output, static_cast<std::uint32_t>(
                       base.parent_frontier_.flow_cursors_.size()));
   PutU64(&output, base.population_token_.generation_);
@@ -154,7 +154,7 @@ absl::StatusOr<PromotionBase> StorageEngine::Impl::DecodePromotionBase(
   PromotionBase base;
   if (encoded.size() > kMaxPromotionBaseBytes ||
       !GetU64(encoded, &offset, &magic) || magic != kPromotionBaseMagic ||
-      !GetU32(encoded, &offset, &version) || version != kStorageFormatVersion ||
+      !GetU32(encoded, &offset, &version) || version != kCommonFormatVersion ||
       !GetU32(encoded, &offset, &flow_count) || flow_count == 0 ||
       !GetU64(encoded, &offset, &base.population_token_.generation_) ||
       !GetU64(encoded, &offset, &base.population_token_.digest_) ||
@@ -218,7 +218,7 @@ absl::StatusOr<std::string> StorageEngine::Impl::EncodeSystemStateManifest(
   output.reserve(kSystemStateManifestHeaderBytes + ref_count * 24 +
                  promotion.size());
   PutU64(&output, kSystemStateManifestMagic);
-  PutU32(&output, kStorageFormatVersion);
+  PutU32(&output, kCommonFormatVersion);
   PutU32(&output, flags);
   PutU64(&output, state.generation_);
   PutU64(&output, state.catalog_token_.catalog_generation_);
@@ -267,7 +267,7 @@ StorageEngine::Impl::DecodeSystemStateManifest(std::string_view encoded) {
   std::uint64_t proof_bytes = 0;
   DurableSystemState state;
   if (!GetU64(encoded, &offset, &magic) || magic != kSystemStateManifestMagic ||
-      !GetU32(encoded, &offset, &version) || version != kStorageFormatVersion ||
+      !GetU32(encoded, &offset, &version) || version != kCommonFormatVersion ||
       !GetU32(encoded, &offset, &flags) ||
       (flags & ~(kCatalogPresent | kPromotionPresent | kFullSyncInProgress |
                  kCatalogReady)) != 0 ||
@@ -437,7 +437,7 @@ absl::Status StorageEngine::Impl::LoadSystemState(FixedBuffer read_buffer) {
                                     bytes.data(), kBlockHeaderBytes),
                                 &header) ||
         header.kind_ != BlockKind::kPayloadExtent ||
-        header.extent_no_crc_ != 0 || header.block_id_ != ref.block_id_ ||
+        header.extent_no_crc_ != 0 ||
         header.allocation_epoch_ != ref.allocation_epoch_ ||
         header.extent_index_ != expected_index ||
         header.extent_payload_bytes_ != ref.payload_bytes_ ||
@@ -645,7 +645,7 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
 
   const SystemStateRoot root{
       .magic_ = kSystemStateRootMagic,
-      .version_ = kStorageFormatVersion,
+      .version_ = kCommonFormatVersion,
       .root_bytes_ = sizeof(SystemStateRoot),
       .generation_ = next.generation_,
       .manifest_ = new_manifest->front(),

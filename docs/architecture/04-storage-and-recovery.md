@@ -199,7 +199,19 @@ Every data block is 8 MiB:
 records or extent payload
 ```
 
-The alternating header slots record block identity, writer topology,
+Device label version 2 admits both block header formats. Startup upgrades
+version 1 labels before new block writes so older binaries reject the storage
+set. Version and member-count updates first sync a tagged copy of the old label
+to the last 4 KiB page of the metadata padding. Startup uses this copy if the
+primary tears, then clears it after the replacement primary is durable.
+Legacy blocks need no rewrite. Each slot carries its own format version.
+Recovery derives the physical block ID from the device and slot address for
+both versions. The historical ID field in v1 participates only in the CRC.
+Both layouts place the version at byte 16. The v2 prefix occupies 112 bytes and
+stores the allocation epoch at byte 8. The CRC checks the contents of the 4 KiB
+slot. A byte-for-byte copy at another address also passes this check.
+
+The alternating header slots record writer topology,
 allocation epoch, committed boundary, record count, maximum physical LSN,
 header sequence, kind, and kind-specific metadata. Slot selection prefers the
 higher allocation epoch and then the higher header sequence. Current block
@@ -437,9 +449,7 @@ Recovery proceeds as follows:
    owners. A clear allocation bit is authoritative and skips block I/O. A set
    bit leads to a header read.
 2. An all-zero or wholly invalid header on an allocated block is a permitted
-   activation false positive and becomes reusable. A valid header whose
-   embedded block ID does not match its physical location is stale media and
-   is ignored without rewriting the bitmap. A valid temporary Redis export
+   activation false positive and becomes reusable. A valid temporary Redis export
    block is also reclaimed immediately; a new process has no matching PSYNC
    session or continuation cursor.
 3. A valid extent header contributes extent identity. With a validated
@@ -1365,7 +1375,7 @@ Current test evidence includes:
 | `tests/multi_exec_e2e_test.cpp` | Function LOAD/RESTORE/DELETE/FLUSH durability and startup recovery |
 | `tests/storage_capacity_test.cpp` | Existing-file requirement, alignment and minimum capacity, persisted capacity, expansion membership, foreign-device rejection, and explicit reset |
 | `tests/extent_recovery_e2e_test.cpp` | External keys and values, manifest/extent recovery, reclamation, and repeated worker-count changes |
-| `tests/flushdb_reclaim_e2e_test.cpp` | Full-device FLUSHDB reclaim, paused-defrag exhaustion and resume, expiry escape valve, stale activated-header handling, and a crash after durable defrag source retirement |
+| `tests/flushdb_reclaim_e2e_test.cpp` | Full-device FLUSHDB reclaim, paused-defrag exhaustion and resume, expiry escape valve, legacy header recovery, and a crash after durable defrag source retirement |
 | `tests/ttl_e2e_test.cpp` | TTL mutation, disk-resident rewrite, expired/live restart behavior, and extent-backed values |
 | `tests/tomb_raider_e2e_test.cpp` | Runtime scheduling, retain/reap behavior for buried persistent or expired values, user OFF completion semantics, population-change drains, and FLUSH generation invalidation |
 | `tests/multikey_e2e_test.cpp` | Bounded disk MGET waves, commit batching and fence merging, transaction-block retirement, recovery, FLUSHDB invalidation, rollback, and retry |

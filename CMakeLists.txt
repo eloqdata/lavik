@@ -2145,11 +2145,11 @@ endforeach()
     )
     set_tests_properties(lavik_paused_defrag_full_e2e PROPERTIES TIMEOUT 120)
     add_test(
-      NAME lavik_stale_block_recovery_e2e
+      NAME lavik_legacy_header_recovery_e2e
       COMMAND lavik_flushdb_reclaim_e2e_test $<TARGET_FILE:lavik>
-              --stale-header-only
+              --legacy-header-only
     )
-    set_tests_properties(lavik_stale_block_recovery_e2e PROPERTIES TIMEOUT 60)
+    set_tests_properties(lavik_legacy_header_recovery_e2e PROPERTIES TIMEOUT 60)
 
     add_executable(lavik_tomb_raider_e2e_test
       tests/tomb_raider_e2e_test.cpp

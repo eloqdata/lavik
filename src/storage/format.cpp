@@ -400,7 +400,7 @@ void EncodeSystemStateRoot(const SystemStateRoot& root,
   assert(output.size() >= sizeof(SystemStateRoot));
   std::fill(output.begin(), output.end(), std::byte{0});
   StoreLittleEndian64(output, 0, kSystemStateRootMagic);
-  StoreLittleEndian32(output, 8, kStorageFormatVersion);
+  StoreLittleEndian32(output, 8, kCommonFormatVersion);
   StoreLittleEndian32(output, 12, sizeof(SystemStateRoot));
   StoreLittleEndian64(output, 16, root.generation_);
   StoreLittleEndian64(output, 24, root.manifest_.block_id_);
@@ -414,7 +414,7 @@ bool DecodeSystemStateRoot(std::span<const std::byte> input,
                            SystemStateRoot* root) noexcept {
   if (root == nullptr || input.size() < sizeof(SystemStateRoot) ||
       LoadLittleEndian64(input.data()) != kSystemStateRootMagic ||
-      LoadLittleEndian32(input.data() + 8) != kStorageFormatVersion ||
+      LoadLittleEndian32(input.data() + 8) != kCommonFormatVersion ||
       LoadLittleEndian32(input.data() + 12) != sizeof(SystemStateRoot)) {
     return false;
   }
@@ -457,7 +457,8 @@ bool DecodeDeviceLabel(std::span<const std::byte, kDirectIoAlignment> input,
   DeviceLabel decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
   if (decoded.magic_ != kDeviceLabelMagic ||
-      decoded.version_ != kStorageFormatVersion ||
+      (decoded.version_ != kStorageFormatVersionLegacyV1 &&
+       decoded.version_ != kStorageFormatVersion) ||
       decoded.header_bytes_ != kDirectIoAlignment ||
       decoded.storage_set_id_ == 0 || decoded.device_id_ >= kDeviceIdLimit ||
       decoded.capacity_blocks_ < 2 ||
@@ -487,7 +488,7 @@ void EncodeMetadataPage(
   std::fill(output.begin(), output.end(), std::byte{0});
   MetadataPageHeader header{
       .magic_ = kMetadataPageMagic,
-      .version_ = kStorageFormatVersion,
+      .version_ = kCommonFormatVersion,
       .kind_ = kind,
       .header_bytes_ = sizeof(MetadataPageHeader),
       .page_index_ = page_index,
@@ -512,7 +513,7 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
   MetadataPageHeader header{};
   std::memcpy(&header, input.data(), sizeof(header));
   if (header.magic_ != kMetadataPageMagic ||
-      header.version_ != kStorageFormatVersion ||
+      header.version_ != kCommonFormatVersion ||
       header.kind_ != expected_kind ||
       header.header_bytes_ != sizeof(MetadataPageHeader) ||
       header.page_index_ != expected_page_index || header.generation_ == 0 ||
@@ -535,62 +536,91 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
   return true;
 }
 
+namespace {
+// Frozen layout of a v1 slot. Its version discriminator is shared with v2.
+struct BlockHeaderLegacyV1 {
+  std::uint64_t magic_;
+  std::uint64_t unused_block_id_;  // Retained only for the v1 layout and CRC.
+  std::uint32_t version_;
+  std::uint32_t header_bytes_;
+  std::uint32_t block_bytes_;
+  std::uint32_t writer_id_;
+  std::uint64_t allocation_epoch_;
+  std::uint32_t committed_bytes_;
+  std::uint32_t record_count_;
+  std::uint64_t max_lsn_;
+  std::uint32_t header_sequence_;
+  std::uint32_t checksum_;
+  std::uint32_t layout_worker_count_;
+  BlockKind kind_;
+  std::uint8_t extent_no_crc_;
+  std::array<std::uint8_t, 2> reserved_;
+  std::uint32_t extent_index_;
+  std::uint32_t extent_payload_bytes_;
+  std::uint32_t extent_payload_checksum_;
+  std::array<std::uint64_t, 3> reserved_runtime_;
+  std::uint64_t checkpoint_generation_;
+};
+static_assert(sizeof(BlockHeaderLegacyV1) == 120);
+static_assert(offsetof(BlockHeaderLegacyV1, version_) ==
+              offsetof(BlockHeader, version_));
+
+[[gnu::cold, gnu::noinline]] void DecodeLegacyBlockFields(
+    std::span<const std::byte, kBlockHeaderSlotBytes> page,
+    BlockHeader& header) noexcept {
+  BlockHeaderLegacyV1 legacy;
+  std::memcpy(&legacy, page.data(), sizeof(legacy));
+  header = BlockHeader{
+      .magic_ = legacy.magic_,
+      .allocation_epoch_ = legacy.allocation_epoch_,
+      .version_ = legacy.version_,
+      .header_bytes_ = legacy.header_bytes_,
+      .block_bytes_ = legacy.block_bytes_,
+      .writer_id_ = legacy.writer_id_,
+      .committed_bytes_ = legacy.committed_bytes_,
+      .record_count_ = legacy.record_count_,
+      .max_lsn_ = legacy.max_lsn_,
+      .header_sequence_ = legacy.header_sequence_,
+      .checksum_ = legacy.checksum_,
+      .layout_worker_count_ = legacy.layout_worker_count_,
+      .kind_ = legacy.kind_,
+      .extent_no_crc_ = legacy.extent_no_crc_,
+      .reserved_ = legacy.reserved_,
+      .extent_index_ = legacy.extent_index_,
+      .extent_payload_bytes_ = legacy.extent_payload_bytes_,
+      .extent_payload_checksum_ = legacy.extent_payload_checksum_,
+      .reserved_runtime_ = legacy.reserved_runtime_,
+      .checkpoint_generation_ = legacy.checkpoint_generation_,
+  };
+}
+}  // namespace
+
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept {
-  std::fill(output.begin(), output.end(), std::byte{0});
+  std::fill(output.begin() + sizeof(BlockHeader), output.end(), std::byte{0});
   BlockHeader encoded = header;
+  encoded.version_ = kStorageFormatVersion;
   encoded.checksum_ = 0;
-  std::memcpy(output.data(), &encoded, sizeof(encoded));
-  encoded.checksum_ = Crc32c(output);
-  std::memcpy(output.data(), &encoded, sizeof(encoded));
-}
-
-bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
-                            BlockHeader* header,
-                            std::uint8_t* active_slot) noexcept {
-  BlockHeader best{};
-  std::uint8_t best_slot = 0;
-  bool found = false;
-  for (std::uint8_t slot = 0; slot < kBlockHeaderSlots; ++slot) {
-    BlockHeader decoded{};
-    if (!DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes>(
-                               input.data() + slot * kBlockHeaderSlotBytes,
-                               kBlockHeaderSlotBytes),
-                           &decoded)) {
-      continue;
-    }
-    if (!found || decoded.allocation_epoch_ > best.allocation_epoch_ ||
-        (decoded.allocation_epoch_ == best.allocation_epoch_ &&
-         decoded.header_sequence_ > best.header_sequence_)) {
-      best = decoded;
-      best_slot = slot;
-      found = true;
-    }
-  }
-  if (!found) {
-    return false;
-  }
-  if (header != nullptr) {
-    *header = best;
-  }
-  if (active_slot != nullptr) {
-    *active_slot = best_slot;
-  }
-  return true;
+  std::memcpy(output.data(), &encoded, sizeof(BlockHeader));
+  const auto checksum = Crc32c(output);
+  std::memcpy(output.data() + offsetof(BlockHeader, checksum_), &checksum,
+              sizeof(checksum));
 }
 
 bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
                        BlockHeader* header) noexcept {
-  if (header == nullptr) {
-    return false;
-  }
+  if (header == nullptr) return false;
   BlockHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
-  if (decoded.magic_ != kBlockMagic || decoded.block_id_ == kInvalidBlockId ||
-      LocalBlockId(decoded.block_id_) == 0 ||
-      decoded.version_ != kStorageFormatVersion ||
-      decoded.header_bytes_ != kBlockHeaderBytes ||
+  if (decoded.magic_ != kBlockMagic) return false;
+  std::size_t checksum_offset = offsetof(BlockHeader, checksum_);
+  if (decoded.version_ != kStorageFormatVersion) [[unlikely]] {
+    if (decoded.version_ != kStorageFormatVersionLegacyV1) return false;
+    DecodeLegacyBlockFields(input, decoded);
+    checksum_offset = offsetof(BlockHeaderLegacyV1, checksum_);
+  }
+  if (decoded.header_bytes_ != kBlockHeaderBytes ||
       decoded.block_bytes_ != kStorageBlockBytes ||
       decoded.layout_worker_count_ == 0 ||
       decoded.layout_worker_count_ > kLogicalStorageShards ||
@@ -645,11 +675,43 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
   std::array<std::byte, kBlockHeaderSlotBytes> copy{};
   std::memcpy(copy.data(), input.data(), copy.size());
   decoded.checksum_ = 0;
-  std::memcpy(copy.data(), &decoded, sizeof(decoded));
-  if (Crc32c(copy) != expected) {
+  std::memcpy(copy.data() + checksum_offset, &decoded.checksum_,
+              sizeof(decoded.checksum_));
+  if (Crc32c(copy) != expected) return false;
+  *header = decoded;
+  return true;
+}
+bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
+                            BlockHeader* header,
+                            std::uint8_t* active_slot) noexcept {
+  BlockHeader best{};
+  std::uint8_t best_slot = 0;
+  bool found = false;
+  for (std::uint8_t slot = 0; slot < kBlockHeaderSlots; ++slot) {
+    BlockHeader decoded{};
+    if (!DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes>(
+                               input.data() + slot * kBlockHeaderSlotBytes,
+                               kBlockHeaderSlotBytes),
+                           &decoded)) {
+      continue;
+    }
+    if (!found || decoded.allocation_epoch_ > best.allocation_epoch_ ||
+        (decoded.allocation_epoch_ == best.allocation_epoch_ &&
+         decoded.header_sequence_ > best.header_sequence_)) {
+      best = decoded;
+      best_slot = slot;
+      found = true;
+    }
+  }
+  if (!found) {
     return false;
   }
-  *header = decoded;
+  if (header != nullptr) {
+    *header = best;
+  }
+  if (active_slot != nullptr) {
+    *active_slot = best_slot;
+  }
   return true;
 }
 
@@ -911,7 +973,7 @@ bool EncodeReplicationFrameHeader(
     const ReplicationFrameHeader& header,
     std::span<std::byte, sizeof(ReplicationFrameHeader)> output) noexcept {
   if (header.magic_ != kReplicationFrameMagic ||
-      header.version_ != kStorageFormatVersion ||
+      header.version_ != kCommonFormatVersion ||
       header.header_bytes_ != sizeof(ReplicationFrameHeader) ||
       header.lsn_ == 0 || header.partition_id_ >= kLogicalStorageShards ||
       header.reserved_ != 0 ||

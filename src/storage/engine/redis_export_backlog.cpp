@@ -140,9 +140,8 @@ Task<absl::Status> StorageEngine::Impl::SealRedisExportDiskBlock(
     co_return absl::InternalError("empty Redis export block");
   }
   BlockHeader header{
-      .block_id_ = block.id_,
-      .writer_id_ = static_cast<std::uint32_t>(store.worker_->id()),
       .allocation_epoch_ = block.allocation_epoch_,
+      .writer_id_ = static_cast<std::uint32_t>(store.worker_->id()),
       .committed_bytes_ = block.committed_bytes_,
       .record_count_ = block.frame_count_,
       .layout_worker_count_ = worker_count_,
@@ -359,7 +358,6 @@ StorageEngine::Impl::ReadRedisExportDiskBacklog(std::uint64_t session_id,
                                     buffer.data_, kBlockHeaderBytes),
                                 &decoded) ||
         decoded.kind_ != BlockKind::kRedisExportBacklog ||
-        decoded.block_id_ != block.id_ ||
         decoded.allocation_epoch_ != block.allocation_epoch_ ||
         decoded.committed_bytes_ != block.committed_bytes_) {
       co_return absl::DataLossError("invalid Redis export disk block header");

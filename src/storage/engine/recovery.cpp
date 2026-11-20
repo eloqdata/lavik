@@ -102,7 +102,6 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
                                   io.data_, kBlockHeaderBytes),
                               &header) ||
       header.kind_ != BlockKind::kPayloadExtent ||
-      header.block_id_ != ref.block_id_ ||
       header.allocation_epoch_ != ref.allocation_epoch_ ||
       header.extent_index_ != extent_index ||
       header.extent_payload_bytes_ != ref.payload_bytes_ ||
@@ -392,19 +391,9 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
 
       BlockHeader block{};
       if (!DecodeBlockHeaderPages(block_bytes, &block)) {
-        // Neither slot is valid. A block is allocated before it is ever
-        // flushed, and its first flush zeroes the slot it does not write, so
-        // this means no header ever committed here. Nothing in it was
-        // durable, and the free slot cannot hold a header from an earlier
-        // life, so the block is unused rather than corrupt.
+        // Activation can precede the first flush. A slot with no valid header
+        // is reusable.
         if (!indirect_key_pass) zero_blocks->push_back(block_id);
-        if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
-        continue;
-      }
-      if (block.block_id_ != block_id) {
-        // The bitmap records activation, not a committed write. A valid
-        // header naming another physical block is stale media contents. Do
-        // not recover it and do not rewrite the allocation bitmap.
         if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }

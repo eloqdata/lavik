@@ -466,7 +466,7 @@ TEST(CompactPointWriteE2e, RestoredCollectionsPersistV2SurviveEditsAndRecover) {
   }
   using Version = std::pair<std::uint64_t, std::uint64_t>;
   std::map<std::string, std::pair<Version, std::string>> latest;
-  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+  disk.VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                         std::string_view key, std::string_view payload) {
     if (key != "unchanged" && key != "restored-list") return;
     if (record.auxiliary_group_) return;

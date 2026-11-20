@@ -81,8 +81,10 @@ lavik \
 
 For a raw block device, first verify the exact device and that it is neither
 mounted nor in use. Prefer a genuinely empty or fully sanitized device. A
-device that has never held Lavik data already has a zero label. Clearing only
-the 4 KiB label of a former Lavik member makes it eligible as a new member,
+device that has never held Lavik data already has a zero label. If a label
+upgrade was interrupted, reopen the original set to finish it before clearing
+the label. Clearing the 4 KiB label of a cleanly stopped former member makes
+it eligible as a new member,
 but does not provide secure erasure or a crash-safe stale-media sanitization
 guarantee:
 
@@ -139,11 +141,13 @@ Data begins at the next 8 MiB boundary; it is not hard-coded to local block
 one. See the current
 [storage and recovery architecture](../architecture/04-storage-and-recovery.md).
 
-This build writes the current storage format version 1 and does not detect or
-preserve compatibility with pre-deployment layouts that previously reused
-that version. Such media is unsupported. Moving between incompatible
-development layouts requires a backup plus reset/restore, or a full sync from
-a compatible source; replacing only the binary is not sufficient.
+Opening a supported version 1 storage set upgrades its device labels to
+version 2 after read-only preflight. Restart with the same member set if the
+upgrade is interrupted. Startup recovers a torn label from the copy in
+metadata padding. Existing blocks remain readable in place.
+Older binaries reject the upgraded labels. To retain a downgrade path,
+keep a pre-upgrade backup. Obsolete pre-deployment layouts that reused the
+version 1 number still require reset/restore or full sync.
 
 ## Per-device allocator ownership
 
