@@ -118,7 +118,7 @@ TEST(StorageFormatTest, MixedLocationDerivedAndLegacySlots) {
                           [](std::byte b) { return b == std::byte{}; }));
   ASSERT_TRUE(DecodeBlockHeaderPages(destination, pages, &header));
   EXPECT_EQ(header.block_id_, destination);
-  EXPECT_EQ(header.version_, kLocationDerivedHeaderVersion);
+  EXPECT_EQ(header.version_, kStorageFormatVersion);
   current.back() ^= std::byte{1};
   ASSERT_TRUE(DecodeBlockHeaderPages(destination, pages, &header));
   EXPECT_EQ(header.block_id_, source);
@@ -531,7 +531,8 @@ TEST(StorageFormatTest, ComputesRedisClusterSlotsAndHashTags) {
 
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   using namespace lavik::storage;
-  static_assert(kStorageFormatVersion == 1);
+  static_assert(kStorageFormatVersionLegacyV1 == 1);
+  static_assert(kStorageFormatVersion == 2);
 
   constexpr std::uint64_t device_id = kDeviceIdLimit - 2;
   constexpr std::uint32_t local_block =
@@ -544,7 +545,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   DeviceLabel label{
       .magic_ = kDeviceLabelMagic,
-      .version_ = kStorageFormatVersion,
+      .version_ = kStorageFormatVersionLegacyV1,
       .header_bytes_ = kDirectIoAlignment,
       .storage_set_id_ = 17,
       .device_id_ = device_id,
@@ -599,7 +600,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   SystemStateRoot system_root{
       .magic_ = kSystemStateRootMagic,
-      .version_ = kStorageFormatVersion,
+      .version_ = kStorageFormatVersionLegacyV1,
       .root_bytes_ = sizeof(SystemStateRoot),
       .generation_ = 41,
       .manifest_ =

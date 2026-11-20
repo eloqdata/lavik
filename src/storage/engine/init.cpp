@@ -719,7 +719,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       if (!system_state_installed.ok()) return system_state_installed;
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,
-          .version_ = kLocationDerivedHeaderVersion,
+          .version_ = kStorageFormatVersion,
           .header_bytes_ = kDirectIoAlignment,
           .storage_set_id_ = storage_set_id,
           .device_id_ = assigned_device_ids[i],
@@ -755,7 +755,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     for (std::size_t i = 0; i < labels.size(); ++i) {
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,
-          .version_ = kLocationDerivedHeaderVersion,
+          .version_ = kStorageFormatVersion,
           .header_bytes_ = kDirectIoAlignment,
           .storage_set_id_ = storage_set_id,
           .device_id_ = assigned_device_ids[i],
@@ -776,8 +776,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   // Fence downgrade on every member before admitting any new block writes.
   // Mixed label versions after interruption are safe to resume.
   for (std::size_t i = 0; i < labels.size(); ++i) {
-    if (labels[i]->version_ == kLocationDerivedHeaderVersion) continue;
-    labels[i]->version_ = kLocationDerivedHeaderVersion;
+    if (labels[i]->version_ == kStorageFormatVersion) continue;
+    labels[i]->version_ = kStorageFormatVersion;
     auto status = WriteDeviceLabel(
         options_.data_files_[i], *labels[i],
         device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_);

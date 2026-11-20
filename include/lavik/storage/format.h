@@ -35,12 +35,12 @@ inline constexpr std::size_t kBlockHeaderBytes =
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-// Base format for records and metadata. Obsolete development signatures
-// predate system-state lineage and are rejected.
-inline constexpr std::uint32_t kStorageFormatVersion = 1;
+// Unchanged payload and metadata layouts keep their v1 encoding, including
+// formats shared with replication and RDB export.
+inline constexpr std::uint32_t kStorageFormatVersionLegacyV1 = 1;
 // Device labels fence older readers before writers emit location-derived
 // headers.
-inline constexpr std::uint32_t kLocationDerivedHeaderVersion = 2;
+inline constexpr std::uint32_t kStorageFormatVersion = 2;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
                                                     << kLocalBlockIdBits;
@@ -82,7 +82,7 @@ enum class MetadataPageKind : std::uint16_t {
 
 struct MetadataPageHeader {
   std::uint64_t magic_ = kMetadataPageMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kStorageFormatVersionLegacyV1;
   MetadataPageKind kind_ = MetadataPageKind::kEpochs;
   std::uint16_t header_bytes_ = 0;
   std::uint32_t page_index_ = 0;
@@ -290,7 +290,7 @@ enum class ValueType : std::uint8_t {
 struct BlockHeader {
   std::uint64_t magic_ = kBlockMagic;
   std::uint64_t block_id_ = kInvalidBlockId;
-  std::uint32_t version_ = kLocationDerivedHeaderVersion;
+  std::uint32_t version_ = kStorageFormatVersion;
   std::uint32_t header_bytes_ = kBlockHeaderBytes;
   std::uint32_t block_bytes_ = kStorageBlockBytes;
   std::uint32_t writer_id_ = 0;
@@ -324,7 +324,7 @@ struct BlockHeader {
 // in memory.
 struct ReplicationFrameHeader {
   std::uint64_t magic_ = kReplicationFrameMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kStorageFormatVersionLegacyV1;
   std::uint16_t header_bytes_ = 0;
   ReplicationEventKind kind_ = ReplicationEventKind::kMutation;
   std::uint8_t flags_ = 0;
@@ -343,7 +343,7 @@ struct ReplicationFrameHeader {
 // metadata follows this label, and data begins at DataBlockBegin(capacity).
 struct DeviceLabel {
   std::uint64_t magic_ = kDeviceLabelMagic;
-  std::uint32_t version_ = kLocationDerivedHeaderVersion;
+  std::uint32_t version_ = kStorageFormatVersion;
   std::uint32_t header_bytes_ = kDirectIoAlignment;
   std::uint64_t storage_set_id_ = 0;
   std::uint64_t device_id_ = 0;
@@ -417,7 +417,7 @@ struct RecordHeader {
 
 struct ExtentManifestHeader {
   std::uint64_t magic_ = kExtentManifestMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kStorageFormatVersionLegacyV1;
   std::uint32_t extent_count_ = 0;
 };
 
@@ -437,7 +437,7 @@ struct ExtentRef {
 // the same valid value.
 struct SystemStateRoot {
   std::uint64_t magic_ = kSystemStateRootMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kStorageFormatVersionLegacyV1;
   std::uint32_t root_bytes_ = 0;
   std::uint64_t generation_ = 0;
   ExtentRef manifest_{};

@@ -691,7 +691,7 @@ TEST(GroupedHashTest, CompactEncodingMatchesAppendReferenceAtUnalignedLengths) {
       reference.push_back(static_cast<char>(number >> (8 * i)));
   };
   append_integer(kHashValueMagic, 8);
-  append_integer(kStorageFormatVersion, 4);
+  append_integer(kStorageFormatVersionLegacyV1, 4);
   append_integer(kHashValueHeaderBytes, 4);
   append_integer(value.entries_.size(), 4);
   append_integer(0, 4);

@@ -400,7 +400,7 @@ void EncodeSystemStateRoot(const SystemStateRoot& root,
   assert(output.size() >= sizeof(SystemStateRoot));
   std::fill(output.begin(), output.end(), std::byte{0});
   StoreLittleEndian64(output, 0, kSystemStateRootMagic);
-  StoreLittleEndian32(output, 8, kStorageFormatVersion);
+  StoreLittleEndian32(output, 8, kStorageFormatVersionLegacyV1);
   StoreLittleEndian32(output, 12, sizeof(SystemStateRoot));
   StoreLittleEndian64(output, 16, root.generation_);
   StoreLittleEndian64(output, 24, root.manifest_.block_id_);
@@ -414,7 +414,7 @@ bool DecodeSystemStateRoot(std::span<const std::byte> input,
                            SystemStateRoot* root) noexcept {
   if (root == nullptr || input.size() < sizeof(SystemStateRoot) ||
       LoadLittleEndian64(input.data()) != kSystemStateRootMagic ||
-      LoadLittleEndian32(input.data() + 8) != kStorageFormatVersion ||
+      LoadLittleEndian32(input.data() + 8) != kStorageFormatVersionLegacyV1 ||
       LoadLittleEndian32(input.data() + 12) != sizeof(SystemStateRoot)) {
     return false;
   }
@@ -457,8 +457,8 @@ bool DecodeDeviceLabel(std::span<const std::byte, kDirectIoAlignment> input,
   DeviceLabel decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
   if (decoded.magic_ != kDeviceLabelMagic ||
-      (decoded.version_ != kStorageFormatVersion &&
-       decoded.version_ != kLocationDerivedHeaderVersion) ||
+      (decoded.version_ != kStorageFormatVersionLegacyV1 &&
+       decoded.version_ != kStorageFormatVersion) ||
       decoded.header_bytes_ != kDirectIoAlignment ||
       decoded.storage_set_id_ == 0 || decoded.device_id_ >= kDeviceIdLimit ||
       decoded.capacity_blocks_ < 2 ||
@@ -488,7 +488,7 @@ void EncodeMetadataPage(
   std::fill(output.begin(), output.end(), std::byte{0});
   MetadataPageHeader header{
       .magic_ = kMetadataPageMagic,
-      .version_ = kStorageFormatVersion,
+      .version_ = kStorageFormatVersionLegacyV1,
       .kind_ = kind,
       .header_bytes_ = sizeof(MetadataPageHeader),
       .page_index_ = page_index,
@@ -513,7 +513,7 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
   MetadataPageHeader header{};
   std::memcpy(&header, input.data(), sizeof(header));
   if (header.magic_ != kMetadataPageMagic ||
-      header.version_ != kStorageFormatVersion ||
+      header.version_ != kStorageFormatVersionLegacyV1 ||
       header.kind_ != expected_kind ||
       header.header_bytes_ != sizeof(MetadataPageHeader) ||
       header.page_index_ != expected_page_index || header.generation_ == 0 ||
@@ -541,7 +541,7 @@ void EncodeBlockHeader(
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept {
   std::fill(output.begin(), output.end(), std::byte{0});
   BlockHeader encoded = header;
-  encoded.version_ = kLocationDerivedHeaderVersion;
+  encoded.version_ = kStorageFormatVersion;
   encoded.block_id_ = 0;
   encoded.checksum_ = 0;
   std::memcpy(output.data(), &encoded, sizeof(encoded));
@@ -593,11 +593,11 @@ bool DecodeBlockHeader(std::uint64_t physical_block_id,
   }
   BlockHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
-  const bool derived = decoded.version_ == kLocationDerivedHeaderVersion;
+  const bool derived = decoded.version_ == kStorageFormatVersion;
   const auto id = derived ? physical_block_id : decoded.block_id_;
   if (decoded.magic_ != kBlockMagic || id == kInvalidBlockId ||
       LocalBlockId(id) == 0 || (derived && decoded.block_id_ != 0) ||
-      (!derived && decoded.version_ != kStorageFormatVersion) ||
+      (!derived && decoded.version_ != kStorageFormatVersionLegacyV1) ||
       decoded.header_bytes_ != kBlockHeaderBytes ||
       decoded.block_bytes_ != kStorageBlockBytes ||
       decoded.layout_worker_count_ == 0 ||
@@ -920,7 +920,7 @@ bool EncodeReplicationFrameHeader(
     const ReplicationFrameHeader& header,
     std::span<std::byte, sizeof(ReplicationFrameHeader)> output) noexcept {
   if (header.magic_ != kReplicationFrameMagic ||
-      header.version_ != kStorageFormatVersion ||
+      header.version_ != kStorageFormatVersionLegacyV1 ||
       header.header_bytes_ != sizeof(ReplicationFrameHeader) ||
       header.lsn_ == 0 || header.partition_id_ >= kLogicalStorageShards ||
       header.reserved_ != 0 ||

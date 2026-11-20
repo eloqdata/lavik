@@ -2051,7 +2051,7 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
         !reader.Le32(&header) || !reader.Le32(&count) ||
         !reader.Le32(&reserved) || !reader.Le64(&bytes) ||
         magic != storage::kHashValueMagic ||
-        version != storage::kStorageFormatVersion || header != 32 ||
+        version != storage::kStorageFormatVersionLegacyV1 || header != 32 ||
         reserved != 0 || bytes != input.size() || count == 0 ||
         count != raw.logical_size_)
       return Bad("invalid Lavik Hash header");
@@ -2172,7 +2172,7 @@ void AppendHashRaw(std::string* output, const Pairs& pairs) {
   for (const auto& [field, value] : pairs)
     bytes += 8 + field.size() + value.size();
   PutLe64(output, storage::kHashValueMagic);
-  PutLe32(output, storage::kStorageFormatVersion);
+  PutLe32(output, storage::kStorageFormatVersionLegacyV1);
   PutLe32(output, 32);
   PutLe32(output, static_cast<std::uint32_t>(pairs.size()));
   PutLe32(output, 0);

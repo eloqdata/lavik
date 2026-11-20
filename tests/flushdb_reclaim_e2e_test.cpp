@@ -442,7 +442,7 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
       if (committed_local == 0) {
         // Only legacy headers carry a source location. Manufacture that wire
         // format to exercise the stale-media branch on an upgraded device.
-        decoded.version_ = lavik::storage::kStorageFormatVersion;
+        decoded.version_ = lavik::storage::kStorageFormatVersionLegacyV1;
         decoded.checksum_ = 0;
         std::memcpy(committed.data(), &decoded, sizeof(decoded));
         decoded.checksum_ = lavik::storage::Crc32c(
