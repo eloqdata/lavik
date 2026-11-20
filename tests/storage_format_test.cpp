@@ -555,15 +555,20 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
       .block_bytes_ = kStorageBlockBytes,
   };
   std::array<std::byte, kDirectIoAlignment> label_page{};
-  EncodeDeviceLabel(label, label_page);
-  DeviceLabel decoded_label{};
-  ASSERT_TRUE(DecodeDeviceLabel(label_page, &decoded_label));
-  ASSERT_TRUE(decoded_label.storage_set_id_ == label.storage_set_id_);
-  ASSERT_TRUE(decoded_label.device_id_ == label.device_id_);
-  ASSERT_TRUE(decoded_label.capacity_blocks_ == label.capacity_blocks_);
-  ASSERT_TRUE(decoded_label.device_count_ == label.device_count_);
-  label_page.back() ^= std::byte{1};
-  ASSERT_TRUE(!DecodeDeviceLabel(label_page, &decoded_label));
+  for (const auto version :
+       {kStorageFormatVersionLegacyV1, kStorageFormatVersion}) {
+    label.version_ = version;
+    EncodeDeviceLabel(label, label_page);
+    DeviceLabel decoded_label{};
+    ASSERT_TRUE(DecodeDeviceLabel(label_page, &decoded_label));
+    EXPECT_EQ(decoded_label.version_, version);
+    ASSERT_TRUE(decoded_label.storage_set_id_ == label.storage_set_id_);
+    ASSERT_TRUE(decoded_label.device_id_ == label.device_id_);
+    ASSERT_TRUE(decoded_label.capacity_blocks_ == label.capacity_blocks_);
+    ASSERT_TRUE(decoded_label.device_count_ == label.device_count_);
+    label_page.back() ^= std::byte{1};
+    ASSERT_TRUE(!DecodeDeviceLabel(label_page, &decoded_label));
+  }
 
   std::array<std::byte, 37> metadata_payload{};
   for (std::size_t i = 0; i < metadata_payload.size(); ++i) {

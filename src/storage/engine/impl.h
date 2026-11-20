@@ -1219,24 +1219,6 @@ inline absl::Status WriteExactlyAt(const std::string& path,
   return status;
 }
 
-inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
-    const std::string& path, FixedBuffer scratch = {}) {
-  std::array<std::byte, kDirectIoAlignment> page{};
-  absl::Status status = ReadExactlyAt(path, page, kDeviceLabelOffset, scratch);
-  if (!status.ok()) {
-    return status;
-  }
-  if (IsZero(page)) {
-    return std::optional<DeviceLabel>{};
-  }
-  DeviceLabel label{};
-  if (!DecodeDeviceLabel(page, &label)) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "invalid or corrupt device label: " + path);
-  }
-  return std::optional<DeviceLabel>{label};
-}
-
 inline absl::Status WriteDeviceLabel(const std::string& path,
                                      const DeviceLabel& label,
                                      FixedBuffer scratch = {}) {

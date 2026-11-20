@@ -201,11 +201,15 @@ records or extent payload
 
 Device label version 2 admits both block header formats. Startup upgrades
 version 1 labels before new block writes so older binaries reject the storage
-set. Legacy blocks need no rewrite. Each slot carries its own format version.
+set. Version and member-count updates first sync a tagged copy of the old label
+to the last 4 KiB page of the metadata padding. Startup uses this copy if the
+primary tears, then clears it after the replacement primary is durable.
+Legacy blocks need no rewrite. Each slot carries its own format version.
 Recovery derives the physical block ID from the device and slot address for
 both versions. The historical ID field in v1 participates only in the CRC.
 Both layouts place the version at byte 16. The v2 prefix occupies 112 bytes and
-stores the allocation epoch at byte 8. The CRC covers the entire 4 KiB slot.
+stores the allocation epoch at byte 8. The CRC checks the contents of the 4 KiB
+slot. A byte-for-byte copy at another address also passes this check.
 
 The alternating header slots record writer topology,
 allocation epoch, committed boundary, record count, maximum physical LSN,

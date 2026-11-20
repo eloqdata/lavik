@@ -890,6 +890,60 @@ TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {
   ASSERT_CHECK(!Prepare({missing}).ok(), "missing storage path was created");
 }
 
+TEST(StorageCapacityTest, RetriesInterruptedDeviceLabelUpgrade) {
+  using namespace lavik::storage;
+  const std::string path = lavik::test::TestDataPath(
+      "lavik-label-upgrade-" + std::to_string(::getpid()) + ".data");
+  Cleanup cleanup{{path}};
+  ASSERT_TRUE(CreateFile(path, 80 * kMiB));
+  ASSERT_TRUE(Prepare({path}).ok());
+  std::array<std::byte, kDirectIoAlignment> page{};
+  ASSERT_TRUE(ReadExactlyAt(path, page, kDeviceLabelOffset).ok());
+  DeviceLabel original;
+  ASSERT_TRUE(DecodeDeviceLabel(page, &original));
+  original.version_ = kStorageFormatVersionLegacyV1;
+  ASSERT_TRUE(WriteDeviceLabel(path, original).ok());
+
+  // A rejected configuration must leave the original label usable by v1.
+  {
+    StorageEngineOptions options;
+    options.data_files_ = {path};
+    options.flush_size_bytes_ = 1;
+    StorageEngine engine(std::move(options));
+    ASSERT_FALSE(engine.Prepare(1).ok());
+  }
+  ASSERT_TRUE(ReadExactlyAt(path, page, kDeviceLabelOffset).ok());
+  DeviceLabel decoded;
+  ASSERT_TRUE(DecodeDeviceLabel(page, &decoded));
+  ASSERT_EQ(decoded.version_, kStorageFormatVersionLegacyV1);
+
+  // Interrupt between writing the primary's version and its checksum.
+  const auto backup_offset =
+      std::uint64_t{DataBlockBegin(original.capacity_blocks_)} *
+          kStorageBlockBytes -
+      kDirectIoAlignment;
+  auto backup = page;
+  const auto backup_magic = ~kDeviceLabelMagic;
+  std::memcpy(backup.data(), &backup_magic, sizeof(backup_magic));
+  ASSERT_TRUE(WriteExactlyAt(path, backup, backup_offset, true).ok());
+  std::memcpy(page.data() + offsetof(DeviceLabel, version_),
+              &kStorageFormatVersion, sizeof(kStorageFormatVersion));
+  ASSERT_FALSE(DecodeDeviceLabel(page, &decoded));
+  ASSERT_TRUE(WriteExactlyAt(path, page, kDeviceLabelOffset, true).ok());
+  ASSERT_TRUE(GrowFile(path, 88 * kMiB));
+  ASSERT_TRUE(Prepare({path}).ok());
+
+  ASSERT_TRUE(ReadExactlyAt(path, page, kDeviceLabelOffset).ok());
+  ASSERT_TRUE(DecodeDeviceLabel(page, &decoded));
+  EXPECT_EQ(decoded.version_, kStorageFormatVersion);
+  EXPECT_EQ(decoded.storage_set_id_, original.storage_set_id_);
+  EXPECT_EQ(decoded.device_id_, original.device_id_);
+  EXPECT_EQ(decoded.capacity_blocks_, original.capacity_blocks_);
+  EXPECT_EQ(decoded.device_count_, original.device_count_);
+  ASSERT_TRUE(ReadExactlyAt(path, page, backup_offset).ok());
+  EXPECT_TRUE(IsZero(page));
+}
+
 TEST(StorageCapacityTest, ExpandsAnInitializedStorageSet) {
   const std::string prefix = lavik::test::TestDataPath(
       "lavik-storage-expansion-" + std::to_string(::getpid()));
