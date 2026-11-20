@@ -895,7 +895,7 @@ TEST(StorageCapacityTest, RetriesInterruptedDeviceLabelUpgrade) {
   const std::string path = lavik::test::TestDataPath(
       "lavik-label-upgrade-" + std::to_string(::getpid()) + ".data");
   Cleanup cleanup{{path}};
-  ASSERT_TRUE(CreateFile(path, 80 * kMiB));
+  ASSERT_TRUE(CreateFile(path, 10 * kStorageBlockBytes));
   ASSERT_TRUE(Prepare({path}).ok());
   std::array<std::byte, kDirectIoAlignment> page{};
   ASSERT_TRUE(ReadExactlyAt(path, page, kDeviceLabelOffset).ok());
@@ -930,7 +930,7 @@ TEST(StorageCapacityTest, RetriesInterruptedDeviceLabelUpgrade) {
               &kStorageFormatVersion, sizeof(kStorageFormatVersion));
   ASSERT_FALSE(DecodeDeviceLabel(page, &decoded));
   ASSERT_TRUE(WriteExactlyAt(path, page, kDeviceLabelOffset, true).ok());
-  ASSERT_TRUE(GrowFile(path, 88 * kMiB));
+  ASSERT_TRUE(GrowFile(path, 11 * kStorageBlockBytes));
   ASSERT_TRUE(Prepare({path}).ok());
 
   ASSERT_TRUE(ReadExactlyAt(path, page, kDeviceLabelOffset).ok());
