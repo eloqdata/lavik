@@ -440,7 +440,7 @@ absl::Status StorageEngine::Impl::LoadSystemState(FixedBuffer read_buffer) {
                                     bytes.data(), kBlockHeaderBytes),
                                 &header) ||
         header.kind_ != BlockKind::kPayloadExtent ||
-        header.extent_no_crc_ != 0 || header.block_id_ != ref.block_id_ ||
+        header.extent_no_crc_ != 0 ||
         header.allocation_epoch_ != ref.allocation_epoch_ ||
         header.extent_index_ != expected_index ||
         header.extent_payload_bytes_ != ref.payload_bytes_ ||

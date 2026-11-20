@@ -145,7 +145,7 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
   HashDiskLayout result;
   std::uint64_t root_sequence = 0;
   std::vector<RecordHeader> auxiliary;
-  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+  disk.VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                         std::string_view stored_key, std::string_view payload) {
     if (stored_key == key && record.grouped_ && !record.auxiliary_group_ &&
         record.mutation_sequence_ >= root_sequence) {
@@ -1641,7 +1641,7 @@ TEST(StorageReadFallbackE2e, LongKeysAndIndivisibleGroupsWithoutOverflow) {
   // Prove these are large records, not the already-supported extent fallback.
   bool key_record = false, hash_record = false, list_record = false;
   disk.VisitRecords(
-      [&](const BlockHeader& block, const RecordHeader& record,
+      [&](const ScannedBlock& block, const RecordHeader& record,
           std::string_view key, std::string_view payload) {
         if (record.external_ || record.payload_bytes_ <= 24 * 1024) return;
         EXPECT_FALSE(record.no_crc_);

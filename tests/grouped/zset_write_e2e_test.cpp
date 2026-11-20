@@ -121,7 +121,7 @@ TEST(GroupedSortedSetWriteE2e, PreparedPublicationAssignsRevisionAfterWaiting) {
   std::map<std::string, Published> latest;
   std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, RecordHeader>>>
       groups;
-  disk.VisitRecords([&](const BlockHeader& block, const RecordHeader& record,
+  disk.VisitRecords([&](const ScannedBlock& block, const RecordHeader& record,
                         std::string_view key, std::string_view payload) {
     if (key != a && key != b) return;
     if (record.grouped_) {
@@ -275,7 +275,7 @@ TEST(GroupedSortedSetWriteE2e, PublicationRevisionsHaveIndependentDecisions) {
   std::map<std::pair<std::string, std::uint64_t>, Root> roots;
   std::vector<std::pair<std::string, RecordHeader>> auxiliaries;
   std::set<std::uint64_t> decisions;
-  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+  disk.VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                         std::string_view key, std::string_view payload) {
     if (record.kind_ == RecordKind::kTxCommit) {
       decisions.insert(record.txid_);
@@ -348,7 +348,7 @@ TEST(GroupedSortedSetWriteE2e, PublicationRevisionsHaveIndependentDecisions) {
     client.Durable();
   }
   std::uint64_t recovered_revision = 0;
-  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+  disk.VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                         std::string_view key, std::string_view payload) {
     if (key != zset || !record.grouped_ || record.auxiliary_group_) return;
     const auto root = DecodeOrderedCollectionRoot(payload);
@@ -602,7 +602,7 @@ std::optional<OrderedGroupSnapshot> FirstDenseOrderedPage(
     const PrivateDisk& disk, std::string_view key) {
   std::optional<OrderedGroupSnapshot> first;
   std::uint64_t sequence = 0;
-  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+  disk.VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                         std::string_view name, std::string_view payload) {
     if (name != key || !record.auxiliary_group_ || record.external_ ||
         record.group_prefix_bits_ != 0)
@@ -1145,7 +1145,7 @@ ZSetMemberLayout InspectZSetMembers(const PrivateDisk& disk,
   ZSetMemberLayout result;
   std::uint64_t root_sequence = 0;
   std::vector<std::pair<RecordHeader, std::string>> records;
-  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+  disk.VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                         std::string_view name, std::string_view payload) {
     if (name != key) return;
     if (record.grouped_ && !record.auxiliary_group_ &&
@@ -1585,7 +1585,7 @@ TEST(GroupedSortedSetWriteE2e, SamplingReadsLockOnlyTheirWindow) {
       client.Durable();
       const auto layout = InspectZSetMembers(disk, key);
       std::map<std::string, std::uint64_t> ordered_groups;
-      disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+      disk.VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                             std::string_view name, std::string_view payload) {
         if (name != key || !record.auxiliary_group_ ||
             record.group_prefix_bits_ != 0 || record.group_prefix_ == 0)
@@ -2572,7 +2572,7 @@ TEST(GroupedSortedSetWriteE2e, HeadInsertionsReuseNeighborCapacityAndRecover) {
   auto latest_root = [&] {
     std::optional<OrderedCollectionRoot> latest;
     std::uint64_t sequence = 0;
-    disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+    disk.VisitRecords([&](const ScannedBlock&, const RecordHeader& record,
                           std::string_view name, std::string_view payload) {
       if (name != key || record.auxiliary_group_ || !record.grouped_ ||
           record.mutation_sequence_ < sequence)

@@ -285,7 +285,7 @@ enum class ValueType : std::uint8_t {
   kStream = 6,
 };
 
-// The v2 wire prefix ends immediately before the runtime block ID.
+// Current on-disk layout. Each reader already has the physical block address.
 struct BlockHeader {
   std::uint64_t magic_ = kBlockMagic;
   std::uint64_t allocation_epoch_ = 0;
@@ -314,12 +314,9 @@ struct BlockHeader {
   std::array<std::uint64_t, 3> reserved_runtime_{};
   // Only checkpoint blocks carry a metadata generation here.
   std::uint64_t checkpoint_generation_ = 0;
-  std::uint64_t block_id_ = kInvalidBlockId;  // Supplied by the reader.
 };
 
-inline constexpr std::size_t kBlockHeaderV2WireBytes =
-    offsetof(BlockHeader, block_id_);
-static_assert(kBlockHeaderV2WireBytes == 112);
+static_assert(sizeof(BlockHeader) == 112);
 static_assert(offsetof(BlockHeader, version_) == 16);
 
 // A logical replication event may span multiple frames and blocks. Every
@@ -557,9 +554,7 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
                         std::uint64_t* generation,
                         std::span<std::byte> payload) noexcept;
 
-// Write the location-independent slot format. Readers reconstruct its ID from
-// physical_block_id. Legacy slots return their embedded ID for stale-media
-// checks.
+// Write a v2 slot. Decode validates the embedded address of legacy slots.
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept;
@@ -569,11 +564,14 @@ bool DecodeBlockHeader(std::uint64_t physical_block_id,
 
 // Decode the winning slot from a block's full header region: the valid slot
 // with the larger (allocation_epoch, header_sequence). Returns the winning
-// slot index in `active_slot`, or false when neither slot is valid.
+// slot index in `active_slot` on success. A winning legacy slot from another
+// address returns false and sets misplaced_legacy, so recovery can preserve
+// the allocation bit instead of reclaiming an unwritten slot.
 bool DecodeBlockHeaderPages(std::uint64_t physical_block_id,
                             std::span<const std::byte, kBlockHeaderBytes> input,
                             BlockHeader* header,
-                            std::uint8_t* active_slot = nullptr) noexcept;
+                            std::uint8_t* active_slot = nullptr,
+                            bool* misplaced_legacy = nullptr) noexcept;
 
 bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
                         std::span<std::byte> output) noexcept;

@@ -359,7 +359,6 @@ StorageEngine::Impl::ReadRedisExportDiskBacklog(std::uint64_t session_id,
                                     buffer.data_, kBlockHeaderBytes),
                                 &decoded) ||
         decoded.kind_ != BlockKind::kRedisExportBacklog ||
-        decoded.block_id_ != block.id_ ||
         decoded.allocation_epoch_ != block.allocation_epoch_ ||
         decoded.committed_bytes_ != block.committed_bytes_) {
       co_return absl::DataLossError("invalid Redis export disk block header");

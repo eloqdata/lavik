@@ -775,7 +775,6 @@ absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
                               std::span<const std::byte, kBlockHeaderBytes>(
                                   data, kBlockHeaderBytes),
                               &reread) ||
-      reread.block_id_ != block_id ||
       reread.allocation_epoch_ != block.allocation_epoch_ ||
       reread.kind_ != BlockKind::kCheckpointIndex ||
       reread.checkpoint_generation_ != generation ||
@@ -951,7 +950,6 @@ class CheckpointPrefetchSlot {
                                   std::span<const std::byte, kBlockHeaderBytes>(
                                       data_, kBlockHeaderBytes),
                                   &header) ||
-          header.block_id_ != block_id_ ||
           header.kind_ != BlockKind::kCheckpointIndex ||
           header.checkpoint_generation_ != generation_ ||
           header.layout_worker_count_ != worker_count_) {

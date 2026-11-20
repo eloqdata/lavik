@@ -355,7 +355,7 @@ std::vector<std::uint64_t> ReadAllocatedRecordBlocks(const std::string& path) {
     lavik::storage::BlockHeader decoded{};
     if (lavik::storage::DecodeBlockHeaderPages(local, header, &decoded) &&
         decoded.kind_ == lavik::storage::BlockKind::kRecords) {
-      blocks.push_back(decoded.block_id_);
+      blocks.push_back(local);
     }
   }
   ::close(fd);
@@ -446,7 +446,7 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
           std::memcpy(committed.data() + offset, &value, sizeof(value));
         };
         store(0, decoded.magic_);
-        store(8, decoded.block_id_);
+        store(8, std::uint64_t{local});
         store(16, lavik::storage::kStorageFormatVersionLegacyV1);
         store(20, decoded.header_bytes_);
         store(24, decoded.block_bytes_);
