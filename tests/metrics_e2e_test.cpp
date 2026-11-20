@@ -940,10 +940,11 @@ TEST_F(CommandResultsE2eTest, ExclusiveCommandsExcludeDatabaseDrainAdmission) {
   const std::string held = data_path_ + ".held";
   const std::string marker = data_path_ + ".marker";
   FileCleanup held_cleanup(held), marker_cleanup(marker);
-  auto reached = [&](const char* variable) {
+  auto reached = [&](std::streampos log_start, const char* variable) {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
     while (std::chrono::steady_clock::now() < deadline) {
       std::ifstream log(log_path_);
+      log.seekg(log_start);
       const std::string text((std::istreambuf_iterator<char>(log)), {});
       if (text.find(std::string("fault pause reached: ") + variable) !=
           std::string::npos)
@@ -953,9 +954,14 @@ TEST_F(CommandResultsE2eTest, ExclusiveCommandsExcludeDatabaseDrainAdmission) {
     return false;
   };
   for (const bool keys : {false, true}) {
+    SCOPED_TRACE(keys ? "KEYS" : "FLUSHDB");
     ASSERT_EQ(client_->Command({"SET", "held:key", "value"}), "+OK");
     client_.reset();
     server_->Stop();
+    // The server appends across restarts. A previous GET pause cannot confirm
+    // that this round's GET holds the database gate.
+    const auto log_start = std::ifstream(log_path_, std::ios::ate).tellg();
+    ASSERT_GE(log_start, std::streampos{0});
     {
       std::ofstream file(held);
     }
@@ -977,13 +983,13 @@ TEST_F(CommandResultsE2eTest, ExclusiveCommandsExcludeDatabaseDrainAdmission) {
       RespClient client(port_);
       return client.Command({"GET", "held:key"});
     });
-    EXPECT_TRUE(reached("LAVIK_DB_OPERATION_HOLD_FILE"));
+    EXPECT_TRUE(reached(log_start, "LAVIK_DB_OPERATION_HOLD_FILE"));
     auto exclusive = std::async(std::launch::async, [&] {
       RespClient client(port_);
       return keys ? client.RawCommand({"KEYS", "*"})
                   : client.RawCommand({"FLUSHDB"});
     });
-    EXPECT_TRUE(reached(boundary));
+    EXPECT_TRUE(reached(log_start, boundary));
     ::unlink(marker.c_str());
     // The exclusive command has entered its real DB-drain loop while GET owns
     // an active operation. That admission wait must not become execution time.
