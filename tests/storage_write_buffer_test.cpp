@@ -69,11 +69,14 @@ class WriteBufferTestPeer {
     const auto expected = StartupCatalog();
     EXPECT_EQ(*impl.recovered_catalog_dump_, expected);
     auto read = pool.maintenance_read_buffer(MaintenanceReadKind::kDefrag);
+    ASSERT_NE(impl.system_state_.catalog_extents_, nullptr);
+    ASSERT_FALSE(impl.system_state_.catalog_extents_->empty());
     BlockHeader header;
-    ASSERT_TRUE(
-        DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
-                                   read.data_, kBlockHeaderBytes),
-                               &header));
+    ASSERT_TRUE(DecodeBlockHeaderPages(
+        impl.system_state_.catalog_extents_->back().block_id_,
+        std::span<const std::byte, kBlockHeaderBytes>(read.data_,
+                                                      kBlockHeaderBytes),
+        &header));
     EXPECT_EQ(header.kind_, BlockKind::kPayloadExtent);
     EXPECT_EQ(header.extent_index_, 1);
     // Prepare has not started any worker or ordinary pool. The last extent
@@ -550,7 +553,7 @@ class WriteBufferTestPeer {
         status = ReadExactlyAt(impl.devices_[file].path_, pages, offset);
         if (!status.ok()) co_return status;
         BlockHeader header;
-        if (!DecodeBlockHeaderPages(pages, &header) ||
+        if (!DecodeBlockHeaderPages(last[stream].block_id(), pages, &header) ||
             header.record_count_ != round + 1 ||
             header.max_lsn_ != slot->max_lsn_ ||
             header.committed_bytes_ != slot->durable_bytes_)

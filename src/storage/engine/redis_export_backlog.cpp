@@ -355,7 +355,8 @@ StorageEngine::Impl::ReadRedisExportDiskBacklog(std::uint64_t session_id,
           : read.status();
     }
     BlockHeader decoded{};
-    if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+    if (!DecodeBlockHeaderPages(block.id_,
+                                std::span<const std::byte, kBlockHeaderBytes>(
                                     buffer.data_, kBlockHeaderBytes),
                                 &decoded) ||
         decoded.kind_ != BlockKind::kRedisExportBacklog ||

@@ -1706,7 +1706,7 @@ absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
 bool StorageEngine::Impl::ReadExtentAwaitable::DecodeHeader(
     std::span<const std::byte, kBlockHeaderBytes> bytes,
     BlockHeader& header) const {
-  return DecodeBlockHeaderPages(bytes, &header) &&
+  return DecodeBlockHeaderPages(ref_.block_id_, bytes, &header) &&
          header.kind_ == BlockKind::kPayloadExtent &&
          header.block_id_ == ref_.block_id_ &&
          header.allocation_epoch_ == ref_.allocation_epoch_ &&

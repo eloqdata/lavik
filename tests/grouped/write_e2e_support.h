@@ -106,9 +106,12 @@ class PrivateDisk {
   void VisitRecords(Visit visit, bool include_indirect_keys = false) const {
     std::ifstream input(path_, std::ios::binary);
     std::vector<std::byte> bytes(kStorageBlockBytes);
-    while (input.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
+    for (std::uint64_t id = 0;
+         input.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+         ++id) {
       BlockHeader block;
-      if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+      if (!DecodeBlockHeaderPages(id,
+                                  std::span<const std::byte, kBlockHeaderBytes>(
                                       bytes.data(), kBlockHeaderBytes),
                                   &block) ||
           (block.kind_ != BlockKind::kRecords &&

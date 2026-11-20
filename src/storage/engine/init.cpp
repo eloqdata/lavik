@@ -719,7 +719,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       if (!system_state_installed.ok()) return system_state_installed;
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,
-          .version_ = kStorageFormatVersion,
+          .version_ = kLocationDerivedHeaderVersion,
           .header_bytes_ = kDirectIoAlignment,
           .storage_set_id_ = storage_set_id,
           .device_id_ = assigned_device_ids[i],
@@ -755,7 +755,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     for (std::size_t i = 0; i < labels.size(); ++i) {
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,
-          .version_ = kStorageFormatVersion,
+          .version_ = kLocationDerivedHeaderVersion,
           .header_bytes_ = kDirectIoAlignment,
           .storage_set_id_ = storage_set_id,
           .device_id_ = assigned_device_ids[i],
@@ -771,6 +771,17 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       }
       labels[i] = label;
     }
+  }
+  // An old engine treats unrecognized block headers as unused allocations.
+  // Fence downgrade on every member before admitting any new block writes.
+  // Mixed label versions after interruption are safe to resume.
+  for (std::size_t i = 0; i < labels.size(); ++i) {
+    if (labels[i]->version_ == kLocationDerivedHeaderVersion) continue;
+    labels[i]->version_ = kLocationDerivedHeaderVersion;
+    auto status = WriteDeviceLabel(
+        options_.data_files_[i], *labels[i],
+        device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_);
+    if (!status.ok()) return status;
   }
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {

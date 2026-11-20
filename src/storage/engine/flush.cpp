@@ -316,7 +316,6 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       const BlockHeader header{
           .magic_ = kBlockMagic,
           .block_id_ = block_id,
-          .version_ = kStorageFormatVersion,
           .header_bytes_ = kBlockHeaderBytes,
           .block_bytes_ = kStorageBlockBytes,
           .writer_id_ = state->writer_id_,

@@ -2050,7 +2050,6 @@ StorageEngine::Impl::WriteExtentValueLocked(
       BlockHeader header{
           .magic_ = kBlockMagic,
           .block_id_ = reserved->block_id_,
-          .version_ = kStorageFormatVersion,
           .header_bytes_ = kBlockHeaderBytes,
           .block_bytes_ = kStorageBlockBytes,
           .writer_id_ = store.worker_->id(),

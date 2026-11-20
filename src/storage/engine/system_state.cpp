@@ -433,7 +433,8 @@ absl::Status StorageEngine::Impl::LoadSystemState(FixedBuffer read_buffer) {
                       LocalBlockOffset(ref.block_id_), read_buffer);
     if (!read.ok()) return read;
     BlockHeader header;
-    if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+    if (!DecodeBlockHeaderPages(ref.block_id_,
+                                std::span<const std::byte, kBlockHeaderBytes>(
                                     bytes.data(), kBlockHeaderBytes),
                                 &header) ||
         header.kind_ != BlockKind::kPayloadExtent ||

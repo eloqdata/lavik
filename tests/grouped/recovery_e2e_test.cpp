@@ -103,7 +103,7 @@ class RecordImage {
                 static_cast<ssize_t>(bytes.size()),
             "block header read failed");
       BlockHeader header;
-      if (!DecodeBlockHeaderPages(bytes, &header) ||
+      if (!DecodeBlockHeaderPages(id, bytes, &header) ||
           header.kind_ != BlockKind::kRecords ||
           header.layout_worker_count_ != 2)
         continue;
@@ -128,7 +128,7 @@ class RecordImage {
                 static_cast<ssize_t>(bytes.size()),
             "checkpoint header read failed");
       BlockHeader header;
-      if (!DecodeBlockHeaderPages(bytes, &header) ||
+      if (!DecodeBlockHeaderPages(id, bytes, &header) ||
           header.kind_ != BlockKind::kCheckpointIndex)
         continue;
       std::array<std::byte, 64> chunk{};

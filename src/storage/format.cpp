@@ -457,7 +457,8 @@ bool DecodeDeviceLabel(std::span<const std::byte, kDirectIoAlignment> input,
   DeviceLabel decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
   if (decoded.magic_ != kDeviceLabelMagic ||
-      decoded.version_ != kStorageFormatVersion ||
+      (decoded.version_ != kStorageFormatVersion &&
+       decoded.version_ != kLocationDerivedHeaderVersion) ||
       decoded.header_bytes_ != kDirectIoAlignment ||
       decoded.storage_set_id_ == 0 || decoded.device_id_ >= kDeviceIdLimit ||
       decoded.capacity_blocks_ < 2 ||
@@ -540,13 +541,16 @@ void EncodeBlockHeader(
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept {
   std::fill(output.begin(), output.end(), std::byte{0});
   BlockHeader encoded = header;
+  encoded.version_ = kLocationDerivedHeaderVersion;
+  encoded.block_id_ = 0;
   encoded.checksum_ = 0;
   std::memcpy(output.data(), &encoded, sizeof(encoded));
   encoded.checksum_ = Crc32c(output);
   std::memcpy(output.data(), &encoded, sizeof(encoded));
 }
 
-bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
+bool DecodeBlockHeaderPages(std::uint64_t physical_block_id,
+                            std::span<const std::byte, kBlockHeaderBytes> input,
                             BlockHeader* header,
                             std::uint8_t* active_slot) noexcept {
   BlockHeader best{};
@@ -554,7 +558,8 @@ bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
   bool found = false;
   for (std::uint8_t slot = 0; slot < kBlockHeaderSlots; ++slot) {
     BlockHeader decoded{};
-    if (!DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes>(
+    if (!DecodeBlockHeader(physical_block_id,
+                           std::span<const std::byte, kBlockHeaderSlotBytes>(
                                input.data() + slot * kBlockHeaderSlotBytes,
                                kBlockHeaderSlotBytes),
                            &decoded)) {
@@ -580,16 +585,19 @@ bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
   return true;
 }
 
-bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
+bool DecodeBlockHeader(std::uint64_t physical_block_id,
+                       std::span<const std::byte, kBlockHeaderSlotBytes> input,
                        BlockHeader* header) noexcept {
   if (header == nullptr) {
     return false;
   }
   BlockHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
-  if (decoded.magic_ != kBlockMagic || decoded.block_id_ == kInvalidBlockId ||
-      LocalBlockId(decoded.block_id_) == 0 ||
-      decoded.version_ != kStorageFormatVersion ||
+  const bool derived = decoded.version_ == kLocationDerivedHeaderVersion;
+  const auto id = derived ? physical_block_id : decoded.block_id_;
+  if (decoded.magic_ != kBlockMagic || id == kInvalidBlockId ||
+      LocalBlockId(id) == 0 || (derived && decoded.block_id_ != 0) ||
+      (!derived && decoded.version_ != kStorageFormatVersion) ||
       decoded.header_bytes_ != kBlockHeaderBytes ||
       decoded.block_bytes_ != kStorageBlockBytes ||
       decoded.layout_worker_count_ == 0 ||
@@ -649,6 +657,7 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
   if (Crc32c(copy) != expected) {
     return false;
   }
+  decoded.block_id_ = id;
   *header = decoded;
   return true;
 }

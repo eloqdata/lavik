@@ -353,7 +353,7 @@ std::vector<std::uint64_t> ReadAllocatedRecordBlocks(const std::string& path) {
       Fail("failed to read block header during test scan");
     }
     lavik::storage::BlockHeader decoded{};
-    if (lavik::storage::DecodeBlockHeaderPages(header, &decoded) &&
+    if (lavik::storage::DecodeBlockHeaderPages(local, header, &decoded) &&
         decoded.kind_ == lavik::storage::BlockKind::kRecords) {
       blocks.push_back(decoded.block_id_);
     }
@@ -437,10 +437,17 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
       Fail("failed to scan headers while injecting a stale block header");
     }
     lavik::storage::BlockHeader decoded{};
-    if (lavik::storage::DecodeBlockHeaderPages(candidate, &decoded) &&
+    if (lavik::storage::DecodeBlockHeaderPages(local, candidate, &decoded) &&
         decoded.kind_ == lavik::storage::BlockKind::kRecords) {
       if (committed_local == 0) {
-        committed = candidate;
+        // Only legacy headers carry a source location. Manufacture that wire
+        // format to exercise the stale-media branch on an upgraded device.
+        decoded.version_ = lavik::storage::kStorageFormatVersion;
+        decoded.checksum_ = 0;
+        std::memcpy(committed.data(), &decoded, sizeof(decoded));
+        decoded.checksum_ = lavik::storage::Crc32c(
+            std::span(committed).first(lavik::storage::kBlockHeaderSlotBytes));
+        std::memcpy(committed.data(), &decoded, sizeof(decoded));
         committed_local = local;
       }
       continue;

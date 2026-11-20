@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -85,6 +86,45 @@ TEST(StorageFormatTest, MixedRecordCrcPoliciesPreserveLegacyEncoding) {
   }
 }
 
+TEST(StorageFormatTest, MixedLocationDerivedAndLegacySlots) {
+  using namespace lavik::storage;
+  // Build a v1 wire fixture from its fixed offsets, independently of the
+  // current encoder. CRC covers the whole 4 KiB page in both formats.
+  std::array<std::byte, kBlockHeaderBytes> pages{};
+  auto legacy = std::span(pages).first<kBlockHeaderSlotBytes>();
+  const auto store = [&](std::size_t offset, auto value) {
+    std::memcpy(legacy.data() + offset, &value, sizeof(value));
+  };
+  const auto source = MakeBlockId(3, 21);
+  const auto destination = MakeBlockId(5, 42);
+  store(0, kBlockMagic);
+  store(8, source);
+  store(16, std::uint32_t{1});
+  store(20, std::uint32_t{kBlockHeaderBytes});
+  store(24, std::uint32_t{kStorageBlockBytes});
+  store(32, std::uint64_t{9});  // allocation epoch
+  store(40, std::uint32_t{kBlockHeaderBytes});
+  store(56, std::uint32_t{1});  // sequence
+  store(64, std::uint32_t{1});  // writer count
+  store(68, std::uint8_t{1});   // record block
+  store(60, Crc32c(legacy));
+  BlockHeader header;
+  ASSERT_TRUE(DecodeBlockHeaderPages(destination, pages, &header));
+  EXPECT_EQ(header.block_id_, source);  // Detect a misplaced v1 block.
+  header.header_sequence_++;
+  auto current = std::span(pages).last<kBlockHeaderSlotBytes>();
+  EncodeBlockHeader(header, current);
+  EXPECT_TRUE(std::all_of(current.begin() + 8, current.begin() + 16,
+                          [](std::byte b) { return b == std::byte{}; }));
+  ASSERT_TRUE(DecodeBlockHeaderPages(destination, pages, &header));
+  EXPECT_EQ(header.block_id_, destination);
+  EXPECT_EQ(header.version_, kLocationDerivedHeaderVersion);
+  current.back() ^= std::byte{1};
+  ASSERT_TRUE(DecodeBlockHeaderPages(destination, pages, &header));
+  EXPECT_EQ(header.block_id_, source);
+  EXPECT_EQ(header.header_sequence_, 1u);
+}
+
 TEST(StorageFormatTest, ExtentCrcPolicyIsProtectedByBlockHeader) {
   using namespace lavik::storage;
   // Repurpose one reserved byte without changing persisted field offsets.
@@ -99,23 +139,23 @@ TEST(StorageFormatTest, ExtentCrcPolicyIsProtectedByBlockHeader) {
   std::array<std::byte, kBlockHeaderSlotBytes> encoded{};
   EncodeBlockHeader(header, encoded);
   BlockHeader decoded;
-  ASSERT_TRUE(DecodeBlockHeader(encoded, &decoded));
+  ASSERT_TRUE(DecodeBlockHeader(header.block_id_, encoded, &decoded));
   EXPECT_EQ(decoded.extent_no_crc_, 1);
   encoded[offsetof(BlockHeader, extent_no_crc_)] = std::byte{0};
-  EXPECT_FALSE(DecodeBlockHeader(encoded, &decoded));
+  EXPECT_FALSE(DecodeBlockHeader(header.block_id_, encoded, &decoded));
   header.extent_payload_checksum_ = 1;
   EncodeBlockHeader(header, encoded);
-  EXPECT_FALSE(DecodeBlockHeader(encoded, &decoded));
+  EXPECT_FALSE(DecodeBlockHeader(header.block_id_, encoded, &decoded));
   header.extent_payload_checksum_ = 0;
   header.extent_no_crc_ = 2;
   EncodeBlockHeader(header, encoded);
-  EXPECT_FALSE(DecodeBlockHeader(encoded, &decoded));
+  EXPECT_FALSE(DecodeBlockHeader(header.block_id_, encoded, &decoded));
   header.extent_no_crc_ = 1;
   header.kind_ = BlockKind::kRecords;
   header.extent_payload_bytes_ = 0;
   header.committed_bytes_ = kBlockHeaderBytes;
   EncodeBlockHeader(header, encoded);
-  EXPECT_FALSE(DecodeBlockHeader(encoded, &decoded));
+  EXPECT_FALSE(DecodeBlockHeader(header.block_id_, encoded, &decoded));
 }
 
 TEST(StorageStateTest, PromotionBaseEqualityIncludesDurabilityFrontier) {
@@ -614,7 +654,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   std::array<std::byte, kBlockHeaderSlotBytes> block_page{};
   EncodeBlockHeader(header, block_page);
   BlockHeader decoded_header{};
-  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
+  ASSERT_TRUE(DecodeBlockHeader(block_id, block_page, &decoded_header));
   ASSERT_TRUE(decoded_header.block_id_ == block_id);
   ASSERT_TRUE(decoded_header.allocation_epoch_ == header.allocation_epoch_);
 
@@ -624,9 +664,10 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
     std::array<std::byte, kBlockHeaderBytes> pages{};
     BlockHeader winner{};
     std::uint8_t active_slot = 9;
-    ASSERT_TRUE(!DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    ASSERT_TRUE(
+        !DecodeBlockHeaderPages(block_id, pages, &winner, &active_slot));
     std::memcpy(pages.data(), block_page.data(), block_page.size());
-    ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    ASSERT_TRUE(DecodeBlockHeaderPages(block_id, pages, &winner, &active_slot));
     ASSERT_TRUE(active_slot == 0 &&
                 winner.committed_bytes_ == kBlockHeaderBytes);
     BlockHeader newer = header;
@@ -636,11 +677,11 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
     EncodeBlockHeader(newer, newer_page);
     std::memcpy(pages.data() + kBlockHeaderSlotBytes, newer_page.data(),
                 newer_page.size());
-    ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    ASSERT_TRUE(DecodeBlockHeaderPages(block_id, pages, &winner, &active_slot));
     ASSERT_TRUE(active_slot == 1 &&
                 winner.committed_bytes_ == kBlockHeaderBytes + 4096);
     pages[kBlockHeaderSlotBytes + 8] ^= std::byte{0xff};  // tear slot 1
-    ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    ASSERT_TRUE(DecodeBlockHeaderPages(block_id, pages, &winner, &active_slot));
     ASSERT_TRUE(active_slot == 0 &&
                 winner.committed_bytes_ == kBlockHeaderBytes);
 
@@ -652,7 +693,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
     EncodeBlockHeader(restamped, newer_page);
     std::memcpy(pages.data() + kBlockHeaderSlotBytes, newer_page.data(),
                 newer_page.size());
-    ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    ASSERT_TRUE(DecodeBlockHeaderPages(block_id, pages, &winner, &active_slot));
     ASSERT_TRUE(active_slot == 1 && winner.max_lsn_ == 77);
   }
 
@@ -663,7 +704,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   extent_header.extent_payload_bytes_ = 1234;
   extent_header.extent_payload_checksum_ = 0x12345678U;
   EncodeBlockHeader(extent_header, block_page);
-  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
+  ASSERT_TRUE(DecodeBlockHeader(block_id, block_page, &decoded_header));
   ASSERT_TRUE(decoded_header.kind_ == BlockKind::kPayloadExtent);
   ASSERT_TRUE(decoded_header.extent_index_ == extent_header.extent_index_);
   ASSERT_TRUE(decoded_header.extent_payload_bytes_ ==
@@ -677,13 +718,13 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   transaction_header.record_count_ = 3;
   transaction_header.committed_bytes_ = kBlockHeaderBytes + 3 * 120;
   EncodeBlockHeader(transaction_header, block_page);
-  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
+  ASSERT_TRUE(DecodeBlockHeader(block_id, block_page, &decoded_header));
   EXPECT_EQ(decoded_header.kind_, BlockKind::kTransaction);
   EXPECT_EQ(decoded_header.checkpoint_generation_, 0);
 
   transaction_header.checkpoint_generation_ = 17;
   EncodeBlockHeader(transaction_header, block_page);
-  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
+  EXPECT_FALSE(DecodeBlockHeader(block_id, block_page, &decoded_header));
 
   BlockHeader checkpoint_header = header;
   checkpoint_header.kind_ = BlockKind::kCheckpointIndex;
@@ -694,7 +735,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   checkpoint_header.record_count_ = 11;
   checkpoint_header.committed_bytes_ = kBlockHeaderBytes + 4096;
   EncodeBlockHeader(checkpoint_header, block_page);
-  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
+  ASSERT_TRUE(DecodeBlockHeader(block_id, block_page, &decoded_header));
   EXPECT_EQ(decoded_header.kind_, BlockKind::kCheckpointIndex);
   EXPECT_EQ(decoded_header.checkpoint_generation_, 23);
   BlockHeader export_header = header;
@@ -702,15 +743,15 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   export_header.record_count_ = 2;
   export_header.committed_bytes_ = kBlockHeaderBytes + 256;
   EncodeBlockHeader(export_header, block_page);
-  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
+  ASSERT_TRUE(DecodeBlockHeader(block_id, block_page, &decoded_header));
   EXPECT_EQ(decoded_header.kind_, BlockKind::kRedisExportBacklog);
   export_header.checkpoint_generation_ = 17;
   EncodeBlockHeader(export_header, block_page);
-  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
+  EXPECT_FALSE(DecodeBlockHeader(block_id, block_page, &decoded_header));
   BlockHeader records_with_generation = header;
   records_with_generation.checkpoint_generation_ = 17;
   EncodeBlockHeader(records_with_generation, block_page);
-  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
+  EXPECT_FALSE(DecodeBlockHeader(block_id, block_page, &decoded_header));
 
   constexpr std::string_view key = "typed-expiring-key";
   constexpr std::string_view value = "value";

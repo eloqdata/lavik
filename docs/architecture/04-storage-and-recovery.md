@@ -199,7 +199,13 @@ Every data block is 8 MiB:
 records or extent payload
 ```
 
-The alternating header slots record block identity, writer topology,
+Device label version 2 admits both block header formats. Startup upgrades
+version 1 labels before new block writes so older binaries reject the storage
+set. Legacy blocks need no rewrite. Each slot carries its own format version.
+Version 1 stores the physical block ID, while version 2 derives it from the
+device and slot address. Both formats use the same offsets and CRC coverage.
+
+The alternating header slots record writer topology,
 allocation epoch, committed boundary, record count, maximum physical LSN,
 header sequence, kind, and kind-specific metadata. Slot selection prefers the
 higher allocation epoch and then the higher header sequence. Current block
@@ -437,7 +443,7 @@ Recovery proceeds as follows:
    owners. A clear allocation bit is authoritative and skips block I/O. A set
    bit leads to a header read.
 2. An all-zero or wholly invalid header on an allocated block is a permitted
-   activation false positive and becomes reusable. A valid header whose
+   activation false positive and becomes reusable. A valid legacy header whose
    embedded block ID does not match its physical location is stale media and
    is ignored without rewriting the bitmap. A valid temporary Redis export
    block is also reclaimed immediately; a new process has no matching PSYNC

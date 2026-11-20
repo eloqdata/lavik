@@ -609,7 +609,6 @@ class CheckpointWriteSlot {
     BlockHeader header{
         .magic_ = kBlockMagic,
         .block_id_ = block_id,
-        .version_ = kStorageFormatVersion,
         .header_bytes_ = kBlockHeaderBytes,
         .block_bytes_ = kStorageBlockBytes,
         .writer_id_ = shard_id,
@@ -774,7 +773,8 @@ absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
     std::uint64_t block_id, const std::byte* data, const BlockHeader& block,
     std::uint64_t generation, unsigned worker_count, bool validate_payload) {
   BlockHeader reread{};
-  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+  if (!DecodeBlockHeaderPages(block_id,
+                              std::span<const std::byte, kBlockHeaderBytes>(
                                   data, kBlockHeaderBytes),
                               &reread) ||
       reread.block_id_ != block_id ||
@@ -949,7 +949,8 @@ class CheckpointPrefetchSlot {
       }
 
       BlockHeader header{};
-      if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+      if (!DecodeBlockHeaderPages(block_id_,
+                                  std::span<const std::byte, kBlockHeaderBytes>(
                                       data_, kBlockHeaderBytes),
                                   &header) ||
           header.block_id_ != block_id_ ||

@@ -35,11 +35,12 @@ inline constexpr std::size_t kBlockHeaderBytes =
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-// Pre-deployment format changes directly replace version 1. Compatibility
-// with earlier development media is intentionally unsupported because its
-// missing system-state lineage cannot be inferred safely. Lavik signatures
-// also reject media bearing obsolete development signatures.
+// Base format for records and metadata. Obsolete development signatures
+// predate system-state lineage and are rejected.
 inline constexpr std::uint32_t kStorageFormatVersion = 1;
+// Device labels fence older readers before writers emit location-derived
+// headers.
+inline constexpr std::uint32_t kLocationDerivedHeaderVersion = 2;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
                                                     << kLocalBlockIdBits;
@@ -284,10 +285,12 @@ enum class ValueType : std::uint8_t {
   kStream = 6,
 };
 
+// In memory, block_id_ names the physical slot. On version 2 media the
+// corresponding eight bytes are reserved zero to preserve field offsets.
 struct BlockHeader {
   std::uint64_t magic_ = kBlockMagic;
   std::uint64_t block_id_ = kInvalidBlockId;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kLocationDerivedHeaderVersion;
   std::uint32_t header_bytes_ = kBlockHeaderBytes;
   std::uint32_t block_bytes_ = kStorageBlockBytes;
   std::uint32_t writer_id_ = 0;
@@ -340,7 +343,7 @@ struct ReplicationFrameHeader {
 // metadata follows this label, and data begins at DataBlockBegin(capacity).
 struct DeviceLabel {
   std::uint64_t magic_ = kDeviceLabelMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t version_ = kLocationDerivedHeaderVersion;
   std::uint32_t header_bytes_ = kDirectIoAlignment;
   std::uint64_t storage_set_id_ = 0;
   std::uint64_t device_id_ = 0;
@@ -550,17 +553,21 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
                         std::uint64_t* generation,
                         std::span<std::byte> payload) noexcept;
 
-// Encode into / decode from a single header slot page.
+// Write the location-independent slot format. Readers reconstruct its ID from
+// physical_block_id. Legacy slots return their embedded ID for stale-media
+// checks.
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept;
-bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
+bool DecodeBlockHeader(std::uint64_t physical_block_id,
+                       std::span<const std::byte, kBlockHeaderSlotBytes> input,
                        BlockHeader* header) noexcept;
 
 // Decode the winning slot from a block's full header region: the valid slot
 // with the larger (allocation_epoch, header_sequence). Returns the winning
 // slot index in `active_slot`, or false when neither slot is valid.
-bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
+bool DecodeBlockHeaderPages(std::uint64_t physical_block_id,
+                            std::span<const std::byte, kBlockHeaderBytes> input,
                             BlockHeader* header,
                             std::uint8_t* active_slot = nullptr) noexcept;
 

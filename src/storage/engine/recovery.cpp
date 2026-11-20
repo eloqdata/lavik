@@ -98,7 +98,8 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
     co_return absl::InternalError("short recovered extent read");
   }
   BlockHeader header{};
-  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+  if (!DecodeBlockHeaderPages(ref.block_id_,
+                              std::span<const std::byte, kBlockHeaderBytes>(
                                   io.data_, kBlockHeaderBytes),
                               &header) ||
       header.kind_ != BlockKind::kPayloadExtent ||
@@ -391,7 +392,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       }
 
       BlockHeader block{};
-      if (!DecodeBlockHeaderPages(block_bytes, &block)) {
+      if (!DecodeBlockHeaderPages(block_id, block_bytes, &block)) {
         // Neither slot is valid. A block is allocated before it is ever
         // flushed, and its first flush zeroes the slot it does not write, so
         // this means no header ever committed here. Nothing in it was
@@ -402,7 +403,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
       if (block.block_id_ != block_id) {
-        // The bitmap records activation, not a committed write. A valid
+        // The bitmap records activation, not a committed write. A legacy
         // header naming another physical block is stale media contents. Do
         // not recover it and do not rewrite the allocation bitmap.
         if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
