@@ -285,16 +285,14 @@ enum class ValueType : std::uint8_t {
   kStream = 6,
 };
 
-// In memory, block_id_ names the physical slot. On version 2 media the
-// corresponding eight bytes are reserved zero to preserve field offsets.
+// The v2 wire prefix ends immediately before the runtime block ID.
 struct BlockHeader {
   std::uint64_t magic_ = kBlockMagic;
-  std::uint64_t block_id_ = kInvalidBlockId;
+  std::uint64_t allocation_epoch_ = 0;
   std::uint32_t version_ = kStorageFormatVersion;
   std::uint32_t header_bytes_ = kBlockHeaderBytes;
   std::uint32_t block_bytes_ = kStorageBlockBytes;
   std::uint32_t writer_id_ = 0;
-  std::uint64_t allocation_epoch_ = 0;
   std::uint32_t committed_bytes_ = kBlockHeaderBytes;
   std::uint32_t record_count_ = 0;
   std::uint64_t max_lsn_ = 0;
@@ -316,7 +314,13 @@ struct BlockHeader {
   std::array<std::uint64_t, 3> reserved_runtime_{};
   // Only checkpoint blocks carry a metadata generation here.
   std::uint64_t checkpoint_generation_ = 0;
+  std::uint64_t block_id_ = kInvalidBlockId;  // Supplied by the reader.
 };
+
+inline constexpr std::size_t kBlockHeaderV2WireBytes =
+    offsetof(BlockHeader, block_id_);
+static_assert(kBlockHeaderV2WireBytes == 112);
+static_assert(offsetof(BlockHeader, version_) == 16);
 
 // A logical replication event may span multiple frames and blocks. Every
 // fragment shares one LSN. The receiver publishes the event only after seeing

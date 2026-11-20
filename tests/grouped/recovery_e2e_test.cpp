@@ -285,7 +285,6 @@ class RecordImage {
                       .payload_bytes_ = static_cast<std::uint32_t>(count),
                       .payload_checksum_ = Crc32c(bytes)};
         BlockHeader header{
-            .block_id_ = id,
             .allocation_epoch_ = ref.allocation_epoch_,
             .committed_bytes_ =
                 static_cast<std::uint32_t>(kBlockHeaderBytes + count),
@@ -409,12 +408,12 @@ class RecordImage {
     if (inserted) {
       const auto id = Allocate();
       block.header_ = BlockHeader{
-          .block_id_ = id,
           .allocation_epoch_ = id + 100,
           .committed_bytes_ = kBlockHeaderBytes,
           .header_sequence_ = 1,
           .layout_worker_count_ = 1,
           .kind_ = tagged ? BlockKind::kTransaction : BlockKind::kRecords,
+          .block_id_ = id,
       };
     }
     record.key_bytes_ = key.size();

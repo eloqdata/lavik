@@ -203,7 +203,8 @@ Device label version 2 admits both block header formats. Startup upgrades
 version 1 labels before new block writes so older binaries reject the storage
 set. Legacy blocks need no rewrite. Each slot carries its own format version.
 Version 1 stores the physical block ID, while version 2 derives it from the
-device and slot address. Both formats use the same offsets and CRC coverage.
+device and slot address. Both layouts place the version at byte 16. The v2 prefix occupies 112 bytes and
+stores the allocation epoch at byte 8. The CRC covers the entire 4 KiB slot.
 
 The alternating header slots record writer topology,
 allocation epoch, committed boundary, record count, maximum physical LSN,

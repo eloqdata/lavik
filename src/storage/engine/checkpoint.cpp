@@ -597,9 +597,8 @@ class CheckpointWriteSlot {
     state_->payload_bytes_ += bytes;
   }
 
-  std::size_t Finalize(std::uint64_t block_id, std::uint64_t allocation_epoch,
-                       std::uint64_t generation, std::uint32_t shard_id,
-                       std::uint32_t record_count,
+  std::size_t Finalize(std::uint64_t allocation_epoch, std::uint64_t generation,
+                       std::uint32_t shard_id, std::uint32_t record_count,
                        unsigned worker_count) noexcept {
     assert(state_ != nullptr);
     assert(!state_->active_);
@@ -608,11 +607,10 @@ class CheckpointWriteSlot {
                                                     state_->payload_bytes_);
     BlockHeader header{
         .magic_ = kBlockMagic,
-        .block_id_ = block_id,
+        .allocation_epoch_ = allocation_epoch,
         .header_bytes_ = kBlockHeaderBytes,
         .block_bytes_ = kStorageBlockBytes,
         .writer_id_ = shard_id,
-        .allocation_epoch_ = allocation_epoch,
         .committed_bytes_ = static_cast<std::uint32_t>(kBlockHeaderBytes +
                                                        state_->payload_bytes_),
         .record_count_ = record_count,
@@ -1169,9 +1167,9 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     auto reserved =
         co_await AllocateBlock(store, AllocationPurpose::kShutdownMetadata);
     if (!reserved.ok()) co_return reserved.status();
-    const std::size_t write_bytes = payload->Finalize(
-        reserved->block_id_, reserved->allocation_epoch_, generation,
-        store.worker_->id(), record_count, worker_count_);
+    const std::size_t write_bytes =
+        payload->Finalize(reserved->allocation_epoch_, generation,
+                          store.worker_->id(), record_count, worker_count_);
     const auto [file_id, block_offset] = FileOffset(reserved->block_id_);
     absl::Status submitted = payload->Start(
         *store.worker_, store.files_[file_id], block_offset, write_bytes);

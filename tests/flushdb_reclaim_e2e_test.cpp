@@ -442,12 +442,24 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
       if (committed_local == 0) {
         // Only legacy headers carry a source location. Manufacture that wire
         // format to exercise the stale-media branch on an upgraded device.
-        decoded.version_ = lavik::storage::kStorageFormatVersionLegacyV1;
-        decoded.checksum_ = 0;
-        std::memcpy(committed.data(), &decoded, sizeof(decoded));
-        decoded.checksum_ = lavik::storage::Crc32c(
-            std::span(committed).first(lavik::storage::kBlockHeaderSlotBytes));
-        std::memcpy(committed.data(), &decoded, sizeof(decoded));
+        const auto store = [&](std::size_t offset, auto value) {
+          std::memcpy(committed.data() + offset, &value, sizeof(value));
+        };
+        store(0, decoded.magic_);
+        store(8, decoded.block_id_);
+        store(16, lavik::storage::kStorageFormatVersionLegacyV1);
+        store(20, decoded.header_bytes_);
+        store(24, decoded.block_bytes_);
+        store(28, decoded.writer_id_);
+        store(32, decoded.allocation_epoch_);
+        store(40, decoded.committed_bytes_);
+        store(44, decoded.record_count_);
+        store(48, decoded.max_lsn_);
+        store(56, decoded.header_sequence_);
+        store(64, decoded.layout_worker_count_);
+        store(68, decoded.kind_);
+        store(60, lavik::storage::Crc32c(std::span(committed).first(
+                      lavik::storage::kBlockHeaderSlotBytes)));
         committed_local = local;
       }
       continue;

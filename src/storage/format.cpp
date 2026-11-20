@@ -536,17 +536,36 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
   return true;
 }
 
+namespace {
+// v1 put the physical ID at byte 8 and the allocation epoch at byte 32.
+// The fields from committed_bytes through checkpoint_generation follow in
+// the same order as v2, eight bytes later on disk.
+[[gnu::cold, gnu::noinline]] void DecodeLegacyBlockFields(
+    std::span<const std::byte, kBlockHeaderSlotBytes> page,
+    BlockHeader& header) {
+  static_assert(offsetof(BlockHeader, committed_bytes_) == 32);
+  static_assert(offsetof(BlockHeader, checksum_) == 52);
+  std::memcpy(&header.block_id_, page.data() + 8, sizeof(header.block_id_));
+  std::memcpy(&header.allocation_epoch_, page.data() + 32,
+              sizeof(header.allocation_epoch_));
+  constexpr auto tail = offsetof(BlockHeader, committed_bytes_);
+  std::memcpy(reinterpret_cast<std::byte*>(&header) + tail, page.data() + 40,
+              kBlockHeaderV2WireBytes - tail);
+}
+}  // namespace
+
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept {
-  std::fill(output.begin(), output.end(), std::byte{0});
+  std::fill(output.begin() + kBlockHeaderV2WireBytes, output.end(),
+            std::byte{0});
   BlockHeader encoded = header;
   encoded.version_ = kStorageFormatVersion;
-  encoded.block_id_ = 0;
   encoded.checksum_ = 0;
-  std::memcpy(output.data(), &encoded, sizeof(encoded));
-  encoded.checksum_ = Crc32c(output);
-  std::memcpy(output.data(), &encoded, sizeof(encoded));
+  std::memcpy(output.data(), &encoded, kBlockHeaderV2WireBytes);
+  const auto checksum = Crc32c(output);
+  std::memcpy(output.data() + offsetof(BlockHeader, checksum_), &checksum,
+              sizeof(checksum));
 }
 
 bool DecodeBlockHeaderPages(std::uint64_t physical_block_id,
@@ -592,12 +611,20 @@ bool DecodeBlockHeader(std::uint64_t physical_block_id,
     return false;
   }
   BlockHeader decoded{};
-  std::memcpy(&decoded, input.data(), sizeof(decoded));
-  const bool derived = decoded.version_ == kStorageFormatVersion;
-  const auto id = derived ? physical_block_id : decoded.block_id_;
-  if (decoded.magic_ != kBlockMagic || id == kInvalidBlockId ||
-      LocalBlockId(id) == 0 || (derived && decoded.block_id_ != 0) ||
-      (!derived && decoded.version_ != kStorageFormatVersionLegacyV1) ||
+  std::memcpy(static_cast<void*>(&decoded), input.data(),
+              kBlockHeaderV2WireBytes);
+  if (decoded.magic_ != kBlockMagic) return false;
+  std::size_t checksum_offset = offsetof(BlockHeader, checksum_);
+  if (decoded.version_ == kStorageFormatVersion) [[likely]] {
+    decoded.block_id_ = physical_block_id;
+  } else if (decoded.version_ == kStorageFormatVersionLegacyV1) {
+    DecodeLegacyBlockFields(input, decoded);
+    checksum_offset = 60;
+  } else {
+    return false;
+  }
+  if (decoded.block_id_ == kInvalidBlockId ||
+      LocalBlockId(decoded.block_id_) == 0 ||
       decoded.header_bytes_ != kBlockHeaderBytes ||
       decoded.block_bytes_ != kStorageBlockBytes ||
       decoded.layout_worker_count_ == 0 ||
@@ -653,11 +680,9 @@ bool DecodeBlockHeader(std::uint64_t physical_block_id,
   std::array<std::byte, kBlockHeaderSlotBytes> copy{};
   std::memcpy(copy.data(), input.data(), copy.size());
   decoded.checksum_ = 0;
-  std::memcpy(copy.data(), &decoded, sizeof(decoded));
-  if (Crc32c(copy) != expected) {
-    return false;
-  }
-  decoded.block_id_ = id;
+  std::memcpy(copy.data() + checksum_offset, &decoded.checksum_,
+              sizeof(decoded.checksum_));
+  if (Crc32c(copy) != expected) return false;
   *header = decoded;
   return true;
 }

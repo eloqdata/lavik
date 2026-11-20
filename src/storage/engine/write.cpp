@@ -2049,11 +2049,10 @@ StorageEngine::Impl::WriteExtentValueLocked(
       };
       BlockHeader header{
           .magic_ = kBlockMagic,
-          .block_id_ = reserved->block_id_,
+          .allocation_epoch_ = reserved->allocation_epoch_,
           .header_bytes_ = kBlockHeaderBytes,
           .block_bytes_ = kStorageBlockBytes,
           .writer_id_ = store.worker_->id(),
-          .allocation_epoch_ = reserved->allocation_epoch_,
           .committed_bytes_ =
               static_cast<std::uint32_t>(kBlockHeaderBytes + payload_bytes),
           .record_count_ = 0,

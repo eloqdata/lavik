@@ -114,8 +114,13 @@ TEST(StorageFormatTest, MixedLocationDerivedAndLegacySlots) {
   header.header_sequence_++;
   auto current = std::span(pages).last<kBlockHeaderSlotBytes>();
   EncodeBlockHeader(header, current);
-  EXPECT_TRUE(std::all_of(current.begin() + 8, current.begin() + 16,
-                          [](std::byte b) { return b == std::byte{}; }));
+  std::uint64_t wire_epoch;
+  std::memcpy(&wire_epoch, current.data() + 8, sizeof(wire_epoch));
+  EXPECT_EQ(wire_epoch, 9u);
+  header.block_id_ = destination;
+  std::array<std::byte, kBlockHeaderSlotBytes> relocated{};
+  EncodeBlockHeader(header, relocated);
+  EXPECT_EQ(std::memcmp(relocated.data(), current.data(), current.size()), 0);
   ASSERT_TRUE(DecodeBlockHeaderPages(destination, pages, &header));
   EXPECT_EQ(header.block_id_, destination);
   EXPECT_EQ(header.version_, kStorageFormatVersion);
@@ -127,8 +132,7 @@ TEST(StorageFormatTest, MixedLocationDerivedAndLegacySlots) {
 
 TEST(StorageFormatTest, ExtentCrcPolicyIsProtectedByBlockHeader) {
   using namespace lavik::storage;
-  // Repurpose one reserved byte without changing persisted field offsets.
-  static_assert(offsetof(BlockHeader, extent_index_) == 72);
+  static_assert(offsetof(BlockHeader, extent_index_) == 64);
   BlockHeader header;
   header.block_id_ = 1;
   header.layout_worker_count_ = 1;
@@ -639,12 +643,11 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   BlockHeader header{
       .magic_ = kBlockMagic,
-      .block_id_ = block_id,
+      .allocation_epoch_ = 9,
       .version_ = kStorageFormatVersion,
       .header_bytes_ = kBlockHeaderBytes,
       .block_bytes_ = kStorageBlockBytes,
       .writer_id_ = 3,
-      .allocation_epoch_ = 9,
       .committed_bytes_ = kBlockHeaderBytes,
       .record_count_ = 0,
       .max_lsn_ = 0,
