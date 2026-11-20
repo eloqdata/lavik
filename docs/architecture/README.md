@@ -27,6 +27,7 @@ references rather than current architecture.
 | Subsystem | Responsibility | Architecture document |
 |---|---|---|
 | System composition | Process lifecycle, runtime dependency, cross-cutting flows, and integrations | [System overview](01-overview.md) |
+| Outbound HTTP | Worker-owned HTTP and HTTPS client exchanges, deadlines and response framing | [Outbound HTTP client](13-outbound-http.md) |
 | Request and Redis serving | TCP/TLS sessions, RESP2/RESP3 negotiation, command dispatch, connection state, Lua/Functions, Pub/Sub, replies, and command handlers | [Request and Redis serving](02-request-serving.md) |
 | Function catalog | Process-global Function ownership, hidden staging, crash-durable catalog commits, startup recovery, and replication integration | [Function catalog](07-function-catalog.md) |
 | Transaction coordination | Per-worker intent arbitration, cross-worker scheduling, multi-hop execution, WATCH, and transaction completion | [Transaction coordination](03-transaction-coordination.md) |

@@ -81,7 +81,10 @@ class Reader {
         position_ += end + 2;
         co_return line;
       }
-      if (Remaining().size() > kMaxHeaders)
+      // A CR at the end of a read can still become the line delimiter.
+      auto partial = Remaining();
+      if (partial.ends_with('\r')) partial.remove_suffix(1);
+      if (partial.size() > kMaxHeaders)
         co_return absl::DataLossError("HTTP line too long");
       auto n = co_await Refill();
       if (!n.ok()) co_return n.status();
@@ -140,8 +143,6 @@ bycorf::Task<absl::StatusOr<HttpResponse>> ReadResponse(
     bycorf::TcpStream& stream, HttpMethod method, std::size_t body_limit) {
   Reader reader(stream, body_limit);
   HttpResponse response;
-  std::optional<std::size_t> length;
-  bool chunked = false;
   std::size_t header_bytes = 0;
   do {
     auto line = co_await reader.Line();
@@ -153,8 +154,6 @@ bycorf::Task<absl::StatusOr<HttpResponse>> ReadResponse(
         status > 599 || status == 101)
       co_return absl::DataLossError("invalid HTTP status");
     response.status_ = status;
-    length.reset();
-    chunked = false;
     response.headers_.clear();
     header_bytes += line->size() + 2;
     for (;;) {
@@ -173,24 +172,30 @@ bycorf::Task<absl::StatusOr<HttpResponse>> ReadResponse(
         co_return absl::DataLossError("invalid HTTP header");
       value = absl::StripAsciiWhitespace(value);
       response.headers_.push_back({std::string(name), std::string(value)});
-      if (absl::EqualsIgnoreCase(name, "Content-Length")) {
-        std::size_t size;
-        if (!Number(value, 10, size) || (length && *length != size))
-          co_return absl::DataLossError("invalid Content-Length");
-        length = size;
-      } else if (absl::EqualsIgnoreCase(name, "Transfer-Encoding")) {
-        if (chunked || !absl::EqualsIgnoreCase(value, "chunked"))
-          co_return absl::DataLossError("unsupported Transfer-Encoding");
-        chunked = true;
-      }
     }
   } while (response.status_ < 200);
 
-  if (chunked && length)
-    co_return absl::DataLossError("ambiguous HTTP framing");
+  // Framing fields on HEAD and 304 can describe a hypothetical GET.
   if (method == HttpMethod::kHead || response.status_ == 204 ||
       response.status_ == 304)
     co_return response;
+
+  std::optional<std::size_t> length;
+  bool chunked = false;
+  for (const auto& [name, value] : response.headers_) {
+    if (absl::EqualsIgnoreCase(name, "Content-Length")) {
+      std::size_t size;
+      if (!Number(value, 10, size) || (length && *length != size))
+        co_return absl::DataLossError("invalid Content-Length");
+      length = size;
+    } else if (absl::EqualsIgnoreCase(name, "Transfer-Encoding")) {
+      if (chunked || !absl::EqualsIgnoreCase(value, "chunked"))
+        co_return absl::DataLossError("unsupported Transfer-Encoding");
+      chunked = true;
+    }
+  }
+  if (chunked && length)
+    co_return absl::DataLossError("ambiguous HTTP framing");
   if (!chunked) {
     auto status = co_await reader.Append(response.body_, length);
     if (!status.ok()) co_return status;
@@ -200,7 +205,13 @@ bycorf::Task<absl::StatusOr<HttpResponse>> ReadResponse(
     auto line = co_await reader.Line();
     if (!line.ok()) co_return line.status();
     std::size_t size;
-    if (!Number(line->substr(0, line->find(';')), 16, size))
+    auto digits = *line;
+    if (const auto ext = digits.find(';'); ext != digits.npos) {
+      digits = digits.substr(0, ext);
+      while (digits.ends_with(' ') || digits.ends_with('\t'))
+        digits.remove_suffix(1);
+    }
+    if (!Number(digits, 16, size))
       co_return absl::DataLossError("invalid HTTP chunk size");
     if (size == 0) break;
     auto status = co_await reader.Append(response.body_, size);
@@ -309,16 +320,23 @@ bycorf::Task<absl::Status> Expire(
 
 bycorf::Task<absl::StatusOr<HttpResponse>> Exchange(
     bycorf::TcpStream& stream, const HttpEndpoint& endpoint,
-    const HttpRequest& request, const std::string& head, std::size_t limit) {
+    const HttpRequest& request, const std::string& head, std::size_t limit,
+    std::chrono::steady_clock::time_point deadline) {
   if (endpoint.tls_) {
     auto status = co_await stream.StartTls(
         endpoint.tls_, false,
         endpoint.host_.empty() ? endpoint.address_ : endpoint.host_);
     if (!status.ok()) co_return status;
   }
+  if (std::chrono::steady_clock::now() >= deadline)
+    co_return absl::DeadlineExceededError(
+        "HTTP request timed out before sending headers");
   auto status = co_await stream.WriteAll(std::as_bytes(std::span(head)));
   if (!status.ok()) co_return status;
   if (!request.body_.empty()) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      co_return absl::DeadlineExceededError(
+          "HTTP request timed out before sending body");
     status = co_await stream.WriteAll(std::as_bytes(std::span(request.body_)));
     if (!status.ok()) co_return status;
   }
@@ -365,9 +383,14 @@ bycorf::Task<absl::StatusOr<HttpResponse>> HttpClient::Send(
     state->cancel.Cancel();
     (void)stream->Close();
   };
+  // Connect may have succeeded while this worker was descheduled. The timer
+  // runs on this worker too, so check before submitting TLS or HTTP bytes.
+  if (std::chrono::steady_clock::now() >= deadline)
+    co_return absl::DeadlineExceededError(
+        "HTTP request timed out before sending headers");
   worker->Spawn(Expire(*worker, state, deadline));
   auto result = co_await Exchange(*stream, endpoint_, request, *head,
-                                  options.max_response_body_bytes_);
+                                  options.max_response_body_bytes_, deadline);
   if (!state->failure.ok()) co_return state->failure;
   if (std::chrono::steady_clock::now() >= deadline)
     co_return absl::DeadlineExceededError("HTTP request timed out");

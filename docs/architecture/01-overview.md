@@ -61,10 +61,8 @@ replication handoff, and cluster paths are outside the validation scope. See
 the [build guide](../operations/building-and-packaging.md#experimental-dpdk-networking)
 and Bycorf's [network architecture](../../bycorf/docs/architecture/networking.md).
 
-The outbound HTTP client (`lavik::http_client`) runs each HTTP/1.1 exchange
-on the calling Bycorf worker. The caller supplies the resolved address and
-HTTP host, and can supply a client TLS context for authenticated HTTPS.
-One deadline covers the connection, handshake, write and bounded response read.
+The [outbound HTTP client](13-outbound-http.md) runs HTTP and HTTPS exchanges
+on the calling Bycorf worker.
 
 A separate `lavik-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,

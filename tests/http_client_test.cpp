@@ -26,6 +26,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 
 #include "absl/cleanup/cleanup.h"
 #include "bycorf/io/storage.h"
@@ -39,8 +40,8 @@ using namespace std::chrono_literals;
 // Both ends run on one worker. A blocking receive prevents the peer's timer
 // from resuming and sending the final chunk, and CTest times out.
 struct Peer {
-  std::string_view first;
-  std::string_view last{};
+  std::string first;
+  std::string last{};
   std::chrono::milliseconds delay{};
   std::shared_ptr<bycorf::TlsContext> tls{};
 };
@@ -78,38 +79,85 @@ bycorf::Task<absl::Status> Reply(bycorf::Worker& worker,
   co_return co_await stream.WriteAll(std::as_bytes(std::span(peer.last)));
 }
 
-bycorf::Task<absl::StatusOr<HttpResponse>> SendToPeer(
-    bycorf::Worker& worker, Peer peer, HttpRequest request,
-    HttpRequestOptions options = {},
-    const std::shared_ptr<bycorf::TlsContext>& tls = {},
-    std::string host = "localhost") {
-  auto listener = std::make_unique<bycorf::TcpListener>();
+absl::StatusOr<std::uint16_t> BindLoopback(bycorf::Worker& worker,
+                                           bycorf::TcpListener& listener) {
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   bycorf::ResolvedTcpAddress loopback{};
   std::memcpy(&loopback.address_, &address, sizeof(address));
   loopback.length_ = sizeof(address);
-  auto status = listener->Bind(&worker, loopback);
-  if (!status.ok()) co_return status;
+  auto status = listener.Bind(&worker, loopback);
+  if (!status.ok()) return status;
   socklen_t size = sizeof(address);
-  if (::getsockname(listener->NativeFd(), reinterpret_cast<sockaddr*>(&address),
+  if (::getsockname(listener.NativeFd(), reinterpret_cast<sockaddr*>(&address),
                     &size) != 0) {
-    (void)listener->Close();
-    co_return absl::InternalError("cannot read loopback listener port");
+    (void)listener.Close();
+    return absl::InternalError("cannot read loopback listener port");
   }
+  return ntohs(address.sin_port);
+}
+
+bycorf::Task<absl::StatusOr<HttpResponse>> SendToPeer(
+    bycorf::Worker& worker, Peer peer, HttpRequest request,
+    HttpRequestOptions options = {},
+    const std::shared_ptr<bycorf::TlsContext>& tls = {},
+    std::string host = "localhost") {
+  auto listener = std::make_unique<bycorf::TcpListener>();
+  auto port = BindLoopback(worker, *listener);
+  if (!port.ok()) co_return port.status();
   HttpClient client({.address_ = "127.0.0.1",
-                     .port_ = ntohs(address.sin_port),
+                     .port_ = *port,
                      .host_ = std::move(host),
                      .tls_ = tls});
   worker.Spawn(Reply(worker, std::move(listener), std::move(peer)));
   co_return co_await client.Send(std::move(request), options);
 }
 
+// Simulate a descheduled worker. Send submits its connect and suspends before
+// this queued task runs. The peer can accept a connection even though the
+// client can no longer start the PUT when it resumes.
+bycorf::Task<absl::Status> DelayWorkerResume() {
+  std::this_thread::sleep_for(100ms);
+  co_return absl::OkStatus();
+}
+
+bycorf::Task<absl::Status> CheckExpiredConnect(bycorf::Worker& worker) {
+  bycorf::TcpListener listener;
+  auto port = BindLoopback(worker, listener);
+  if (!port.ok()) co_return port.status();
+  absl::Cleanup close_listener = [&] { (void)listener.Close(); };
+  HttpClient client({.address_ = "127.0.0.1", .port_ = *port});
+  HttpRequest put{
+      .method_ = HttpMethod::kPut, .target_ = "/object", .body_ = "value"};
+  worker.Spawn(DelayWorkerResume());
+  auto reply = co_await client.Send(std::move(put), {.timeout_ = 50ms});
+  if (!absl::IsDeadlineExceeded(reply.status()) ||
+      !reply.status().message().contains("before sending headers"))
+    co_return absl::InternalError(
+        "PUT should expire after connecting and before writing: " +
+        reply.status().ToString());
+
+  auto accepted = co_await listener.Accept();
+  if (!accepted.ok()) co_return accepted.status();
+  bycorf::TcpStream stream(*accepted);
+  auto borrow = stream.BorrowStorage();
+  absl::Cleanup close_stream = [&] { (void)stream.Close(); };
+  std::array<std::byte, 1> byte;
+  auto count = co_await stream.ReadSome(byte);
+  if (!count.ok()) co_return count.status();
+  if (*count != 0)
+    co_return absl::InternalError("expired PUT sent request bytes");
+  co_return absl::OkStatus();
+}
+
 bycorf::Task<absl::Status> CheckClient(
     bycorf::Worker& worker,
     const std::shared_ptr<bycorf::TlsContext>& server_tls,
     const std::shared_ptr<bycorf::TlsContext>& client_tls) {
+  auto expired = co_await CheckExpiredConnect(worker);
+  if (!expired.ok()) co_return expired;
+
   HttpRequest get{.target_ = "/object"};
   Peer chunked{.first =
                    "HTTP/1.1 103 Early Hints\r\nLink: hint\r\n\r\nHTTP/1.1 200 "
@@ -127,13 +175,45 @@ bycorf::Task<absl::Status> CheckClient(
 
   reply = co_await SendToPeer(worker, chunked, get, {}, client_tls,
                               "wrong.invalid");
-  if (reply.ok()) co_return absl::InternalError("TLS accepted the wrong peer");
+  // The same certificate and trust root just succeeded for localhost. Require
+  // a verification error from TLS itself when only the requested name changes.
+  const auto& tls_error = reply.status();
+  if (!((absl::IsInternal(tls_error) &&
+         tls_error.message().starts_with("TLS handshake failed:") &&
+         tls_error.message().contains("certificate verify failed")) ||
+        (absl::IsPermissionDenied(tls_error) &&
+         tls_error.message().contains("hostname mismatch"))))
+    co_return absl::InternalError(
+        "expected certificate verification failure for wrong.invalid: " +
+        tls_error.ToString());
 
   HttpRequest head{.method_ = HttpMethod::kHead, .target_ = "/object"};
   Peer headers{.first = "HTTP/1.1 200 OK\r\nContent-Length: 8192\r\n\r\n"};
   reply = co_await SendToPeer(worker, headers, head);
   if (!reply.ok() || !reply->body_.empty())
     co_return absl::DataLossError("HEAD expected headers only");
+
+  Peer metadata{
+      .first = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"};
+  reply = co_await SendToPeer(worker, metadata, head);
+  if (!reply.ok() || !reply->body_.empty() ||
+      reply->Header("Transfer-Encoding") != "gzip, chunked")
+    co_return absl::InternalError("HEAD transfer coding metadata lost");
+
+  // Deliver CR and LF in different reads on a maximum-length chunk-size line.
+  std::string first = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+  std::string size_line = "1 \t;x=";
+  size_line.resize(8192, 'a');
+  first += size_line + "\r";
+  Peer split{.first = first, .last = "\nx\r\n0\r\n\r\n", .delay = 10ms};
+  reply = co_await SendToPeer(worker, split, get);
+  if (!reply.ok() || reply->body_ != "x")
+    co_return absl::InternalError("split chunk-size delimiter rejected");
+  first.insert(first.size() - 1, 1, 'a');
+  split.first = first;
+  reply = co_await SendToPeer(worker, split, get);
+  if (!absl::IsDataLoss(reply.status()))
+    co_return absl::InternalError("accepted oversized chunk-size line");
 
   reply = co_await SendToPeer(worker, headers, get,
                               {.max_response_body_bytes_ = 16});
