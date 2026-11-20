@@ -1550,6 +1550,81 @@ def checksum_rejection(root):
     )
 
 
+def full_override_pressure(root, queued_commands=0):
+    # All keys share the first physical partition. Mutate them after capture
+    # starts but before any baseline is covered: these are replacements, not
+    # FIFO entries. Their credit alone exceeds both interleave watermarks.
+    tag = next(
+        f"override-{i}" for i in range(100000) if C.redis_slot(f"override-{i}") == 0
+    )
+    keys = [f"{{{tag}}}key-{i}" for i in range(2000)]
+    marker = root / f"hold-baseline-scan-{queued_commands}"
+    marker.touch()
+
+    def seed(writer):
+        for key in keys:
+            assert writer.call("SET", key, "baseline") == "OK"
+
+    with pair(
+        root,
+        f"full-override-pressure-{queued_commands}",
+        source_workers=1,
+        target_workers=1,
+        source_faults={"LAVIK_REPLICATION_FULLSYNC_SCAN_PAUSE_FILE": str(marker)},
+        source_extra_args=("--replication-publish-queue-mb-per-worker", "1"),
+        require_seed_before_full=True,
+        seed=seed,
+    ) as (meta, source, target, writer):
+        H.wait_until(
+            "baseline capture paused",
+            20,
+            lambda: "fault pause reached: LAVIK_REPLICATION_FULLSYNC_SCAN_PAUSE_FILE"
+            in Path(source.log_path).read_text(),
+        )
+        for key in keys[:1000]:
+            assert writer.call("SET", key, "replacement") == "OK"
+        replacement_bytes = source.metric(
+            "lavik_fullsync_publish_queue_bytes", '{worker="0"}'
+        )
+        capacity = source.metric(
+            "lavik_fullsync_publish_queue_capacity_bytes", '{worker="0"}'
+        )
+        assert replacement_bytes > capacity // 8, (replacement_bytes, capacity)
+        # PUBLISH always enters the session FIFO, even before partition
+        # handoff. More than the initial drain quantum also exercises the
+        # transition from a nonempty FIFO to replacement-only occupancy.
+        for i in range(queued_commands):
+            assert writer.call("PUBLISH", "override-pressure", str(i)) == 0
+        H.log(
+            f"FULL pressure: {replacement_bytes} replacement bytes, "
+            f"{capacity} capacity, {queued_commands} FIFO commands"
+        )
+        marker.unlink()
+        # The buggy publisher spins on an empty FIFO and cannot serve this
+        # foreground command, finish FULL, or observe session cancellation.
+        writer.socket.settimeout(5)
+        H.wait_until(
+            "FULL with override pressure completes",
+            30,
+            lambda: (
+                writer.call("PING") == "PONG"
+                and C.readonly_get(target, keys[0]) == "replacement"
+            ),
+        )
+        ready(meta)
+        reader = Client(target, readonly=True)
+        try:
+            for i, key in enumerate(keys):
+                assert reader.call("GET", key) == (
+                    "replacement" if i < 1000 else "baseline"
+                )
+            assert writer.call("SET", keys[0], "live-tail") == "OK"
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("GET", keys[0]) == "live-tail"
+        finally:
+            reader.close()
+
+
 def full_tail(root):
     with pair(
         root,
@@ -2343,6 +2418,15 @@ def main():
     ) as directory:
         root = Path(directory)
         if len(sys.argv) > 5:
+            if sys.argv[5:] == ["full_override_pressure"]:
+                if not C.has_fault(
+                    C.DATA, b"LAVIK_REPLICATION_FULLSYNC_SCAN_PAUSE_FILE"
+                ):
+                    sys.exit(77)
+                full_override_pressure(root)
+                full_override_pressure(root, queued_commands=256)
+                H.log("PASS")
+                return
             if sys.argv[5:] == ["ordered_cold_recovery"]:
                 ordered_cold_recovery(root)
                 H.log("PASS")
