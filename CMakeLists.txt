@@ -753,6 +753,11 @@ if (BUILD_TESTING)
     add_link_options("$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-flto=thin>")
   endif()
 
+  # Local protocol test with RustFS and Azurite; requires Boost.Beast headers.
+  add_executable(lavik_object_store_probe EXCLUDE_FROM_ALL
+    tests/object_store/probe.cpp)
+  target_link_libraries(lavik_object_store_probe PRIVATE bycorf::core)
+
   include(FetchContent)
 
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
