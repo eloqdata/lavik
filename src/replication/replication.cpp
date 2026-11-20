@@ -10342,14 +10342,18 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   };
 
   auto drain_fullsync_publish_queue =
-      [&](std::size_t max_items) -> Task<absl::Status> {
+      [&](std::size_t max_items) -> Task<absl::StatusOr<std::size_t>> {
     std::size_t drained_items = 0;
     while (drained_items < max_items) {
+      if (session->cancelled()) {
+        co_return absl::CancelledError(
+            "replication session ended while draining full-sync publisher");
+      }
       const std::size_t remaining_items = max_items - drained_items;
       auto pending = storage_->PeekFullSyncPublishItems(
           session->id_, std::min(remaining_items, kBacklogBatchFrames));
       if (!pending.ok()) co_return pending.status();
-      if (pending->empty()) co_return absl::OkStatus();
+      if (pending->empty()) co_return drained_items;
 
       if (pending->front().record_.has_value()) {
         const storage::FullSyncPublishItem& item = pending->front();
@@ -10534,7 +10538,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         }
       }
     }
-    co_return absl::OkStatus();
+    co_return drained_items;
   };
 
   // Function libraries live outside the storage snapshot. Send one
@@ -10648,12 +10652,15 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   // partition coverage, and storage latency. Normally yield back to the
   // snapshot after one small quantum. Once this flow's own queue crosses the
   // high watermark, prioritize live commands until it reaches the low
-  // watermark. This changes publisher duty cycle before capacity admission
-  // has to stop foreground writes; it does not weaken the capacity limit.
+  // watermark or its FIFO empties. Queue accounting also includes captured
+  // replacements: only the caller's override drain can release that credit.
+  // Keep it in admission accounting, but never spin an empty FIFO on it.
   auto drain_interleaved_publish_queue = [&]() -> Task<absl::Status> {
-    absl::Status drained =
+    auto drained =
         co_await drain_fullsync_publish_queue(kFullSyncInterleaveCommands);
-    if (!drained.ok()) co_return drained;
+    if (!drained.ok()) co_return drained.status();
+
+    if (*drained == 0) co_return absl::OkStatus();
 
     auto info = storage_->GetFullSyncPublishQueueInfo(session->id_);
     if (!info.ok()) co_return info.status();
@@ -10665,8 +10672,12 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     const std::size_t low_watermark =
         std::max<std::size_t>(1, high_watermark / 2);
     do {
+      // A batch can finish synchronously. Give foreground work and session
+      // cancellation a scheduling opportunity before consuming another one.
+      co_await bycorf::Yield(*bycorf::ThisWorker().self_);
       drained = co_await drain_fullsync_publish_queue(kBacklogBatchFrames);
-      if (!drained.ok()) co_return drained;
+      if (!drained.ok()) co_return drained.status();
+      if (*drained == 0) co_return absl::OkStatus();
       info = storage_->GetFullSyncPublishQueueInfo(session->id_);
       if (!info.ok()) co_return info.status();
       // Admitted bytes have reserved capacity but are not dequeueable until
@@ -10947,6 +10958,16 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           }
           co_await bycorf::Yield(*bycorf::ThisWorker().self_);
         }
+        LAVIK_FAULT_INJECT({
+          // Hold a real SCANNING capture before baseline coverage so a test
+          // can deterministically accumulate replacement credit.
+          auto held = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_REPLICATION_FULLSYNC_SCAN_PAUSE_FILE");
+          if (!held.ok()) {
+            cleanup();
+            co_return held;
+          }
+        });
         {
           // An admitted write may have populated this DB while Begin waited.
           // Scan after admission drains instead of using an earlier empty
@@ -11080,11 +11101,11 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       cleanup();
       co_return ack_state->status_;
     }
-    absl::Status published =
+    auto published =
         co_await drain_fullsync_publish_queue(kFullSyncReadyWaitCommands);
     if (!published.ok()) {
       cleanup();
-      co_return published;
+      co_return published.status();
     }
     if (session->cancelled()) {
       cleanup();
@@ -11101,12 +11122,12 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   }
   session->MarkSnapshotScanComplete();
   do {
-    absl::Status published = co_await drain_fullsync_publish_queue(
+    auto published = co_await drain_fullsync_publish_queue(
         session->AllSnapshotScansComplete() ? kFullSyncInterleaveCommands
                                             : kFullSyncReadyWaitCommands);
     if (!published.ok()) {
       cleanup();
-      co_return published;
+      co_return published.status();
     }
     if (session->cancelled()) {
       cleanup();
@@ -11193,11 +11214,11 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     cleanup();
     co_return drained;
   }
-  absl::Status queue_drained = co_await drain_fullsync_publish_queue(
+  auto queue_drained = co_await drain_fullsync_publish_queue(
       std::numeric_limits<std::size_t>::max());
   if (!queue_drained.ok()) {
     cleanup();
-    co_return queue_drained;
+    co_return queue_drained.status();
   }
   if (flow_id == 0) {
     absl::Status functions_sent = co_await send_function_catalog();
