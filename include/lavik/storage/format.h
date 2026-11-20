@@ -35,11 +35,11 @@ inline constexpr std::size_t kBlockHeaderBytes =
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-// Unchanged payload and metadata layouts keep their v1 encoding, including
-// formats shared with replication and RDB export.
+// Shared baseline for independently encoded payloads, frames and metadata.
+// Give a layout its own version when it evolves; keep this baseline stable.
+inline constexpr std::uint32_t kCommonFormatVersion = 1;
+// Storage-set labels and block headers have their own compatibility history.
 inline constexpr std::uint32_t kStorageFormatVersionLegacyV1 = 1;
-// Device labels fence older readers before writers emit location-derived
-// headers.
 inline constexpr std::uint32_t kStorageFormatVersion = 2;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
@@ -82,7 +82,7 @@ enum class MetadataPageKind : std::uint16_t {
 
 struct MetadataPageHeader {
   std::uint64_t magic_ = kMetadataPageMagic;
-  std::uint32_t version_ = kStorageFormatVersionLegacyV1;
+  std::uint32_t version_ = kCommonFormatVersion;
   MetadataPageKind kind_ = MetadataPageKind::kEpochs;
   std::uint16_t header_bytes_ = 0;
   std::uint32_t page_index_ = 0;
@@ -325,7 +325,7 @@ static_assert(offsetof(BlockHeader, version_) == 16);
 // in memory.
 struct ReplicationFrameHeader {
   std::uint64_t magic_ = kReplicationFrameMagic;
-  std::uint32_t version_ = kStorageFormatVersionLegacyV1;
+  std::uint32_t version_ = kCommonFormatVersion;
   std::uint16_t header_bytes_ = 0;
   ReplicationEventKind kind_ = ReplicationEventKind::kMutation;
   std::uint8_t flags_ = 0;
@@ -418,7 +418,7 @@ struct RecordHeader {
 
 struct ExtentManifestHeader {
   std::uint64_t magic_ = kExtentManifestMagic;
-  std::uint32_t version_ = kStorageFormatVersionLegacyV1;
+  std::uint32_t version_ = kCommonFormatVersion;
   std::uint32_t extent_count_ = 0;
 };
 
@@ -438,7 +438,7 @@ struct ExtentRef {
 // the same valid value.
 struct SystemStateRoot {
   std::uint64_t magic_ = kSystemStateRootMagic;
-  std::uint32_t version_ = kStorageFormatVersionLegacyV1;
+  std::uint32_t version_ = kCommonFormatVersion;
   std::uint32_t root_bytes_ = 0;
   std::uint64_t generation_ = 0;
   ExtentRef manifest_{};

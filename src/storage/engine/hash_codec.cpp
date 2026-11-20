@@ -123,7 +123,7 @@ absl::StatusOr<HashValueReader> HashValueReader::Open(
       !ReadU32(payload, &offset, &element_count) ||
       !ReadU32(payload, &offset, &reserved) ||
       !ReadU64(payload, &offset, &encoded_bytes) || magic != kHashValueMagic ||
-      version != kStorageFormatVersionLegacyV1 ||
+      version != kCommonFormatVersion ||
       header_bytes != kHashValueHeaderBytes || element_count == 0 ||
       reserved != 0 || encoded_bytes != payload.size()) {
     return absl::InternalError("invalid Hash value header");
@@ -298,7 +298,7 @@ absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
 
   auto& output = result.payload_;
   output.AppendUnsigned(kHashValueMagic, 8);
-  output.AppendUnsigned(kStorageFormatVersionLegacyV1, 4);
+  output.AppendUnsigned(kCommonFormatVersion, 4);
   output.AppendUnsigned(kHashValueHeaderBytes, 4);
   output.AppendUnsigned(result.count_, 4);
   output.AppendUnsigned(0, 4);
@@ -354,7 +354,7 @@ absl::StatusOr<std::string> EncodeHashValue(const HashValue& value) {
 
   output.reserve(bytes);
   AppendU64(&output, kHashValueMagic);
-  AppendU32(&output, kStorageFormatVersionLegacyV1);
+  AppendU32(&output, kCommonFormatVersion);
   AppendU32(&output, kHashValueHeaderBytes);
   AppendU32(&output, static_cast<std::uint32_t>(value.entries_.size()));
   AppendU32(&output, 0);

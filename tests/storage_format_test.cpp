@@ -545,6 +545,7 @@ TEST(StorageFormatTest, ComputesRedisClusterSlotsAndHashTags) {
 
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   using namespace lavik::storage;
+  static_assert(kCommonFormatVersion == 1);
   static_assert(kStorageFormatVersionLegacyV1 == 1);
   static_assert(kStorageFormatVersion == 2);
 
@@ -614,7 +615,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   SystemStateRoot system_root{
       .magic_ = kSystemStateRootMagic,
-      .version_ = kStorageFormatVersionLegacyV1,
+      .version_ = kCommonFormatVersion,
       .root_bytes_ = sizeof(SystemStateRoot),
       .generation_ = 41,
       .manifest_ =

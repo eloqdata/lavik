@@ -209,7 +209,7 @@ absl::StatusOr<HashGroupEncoder> HashGroupEncoder::Create(
   EncodeGroupHeader(bytes, group, group.field_count(), *size);
   if (!group.value_.entries_.empty()) {
     Store(bytes, 48, kHashValueMagic, 8);
-    Store(bytes, 56, kStorageFormatVersionLegacyV1, 4);
+    Store(bytes, 56, kCommonFormatVersion, 4);
     Store(bytes, 60, kHashValueHeaderBytes, 4);
     Store(bytes, 64, group.value_.entries_.size(), 4);
     Store(bytes, 72, *size, 8);
@@ -495,7 +495,7 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
             if (count == 0) return total;
             std::span<char> compact(output + kGroupHeaderBytes, bytes);
             Store(compact, 0, kHashValueMagic, 8);
-            Store(compact, 8, kStorageFormatVersionLegacyV1, 4);
+            Store(compact, 8, kCommonFormatVersion, 4);
             Store(compact, 12, kCompactHeaderBytes, 4);
             Store(compact, 16, count, 4);
             Store(compact, 20, 0, 4);
@@ -640,7 +640,7 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
       if (count == 0) return encoded_bytes;
       std::span<char> compact(output + kGroupHeaderBytes, bytes);
       Store(compact, 0, kHashValueMagic, 8);
-      Store(compact, 8, kStorageFormatVersionLegacyV1, 4);
+      Store(compact, 8, kCommonFormatVersion, 4);
       Store(compact, 12, kCompactHeaderBytes, 4);
       Store(compact, 16, count, 4);
       Store(compact, 20, 0, 4);

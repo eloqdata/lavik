@@ -400,7 +400,7 @@ void EncodeSystemStateRoot(const SystemStateRoot& root,
   assert(output.size() >= sizeof(SystemStateRoot));
   std::fill(output.begin(), output.end(), std::byte{0});
   StoreLittleEndian64(output, 0, kSystemStateRootMagic);
-  StoreLittleEndian32(output, 8, kStorageFormatVersionLegacyV1);
+  StoreLittleEndian32(output, 8, kCommonFormatVersion);
   StoreLittleEndian32(output, 12, sizeof(SystemStateRoot));
   StoreLittleEndian64(output, 16, root.generation_);
   StoreLittleEndian64(output, 24, root.manifest_.block_id_);
@@ -414,7 +414,7 @@ bool DecodeSystemStateRoot(std::span<const std::byte> input,
                            SystemStateRoot* root) noexcept {
   if (root == nullptr || input.size() < sizeof(SystemStateRoot) ||
       LoadLittleEndian64(input.data()) != kSystemStateRootMagic ||
-      LoadLittleEndian32(input.data() + 8) != kStorageFormatVersionLegacyV1 ||
+      LoadLittleEndian32(input.data() + 8) != kCommonFormatVersion ||
       LoadLittleEndian32(input.data() + 12) != sizeof(SystemStateRoot)) {
     return false;
   }
@@ -488,7 +488,7 @@ void EncodeMetadataPage(
   std::fill(output.begin(), output.end(), std::byte{0});
   MetadataPageHeader header{
       .magic_ = kMetadataPageMagic,
-      .version_ = kStorageFormatVersionLegacyV1,
+      .version_ = kCommonFormatVersion,
       .kind_ = kind,
       .header_bytes_ = sizeof(MetadataPageHeader),
       .page_index_ = page_index,
@@ -513,7 +513,7 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
   MetadataPageHeader header{};
   std::memcpy(&header, input.data(), sizeof(header));
   if (header.magic_ != kMetadataPageMagic ||
-      header.version_ != kStorageFormatVersionLegacyV1 ||
+      header.version_ != kCommonFormatVersion ||
       header.kind_ != expected_kind ||
       header.header_bytes_ != sizeof(MetadataPageHeader) ||
       header.page_index_ != expected_page_index || header.generation_ == 0 ||
@@ -1001,7 +1001,7 @@ bool EncodeReplicationFrameHeader(
     const ReplicationFrameHeader& header,
     std::span<std::byte, sizeof(ReplicationFrameHeader)> output) noexcept {
   if (header.magic_ != kReplicationFrameMagic ||
-      header.version_ != kStorageFormatVersionLegacyV1 ||
+      header.version_ != kCommonFormatVersion ||
       header.header_bytes_ != sizeof(ReplicationFrameHeader) ||
       header.lsn_ == 0 || header.partition_id_ >= kLogicalStorageShards ||
       header.reserved_ != 0 ||
