@@ -115,8 +115,7 @@ class PrivateDisk {
          input.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
          ++id) {
       BlockHeader block;
-      if (!DecodeBlockHeaderPages(id,
-                                  std::span<const std::byte, kBlockHeaderBytes>(
+      if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
                                       bytes.data(), kBlockHeaderBytes),
                                   &block) ||
           (block.kind_ != BlockKind::kRecords &&

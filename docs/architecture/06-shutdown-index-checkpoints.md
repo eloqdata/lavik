@@ -218,8 +218,8 @@ allocator exhaustion is process-fatal rather than a fallback condition. Every
 nonempty `ScanHashMap` receives the same final power-of-two bucket count and
 75-percent target it would have after normal growth.
 
-After that allocation barrier, each scanner validates block identity and
-allocation epoch, generation, shard, bounds, entry counts, and CRC32C payload
+After that allocation barrier, each scanner validates the allocation epoch,
+checkpoint generation, shard, bounds, entry counts, and CRC32C payload
 checksums. Before those body reads, the prefix results redistribute every body
 block to its durable shard and order object fragments by their stream sequence.
 That owner decodes and installs the block locally, avoiding a cross-worker

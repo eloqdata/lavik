@@ -353,7 +353,7 @@ std::vector<std::uint64_t> ReadAllocatedRecordBlocks(const std::string& path) {
       Fail("failed to read block header during test scan");
     }
     lavik::storage::BlockHeader decoded{};
-    if (lavik::storage::DecodeBlockHeaderPages(local, header, &decoded) &&
+    if (lavik::storage::DecodeBlockHeaderPages(header, &decoded) &&
         decoded.kind_ == lavik::storage::BlockKind::kRecords) {
       blocks.push_back(local);
     }
@@ -407,16 +407,15 @@ bool BlockBitmapBitIsClear(const std::string& path, std::uint64_t block_id) {
           (1U << bit)) == 0;
 }
 
-std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
-    const std::string& path) {
+void InstallLegacyHeaderWithObsoleteId(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
-    Fail("failed to open data file while injecting a stale block header");
+    Fail("failed to open data file while injecting a legacy block header");
   }
   const off_t bytes = ::lseek(fd, 0, SEEK_END);
   if (bytes < 0) {
     ::close(fd);
-    Fail("failed to size data file while injecting a stale block header");
+    Fail("failed to size data file while injecting a legacy block header");
   }
   const std::uint64_t capacity_blocks =
       static_cast<std::uint64_t>(bytes) / lavik::storage::kStorageBlockBytes;
@@ -426,7 +425,6 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
           candidate{};
   std::array<std::byte, lavik::storage::kBlockHeaderBytes> committed{};
   std::uint32_t committed_local = 0;
-  std::uint32_t unused_local = 0;
   for (std::uint32_t local = begin; local < capacity_blocks; ++local) {
     const off_t offset =
         static_cast<off_t>(local) * lavik::storage::kStorageBlockBytes;
@@ -434,53 +432,39 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
         ::pread(fd, candidate.data(), candidate.size(), offset);
     if (read != static_cast<ssize_t>(candidate.size())) {
       ::close(fd);
-      Fail("failed to scan headers while injecting a stale block header");
+      Fail("failed to scan headers while injecting a legacy block header");
     }
     lavik::storage::BlockHeader decoded{};
-    if (lavik::storage::DecodeBlockHeaderPages(local, candidate, &decoded) &&
+    if (lavik::storage::DecodeBlockHeaderPages(candidate, &decoded) &&
         decoded.kind_ == lavik::storage::BlockKind::kRecords) {
-      if (committed_local == 0) {
-        // Only legacy headers carry a source location. Manufacture that wire
-        // format to exercise the stale-media branch on an upgraded device.
-        const auto store = [&](std::size_t offset, auto value) {
-          std::memcpy(committed.data() + offset, &value, sizeof(value));
-        };
-        store(0, decoded.magic_);
-        store(8, std::uint64_t{local});
-        store(16, lavik::storage::kStorageFormatVersionLegacyV1);
-        store(20, decoded.header_bytes_);
-        store(24, decoded.block_bytes_);
-        store(28, decoded.writer_id_);
-        store(32, decoded.allocation_epoch_);
-        store(40, decoded.committed_bytes_);
-        store(44, decoded.record_count_);
-        store(48, decoded.max_lsn_);
-        store(56, decoded.header_sequence_);
-        store(64, decoded.layout_worker_count_);
-        store(68, decoded.kind_);
-        store(60, lavik::storage::Crc32c(std::span(committed).first(
-                      lavik::storage::kBlockHeaderSlotBytes)));
-        committed_local = local;
-      }
-      continue;
-    }
-    if (unused_local == 0 &&
-        std::all_of(candidate.begin(), candidate.end(),
-                    [](std::byte byte) { return byte == std::byte{0}; })) {
-      unused_local = local;
+      const auto store = [&](std::size_t offset, auto value) {
+        std::memcpy(committed.data() + offset, &value, sizeof(value));
+      };
+      store(0, decoded.magic_);
+      store(8, lavik::storage::kInvalidBlockId);
+      store(16, lavik::storage::kStorageFormatVersionLegacyV1);
+      store(20, decoded.header_bytes_);
+      store(24, decoded.block_bytes_);
+      store(28, decoded.writer_id_);
+      store(32, decoded.allocation_epoch_);
+      store(40, decoded.committed_bytes_);
+      store(44, decoded.record_count_);
+      store(48, decoded.max_lsn_);
+      store(56, decoded.header_sequence_);
+      store(64, decoded.layout_worker_count_);
+      store(68, decoded.kind_);
+      store(60, lavik::storage::Crc32c(std::span(committed).first(
+                    lavik::storage::kBlockHeaderSlotBytes)));
+      committed_local = local;
+      break;
     }
   }
-  if (committed_local == 0 || unused_local == 0) {
+  if (committed_local == 0) {
     ::close(fd);
-    Fail("test data file lacks a committed and an unused block");
-  }
-  const std::uint64_t target = lavik::storage::MakeBlockId(0, unused_local);
-  if (BlockBitmapBitIsClear(path, target)) {
-    ::close(fd);
-    Fail("stale-header target was not activated in the allocation bitmap");
+    Fail("test image has no committed record block");
   }
   const off_t target_offset =
-      static_cast<off_t>(unused_local) * lavik::storage::kStorageBlockBytes;
+      static_cast<off_t>(committed_local) * lavik::storage::kStorageBlockBytes;
   const ssize_t written =
       ::pwrite(fd, committed.data(), committed.size(), target_offset);
   const int sync_error =
@@ -488,9 +472,8 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
   const int close_error = ::close(fd);
   if (written != static_cast<ssize_t>(committed.size()) || sync_error != 0 ||
       close_error != 0) {
-    Fail("failed to inject and persist a stale block header");
+    Fail("failed to inject and persist a legacy block header");
   }
-  return target;
 }
 
 // These fixtures target ordinary-block defrag, including its PAUSE contract.
@@ -504,13 +487,13 @@ std::string OrdinaryKey(std::string_view suffix) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const bool stale_header_only =
-      argc == 3 && std::string_view(argv[2]) == "--stale-header-only";
+  const bool legacy_header_only =
+      argc == 3 && std::string_view(argv[2]) == "--legacy-header-only";
   const bool paused_defrag_only =
       argc == 3 && std::string_view(argv[2]) == "--paused-defrag-only";
-  if (argc != 2 && !stale_header_only && !paused_defrag_only) {
+  if (argc != 2 && !legacy_header_only && !paused_defrag_only) {
     std::cerr << "usage: flushdb_reclaim_e2e_test /path/to/lavik "
-                 "[--stale-header-only|--paused-defrag-only]\n";
+                 "[--legacy-header-only|--paused-defrag-only]\n";
     return 2;
   }
 
@@ -521,14 +504,14 @@ int main(int argc, char** argv) {
   const std::string unequal_path_b = prefix + "-unequal-b.data";
   const std::string expiry_full_path = prefix + "-expiry-full.data";
   const std::string defrag_crash_path = prefix + "-defrag-crash.data";
-  const std::string stale_header_path = prefix + "-stale-header.data";
+  const std::string legacy_header_path = prefix + "-legacy-header.data";
   const std::string log_path = prefix + ".log";
   (void)::unlink(data_path.c_str());
   (void)::unlink(unequal_path_a.c_str());
   (void)::unlink(unequal_path_b.c_str());
   (void)::unlink(expiry_full_path.c_str());
   (void)::unlink(defrag_crash_path.c_str());
-  (void)::unlink(stale_header_path.c_str());
+  (void)::unlink(legacy_header_path.c_str());
   (void)::unlink(log_path.c_str());
 
   try {
@@ -600,7 +583,7 @@ int main(int argc, char** argv) {
     // has no foreground block available. Active expiration must be able to
     // retire those records in memory, allowing defrag to reclaim their block
     // and restore write availability.
-    if (!stale_header_only) {
+    if (!legacy_header_only) {
       // Keep one foreground block after the fixed defrag reserve. This
       // scenario needs every expiring record in the same reclaim candidate;
       // it must not depend on an empty Function catalog consuming capacity.
@@ -682,36 +665,30 @@ int main(int argc, char** argv) {
       }
     }
 
-    // The bitmap means activated, not committed. Model an affected on-disk
-    // image by putting a CRC-valid committed header in another activated but
-    // unwritten physical block. Recovery must ignore the block-id mismatch,
-    // retain current data, and leave the bitmap unchanged.
-    CreateDataFile(stale_header_path, 96ULL * 1024 * 1024);
+    // Rewrite a live record block using the v1 layout and a CRC-valid obsolete
+    // ID. Recovery must discover its records at the scanned physical address.
+    CreateDataFile(legacy_header_path, 96ULL * 1024 * 1024);
     {
-      ServerProcess server(argv[1], port, {stale_header_path}, log_path, 10);
+      ServerProcess server(argv[1], port, {legacy_header_path}, log_path, 10);
       RespClient client = Connect(port);
       Expect(client.Command({"SET", "fresh-format", "fresh-value"}), "+OK",
-             "stale-header initial SET");
+             "legacy-header initial SET");
       server.Stop();
     }
-    const std::uint64_t stale_header_target =
-        CopyCommittedHeaderToUnusedAllocatedBlock(stale_header_path);
+    InstallLegacyHeaderWithObsoleteId(legacy_header_path);
     {
-      ServerProcess server(argv[1], port, {stale_header_path}, log_path, 10);
+      ServerProcess server(argv[1], port, {legacy_header_path}, log_path, 10);
       RespClient client = Connect(port);
-      Expect(client.Command({"DBSIZE"}), ":1", "stale-header DBSIZE");
+      Expect(client.Command({"DBSIZE"}), ":1", "legacy-header DBSIZE");
       Expect(client.Command({"EXISTS", "missing", "fresh-format"}), ":1",
-             "stale-header EXISTS");
+             "legacy-header EXISTS");
       Expect(client.Command({"GET", "fresh-format"}), "$11",
-             "stale-header GET");
+             "legacy-header GET");
       server.Stop();
     }
-    if (BlockBitmapBitIsClear(stale_header_path, stale_header_target)) {
-      Fail("recovery cleared the stale-header allocation bit");
-    }
-    if (stale_header_only) {
+    if (legacy_header_only) {
       (void)::unlink(data_path.c_str());
-      (void)::unlink(stale_header_path.c_str());
+      (void)::unlink(legacy_header_path.c_str());
       (void)::unlink(log_path.c_str());
       return 0;
     }
@@ -843,7 +820,7 @@ int main(int argc, char** argv) {
     (void)::unlink(unequal_path_b.c_str());
     (void)::unlink(expiry_full_path.c_str());
     (void)::unlink(defrag_crash_path.c_str());
-    (void)::unlink(stale_header_path.c_str());
+    (void)::unlink(legacy_header_path.c_str());
     (void)::unlink(log_path.c_str());
     return 0;
   } catch (const std::exception& error) {
@@ -857,7 +834,7 @@ int main(int argc, char** argv) {
     (void)::unlink(unequal_path_b.c_str());
     (void)::unlink(expiry_full_path.c_str());
     (void)::unlink(defrag_crash_path.c_str());
-    (void)::unlink(stale_header_path.c_str());
+    (void)::unlink(legacy_header_path.c_str());
     (void)::unlink(log_path.c_str());
     return 1;
   }

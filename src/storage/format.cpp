@@ -540,7 +540,7 @@ namespace {
 // Frozen layout of a v1 slot. Its version discriminator is shared with v2.
 struct BlockHeaderLegacyV1 {
   std::uint64_t magic_;
-  std::uint64_t block_id_;
+  std::uint64_t unused_block_id_;  // Retained only for the v1 layout and CRC.
   std::uint32_t version_;
   std::uint32_t header_bytes_;
   std::uint32_t block_bytes_;
@@ -566,11 +566,10 @@ static_assert(offsetof(BlockHeaderLegacyV1, version_) ==
               offsetof(BlockHeader, version_));
 
 [[gnu::cold, gnu::noinline]] void DecodeLegacyBlockFields(
-    std::span<const std::byte, kBlockHeaderSlotBytes> page, BlockHeader& header,
-    std::uint64_t& block_id) noexcept {
+    std::span<const std::byte, kBlockHeaderSlotBytes> page,
+    BlockHeader& header) noexcept {
   BlockHeaderLegacyV1 legacy;
   std::memcpy(&legacy, page.data(), sizeof(legacy));
-  block_id = legacy.block_id_;
   header = BlockHeader{
       .magic_ = legacy.magic_,
       .allocation_epoch_ = legacy.allocation_epoch_,
@@ -609,22 +608,19 @@ void EncodeBlockHeader(
               sizeof(checksum));
 }
 
-namespace {
-// v2 uses the caller's address; v1 supplies its own for the winning-slot check.
-bool DecodeBlockSlot(std::uint64_t& block_id,
-                     std::span<const std::byte, kBlockHeaderSlotBytes> input,
-                     BlockHeader* header) noexcept {
+bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
+                       BlockHeader* header) noexcept {
+  if (header == nullptr) return false;
   BlockHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
   if (decoded.magic_ != kBlockMagic) return false;
   std::size_t checksum_offset = offsetof(BlockHeader, checksum_);
   if (decoded.version_ != kStorageFormatVersion) [[unlikely]] {
     if (decoded.version_ != kStorageFormatVersionLegacyV1) return false;
-    DecodeLegacyBlockFields(input, decoded, block_id);
+    DecodeLegacyBlockFields(input, decoded);
     checksum_offset = offsetof(BlockHeaderLegacyV1, checksum_);
   }
-  if (block_id == kInvalidBlockId || LocalBlockId(block_id) == 0 ||
-      decoded.header_bytes_ != kBlockHeaderBytes ||
+  if (decoded.header_bytes_ != kBlockHeaderBytes ||
       decoded.block_bytes_ != kStorageBlockBytes ||
       decoded.layout_worker_count_ == 0 ||
       decoded.layout_worker_count_ > kLogicalStorageShards ||
@@ -685,53 +681,29 @@ bool DecodeBlockSlot(std::uint64_t& block_id,
   *header = decoded;
   return true;
 }
-}  // namespace
-
-bool DecodeBlockHeader(std::uint64_t physical_block_id,
-                       std::span<const std::byte, kBlockHeaderSlotBytes> input,
-                       BlockHeader* header) noexcept {
-  if (header == nullptr) return false;
-  BlockHeader decoded;
-  auto id = physical_block_id;
-  if (!DecodeBlockSlot(id, input, &decoded) || id != physical_block_id)
-    return false;
-  *header = decoded;
-  return true;
-}
-
-bool DecodeBlockHeaderPages(std::uint64_t physical_block_id,
-                            std::span<const std::byte, kBlockHeaderBytes> input,
-                            BlockHeader* header, std::uint8_t* active_slot,
-                            bool* misplaced_legacy) noexcept {
-  if (misplaced_legacy) *misplaced_legacy = false;
-  std::uint64_t winner_id = physical_block_id;
+bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
+                            BlockHeader* header,
+                            std::uint8_t* active_slot) noexcept {
   BlockHeader best{};
   std::uint8_t best_slot = 0;
   bool found = false;
   for (std::uint8_t slot = 0; slot < kBlockHeaderSlots; ++slot) {
     BlockHeader decoded{};
-    std::uint64_t slot_id = physical_block_id;
-    if (!DecodeBlockSlot(slot_id,
-                         std::span<const std::byte, kBlockHeaderSlotBytes>(
-                             input.data() + slot * kBlockHeaderSlotBytes,
-                             kBlockHeaderSlotBytes),
-                         &decoded)) {
+    if (!DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes>(
+                               input.data() + slot * kBlockHeaderSlotBytes,
+                               kBlockHeaderSlotBytes),
+                           &decoded)) {
       continue;
     }
     if (!found || decoded.allocation_epoch_ > best.allocation_epoch_ ||
         (decoded.allocation_epoch_ == best.allocation_epoch_ &&
          decoded.header_sequence_ > best.header_sequence_)) {
       best = decoded;
-      winner_id = slot_id;
       best_slot = slot;
       found = true;
     }
   }
   if (!found) {
-    return false;
-  }
-  if (winner_id != physical_block_id) {
-    if (misplaced_legacy) *misplaced_legacy = true;
     return false;
   }
   if (header != nullptr) {

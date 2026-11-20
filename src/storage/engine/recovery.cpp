@@ -98,8 +98,7 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
     co_return absl::InternalError("short recovered extent read");
   }
   BlockHeader header{};
-  if (!DecodeBlockHeaderPages(ref.block_id_,
-                              std::span<const std::byte, kBlockHeaderBytes>(
+  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
                                   io.data_, kBlockHeaderBytes),
                               &header) ||
       header.kind_ != BlockKind::kPayloadExtent ||
@@ -391,13 +390,10 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       }
 
       BlockHeader block{};
-      bool misplaced_legacy;
-      if (!DecodeBlockHeaderPages(block_id, block_bytes, &block, nullptr,
-                                  &misplaced_legacy)) {
-        // Activation can precede the first flush, so a slot with no valid
-        // header is reusable. A misplaced legacy header preserves the bit.
-        if (!indirect_key_pass && !misplaced_legacy)
-          zero_blocks->push_back(block_id);
+      if (!DecodeBlockHeaderPages(block_bytes, &block)) {
+        // Activation can precede the first flush. A slot with no valid header
+        // is reusable.
+        if (!indirect_key_pass) zero_blocks->push_back(block_id);
         if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }

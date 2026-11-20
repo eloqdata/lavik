@@ -554,24 +554,19 @@ bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
                         std::uint64_t* generation,
                         std::span<std::byte> payload) noexcept;
 
-// Write a v2 slot. Decode validates the embedded address of legacy slots.
+// Write a v2 slot. Both versions decode independently of physical placement.
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept;
-bool DecodeBlockHeader(std::uint64_t physical_block_id,
-                       std::span<const std::byte, kBlockHeaderSlotBytes> input,
+bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
                        BlockHeader* header) noexcept;
 
 // Decode the winning slot from a block's full header region: the valid slot
 // with the larger (allocation_epoch, header_sequence). Returns the winning
-// slot index in `active_slot` on success. A winning legacy slot from another
-// address returns false and sets misplaced_legacy, so recovery can preserve
-// the allocation bit instead of reclaiming an unwritten slot.
-bool DecodeBlockHeaderPages(std::uint64_t physical_block_id,
-                            std::span<const std::byte, kBlockHeaderBytes> input,
+// slot index in `active_slot` on success.
+bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
                             BlockHeader* header,
-                            std::uint8_t* active_slot = nullptr,
-                            bool* misplaced_legacy = nullptr) noexcept;
+                            std::uint8_t* active_slot = nullptr) noexcept;
 
 bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
                         std::span<std::byte> output) noexcept;

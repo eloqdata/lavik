@@ -238,7 +238,7 @@ unsigned RecordCrcPolicies(const std::string& path) {
     input.read(reinterpret_cast<char*>(pages.data()), pages.size());
     if (!input) Fail("reading mixed CRC block header failed");
     BlockHeader block;
-    if (!DecodeBlockHeaderPages(id, pages, &block) ||
+    if (!DecodeBlockHeaderPages(pages, &block) ||
         block.kind_ != BlockKind::kRecords || block.record_count_ == 0)
       continue;
     std::vector<std::byte> body(block.committed_bytes_ - kBlockHeaderBytes);

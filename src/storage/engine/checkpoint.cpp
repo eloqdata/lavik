@@ -768,11 +768,10 @@ bool CheckpointBlockAllocated(
 }
 
 absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
-    std::uint64_t block_id, const std::byte* data, const BlockHeader& block,
-    std::uint64_t generation, unsigned worker_count, bool validate_payload) {
+    const std::byte* data, const BlockHeader& block, std::uint64_t generation,
+    unsigned worker_count, bool validate_payload) {
   BlockHeader reread{};
-  if (!DecodeBlockHeaderPages(block_id,
-                              std::span<const std::byte, kBlockHeaderBytes>(
+  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
                                   data, kBlockHeaderBytes),
                               &reread) ||
       reread.allocation_epoch_ != block.allocation_epoch_ ||
@@ -850,12 +849,11 @@ class CheckpointPrefetchSlot {
   }
 
   void Start(Worker& worker, FixedFile file, std::uint64_t offset,
-             std::uint64_t block_id, std::uint64_t generation,
-             unsigned worker_count, bool prefix_only = false) {
+             std::uint64_t generation, unsigned worker_count,
+             bool prefix_only = false) {
     assert(state_ != nullptr);
     assert(!state_->active_);
-    state_->Start(worker, file, offset, block_id, generation, worker_count,
-                  prefix_only);
+    state_->Start(worker, file, offset, generation, worker_count, prefix_only);
   }
 
   struct Awaiter {
@@ -903,12 +901,11 @@ class CheckpointPrefetchSlot {
           in_flight_(&in_flight) {}
 
     void Start(Worker& worker, FixedFile file, std::uint64_t offset,
-               std::uint64_t block_id, std::uint64_t generation,
-               unsigned worker_count, bool prefix_only) {
+               std::uint64_t generation, unsigned worker_count,
+               bool prefix_only) {
       worker_ = &worker;
       file_ = file;
       offset_ = offset;
-      block_id_ = block_id;
       generation_ = generation;
       worker_count_ = worker_count;
       prefix_only_ = prefix_only;
@@ -946,8 +943,7 @@ class CheckpointPrefetchSlot {
       }
 
       BlockHeader header{};
-      if (!DecodeBlockHeaderPages(block_id_,
-                                  std::span<const std::byte, kBlockHeaderBytes>(
+      if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
                                       data_, kBlockHeaderBytes),
                                   &header) ||
           header.kind_ != BlockKind::kCheckpointIndex ||
@@ -1003,7 +999,6 @@ class CheckpointPrefetchSlot {
     Worker* worker_ = nullptr;
     FixedFile file_{};
     std::uint64_t offset_ = 0;
-    std::uint64_t block_id_ = 0;
     std::uint64_t generation_ = 0;
     unsigned worker_count_ = 0;
     std::size_t payload_read_bytes_ = 0;
@@ -1939,7 +1934,7 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
                                        std::uint64_t block_id,
                                        bool prefix_only) {
     const auto [file_id, offset] = FileOffset(block_id);
-    slot.Start(*store.worker_, store.files_[file_id], offset, block_id,
+    slot.Start(*store.worker_, store.files_[file_id], offset,
                checkpoint_root_.generation_, worker_count_, prefix_only);
   };
 
@@ -1961,9 +1956,9 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
                      candidates[index + 1], true);
     }
     if (!candidate->has_value()) continue;
-    auto chunk = ValidateCheckpointChunk(
-        candidates[index], current.data(), **candidate,
-        checkpoint_root_.generation_, worker_count_, false);
+    auto chunk = ValidateCheckpointChunk(current.data(), **candidate,
+                                         checkpoint_root_.generation_,
+                                         worker_count_, false);
     if (!chunk.ok()) co_return chunk.status();
     if (!result->digest_seed_.has_value()) {
       result->digest_seed_ = chunk->digest_seed_;
@@ -1998,8 +1993,8 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
           "checkpoint capacity header changed after discovery");
     }
     const BlockHeader& block = **candidate;
-    auto chunk = ValidateCheckpointChunk(capacity_blocks[index], current.data(),
-                                         block, checkpoint_root_.generation_,
+    auto chunk = ValidateCheckpointChunk(current.data(), block,
+                                         checkpoint_root_.generation_,
                                          worker_count_, true);
     if (!chunk.ok()) co_return chunk.status();
     if (chunk->kind_ != CheckpointChunkKind::kIndexCapacity) {
@@ -2274,11 +2269,10 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
   };
   auto decode_block = [this, &store, result, &fragment_sequence, &object_size,
                        &object_bytes, &object_reservation, &install_object](
-                          std::uint64_t block_id, const std::byte* data,
+                          const std::byte* data,
                           BlockHeader block) -> Task<absl::Status> {
-    auto decoded_chunk = ValidateCheckpointChunk(block_id, data, block,
-                                                 checkpoint_root_.generation_,
-                                                 worker_count_, true);
+    auto decoded_chunk = ValidateCheckpointChunk(
+        data, block, checkpoint_root_.generation_, worker_count_, true);
     if (!decoded_chunk.ok()) co_return decoded_chunk.status();
     if (decoded_chunk->digest_seed_ != CurrentDigestSeed()) {
       co_return absl::InternalError(
@@ -2575,7 +2569,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     // awaited handoff back to the shard.
     if (reader_for(block_id) != store.worker_->id()) return;
     const auto [file_id, offset] = FileOffset(block_id);
-    slot.Start(*store.worker_, store.files_[file_id], offset, block_id,
+    slot.Start(*store.worker_, store.files_[file_id], offset,
                checkpoint_root_.generation_, worker_count_);
   };
   if (!result->body_blocks_.empty()) {
@@ -2610,8 +2604,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             auto& io_store = *stores_[reader];
             const auto [file_id, offset] = FileOffset(block_id);
             current.Start(*io_store.worker_, io_store.files_[file_id], offset,
-                          block_id, checkpoint_root_.generation_,
-                          worker_count_);
+                          checkpoint_root_.generation_, worker_count_);
             co_return co_await current.Wait();
           });
     }
@@ -2624,8 +2617,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
       co_return absl::InternalError(
           "checkpoint body header changed after discovery");
     }
-    absl::Status decoded = co_await decode_block(result->body_blocks_[index],
-                                                 current.data(), **candidate);
+    absl::Status decoded = co_await decode_block(current.data(), **candidate);
     if (!decoded.ok()) co_return decoded;
   }
   if (object_size != 0 || !object_bytes.empty())
