@@ -235,24 +235,6 @@ bycorf::Task<absl::StatusOr<HttpResponse>> ReadResponse(
   }
 }
 
-std::string_view MethodName(HttpMethod method) {
-  switch (method) {
-    case HttpMethod::kGet:
-      return "GET";
-    case HttpMethod::kHead:
-      return "HEAD";
-    case HttpMethod::kPut:
-      return "PUT";
-    case HttpMethod::kPost:
-      return "POST";
-    case HttpMethod::kPatch:
-      return "PATCH";
-    case HttpMethod::kDelete:
-      return "DELETE";
-  }
-  return {};
-}
-
 absl::StatusOr<std::string> RequestHead(const HttpEndpoint& endpoint,
                                         const HttpRequest& request) {
   const auto& host =
@@ -266,15 +248,9 @@ absl::StatusOr<std::string> RequestHead(const HttpEndpoint& endpoint,
       }))
     return absl::InvalidArgumentError(
         "invalid HTTP endpoint, method or request target");
-  std::string head =
-      absl::StrCat(method, " ", request.target_, " HTTP/1.1\r\nHost: ");
-  if (host.find(':') == host.npos)
-    head += host;
-  else
-    absl::StrAppend(&head, "[", host, "]");
-  if (endpoint.port_ != (endpoint.tls_ ? 443 : 80))
-    absl::StrAppend(&head, ":", endpoint.port_);
-  head += "\r\nConnection: close\r\n";
+  std::string head = absl::StrCat(method, " ", request.target_,
+                                  " HTTP/1.1\r\nHost: ", endpoint.Authority(),
+                                  "\r\nConnection: close\r\n");
   for (const auto& [name, value] : request.headers_) {
     if (!IsToken(name) || !IsFieldValue(value))
       return absl::InvalidArgumentError("invalid HTTP request field");
@@ -343,6 +319,32 @@ bycorf::Task<absl::StatusOr<HttpResponse>> Exchange(
   co_return co_await ReadResponse(stream, request.method_, limit);
 }
 }  // namespace
+
+std::string_view MethodName(HttpMethod method) {
+  switch (method) {
+    case HttpMethod::kGet:
+      return "GET";
+    case HttpMethod::kHead:
+      return "HEAD";
+    case HttpMethod::kPut:
+      return "PUT";
+    case HttpMethod::kPost:
+      return "POST";
+    case HttpMethod::kPatch:
+      return "PATCH";
+    case HttpMethod::kDelete:
+      return "DELETE";
+  }
+  return {};
+}
+
+std::string HttpEndpoint::Authority() const {
+  const auto& host = host_.empty() ? address_ : host_;
+  std::string authority =
+      host.contains(':') ? absl::StrCat("[", host, "]") : host;
+  if (port_ != (tls_ ? 443 : 80)) absl::StrAppend(&authority, ":", port_);
+  return authority;
+}
 
 std::optional<std::string_view> HttpResponse::Header(
     std::string_view name) const {

@@ -108,22 +108,17 @@ def rustfs(binary):
         )
         bucket = "lavik-probe"
         client.create_bucket(Bucket=bucket)
-        urls = [
-            client.generate_presigned_url(
-                operation,
-                Params={"Bucket": bucket, "Key": "blocks/1001_8192"},
-                ExpiresIn=300,
-            )
-            for operation in ("put_object", "get_object", "delete_object")
-        ]
-        urls.append(
-            client.generate_presigned_url(
-                "list_objects_v2",
-                Params={"Bucket": bucket, "Prefix": "blocks/"},
-                ExpiresIn=300,
-            )
+        subprocess.run(
+            [binary, "s3", str(port)],
+            input=f"{bucket}\n{key}\n{secret}\n",
+            text=True,
+            check=True,
+            timeout=45,
         )
-        run_probe(binary, "s3", port, urls)
+        print(
+            "s3: signed binary PUT/GET, conditional overwrite, paginated prefix list, signature rejection and DELETE passed",
+            flush=True,
+        )
 
 
 def azurite(binary):

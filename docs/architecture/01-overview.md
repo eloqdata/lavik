@@ -62,7 +62,8 @@ the [build guide](../operations/building-and-packaging.md#experimental-dpdk-netw
 and Bycorf's [network architecture](../../bycorf/docs/architecture/networking.md).
 
 The [outbound HTTP client](13-outbound-http.md) runs HTTP and HTTPS exchanges
-on the calling Bycorf worker.
+on the calling Bycorf worker. The [S3 client](14-s3-object-client.md) uses
+this transport for signed requests to an object bucket.
 
 A separate `lavik-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,

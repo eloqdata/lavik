@@ -218,6 +218,12 @@ add_library(lavik::http_client ALIAS lavik_http_client)
 target_include_directories(lavik_http_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(lavik_http_client PUBLIC bycorf::core absl::statusor absl::strings)
 
+find_package(LibXml2 REQUIRED)
+add_library(lavik_s3_client STATIC src/object_store/s3_client.cpp)
+add_library(lavik::s3_client ALIAS lavik_s3_client)
+target_link_libraries(lavik_s3_client PUBLIC lavik::http_client
+  PRIVATE OpenSSL::Crypto LibXml2::LibXml2 absl::time)
+
 add_library(lavik_sync_transport STATIC src/net/sync_stream.cpp)
 target_include_directories(lavik_sync_transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -768,7 +774,7 @@ if (BUILD_TESTING)
   # Local protocol test with disposable RustFS and Azurite services.
   add_executable(lavik_object_store_probe EXCLUDE_FROM_ALL
     tests/object_store/probe.cpp)
-  target_link_libraries(lavik_object_store_probe PRIVATE lavik::http_client)
+  target_link_libraries(lavik_object_store_probe PRIVATE lavik::s3_client)
 
   include(FetchContent)
 
@@ -792,6 +798,11 @@ if (BUILD_TESTING)
   set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
   include(GoogleTest)
+
+  add_executable(lavik_s3_protocol_test tests/object_store/s3_protocol_test.cpp)
+  target_include_directories(lavik_s3_protocol_test PRIVATE src/object_store)
+  target_link_libraries(lavik_s3_protocol_test PRIVATE lavik::s3_client absl::time GTest::gtest_main)
+  add_test(NAME lavik_s3_protocol COMMAND lavik_s3_protocol_test)
 
   if (UNIX)
     # These policies must never share module/PCH inline definitions: each
