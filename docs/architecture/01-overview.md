@@ -61,6 +61,9 @@ replication handoff, and cluster paths are outside the validation scope. See
 the [build guide](../operations/building-and-packaging.md#experimental-dpdk-networking)
 and Bycorf's [network architecture](../../bycorf/docs/architecture/networking.md).
 
+The [outbound HTTP client](13-outbound-http.md) runs HTTP and HTTPS exchanges
+on the calling Bycorf worker.
+
 A separate `lavik-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,
 leader-local observations, authenticated administration, and coordination

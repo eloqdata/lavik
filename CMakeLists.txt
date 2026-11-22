@@ -213,6 +213,11 @@ target_link_libraries(lavik_resp_protocol PUBLIC
   absl::inlined_vector absl::status absl::statusor absl::strings OpenSSL::Crypto
 )
 
+add_library(lavik_http_client STATIC src/net/http_client.cpp)
+add_library(lavik::http_client ALIAS lavik_http_client)
+target_include_directories(lavik_http_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(lavik_http_client PUBLIC bycorf::core absl::statusor absl::strings)
+
 add_library(lavik_sync_transport STATIC src/net/sync_stream.cpp)
 target_include_directories(lavik_sync_transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -511,6 +516,7 @@ target_compile_definitions(lavik_module PUBLIC
   LAVIK_ENABLE_TEST_FAULTS=$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>
 )
 target_link_libraries(lavik_module PUBLIC
+  lavik::http_client
   lavik_sync_transport
   lavik_resp_protocol
   lavik::lease_clock
@@ -752,6 +758,17 @@ if (BUILD_TESTING)
     # archives; otherwise Clang with GNU ld cannot read the production graph.
     add_link_options("$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-flto=thin>")
   endif()
+
+  add_executable(lavik_http_client_test tests/http_client_test.cpp)
+  target_link_libraries(lavik_http_client_test PRIVATE lavik::http_client)
+  add_test(NAME lavik_http_client_protocol COMMAND lavik_http_client_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls)
+  set_tests_properties(lavik_http_client_protocol PROPERTIES TIMEOUT 20)
+
+  # Local protocol test with disposable RustFS and Azurite services.
+  add_executable(lavik_object_store_probe EXCLUDE_FROM_ALL
+    tests/object_store/probe.cpp)
+  target_link_libraries(lavik_object_store_probe PRIVATE lavik::http_client)
 
   include(FetchContent)
 
