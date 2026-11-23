@@ -959,12 +959,11 @@ class RequestInputBuffer {
         reinterpret_cast<const char*>(storage_.get() + begin_), end_ - begin_);
   }
 
-  std::span<std::byte> AppendBuffer() {
-    constexpr std::size_t kReadBytes = 4096;
-    if (capacity_ - end_ < kReadBytes && begin_ != 0) Compact();
-    if (capacity_ - end_ < kReadBytes) {
-      const std::size_t wanted = end_ + kReadBytes;
-      std::size_t capacity = capacity_ == 0 ? kReadBytes : capacity_;
+  std::span<std::byte> AppendBuffer(std::size_t minimum = 4096) {
+    if (capacity_ - end_ < minimum && begin_ != 0) Compact();
+    if (capacity_ - end_ < minimum) {
+      const std::size_t wanted = end_ + minimum;
+      std::size_t capacity = capacity_ == 0 ? minimum : capacity_;
       while (capacity < wanted) capacity *= 2;
       auto storage = std::make_unique_for_overwrite<std::byte[]>(capacity);
       if (end_ != begin_) {
@@ -1077,16 +1076,14 @@ Task<absl::Status> ReadCommandBatch(
     std::optional<absl::Status>* deferred_error) {
   constexpr std::size_t kBulkBytesPerYield = 256 * 1024;
   std::size_t bulk_bytes_since_yield = 0;
-  while (ready->empty()) {
-    // CONFIG SET may run on another worker while this coroutine is suspended
-    // in ReadSome(). Refresh once per parsing round; token-level loads would
-    // add needless atomic traffic to every request.
+  const auto plain = stream.GetPlaintextView();
+  auto parse = [&](std::string_view& bytes) -> absl::Status {
+    // A socket read can suspend across CONFIG SET on another worker.
     parser->SetQueryBufferLimit(
         query_buffer_limit->load(std::memory_order_acquire));
-    while (!input->View().empty() &&
-           ready->size() < CommandBatch::kMaxCommands) {
-      RespParseResult parsed = parser->Parse(input->View());
-      input->Consume(parsed.consumed_);
+    while (!bytes.empty() && ready->size() < CommandBatch::kMaxCommands) {
+      RespParseResult parsed = parser->Parse(bytes);
+      bytes.remove_prefix(parsed.consumed_);
       assert(parsed.consumed_ <=
              std::numeric_limits<std::size_t>::max() - *unassigned_input_bytes);
       *unassigned_input_bytes += parsed.consumed_;
@@ -1096,9 +1093,9 @@ Task<absl::Status> ReadCommandBatch(
                                     : RequestInputError::kProtocol);
         if (!ready->empty()) {
           deferred_error->emplace(std::move(parsed.status_));
-          co_return absl::OkStatus();
+          return absl::OkStatus();
         }
-        co_return parsed.status_;
+        return parsed.status_;
       }
       if (parsed.state_ == RespParseState::kOk) {
         ready->Push(std::move(parsed.command_), *unassigned_input_bytes);
@@ -1116,6 +1113,21 @@ Task<absl::Status> ReadCommandBatch(
       // Everything before it is now parser-owned and already consumed.
       break;
     }
+    return absl::OkStatus();
+  };
+  auto admit = [&](std::size_t bytes) {
+    if (client_buffers->TryAcquire(bytes)) return absl::OkStatus();
+    RecordRequestInputError(RequestInputError::kClientMemory);
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "client request buffers exceed the memory limit");
+  };
+  while (ready->empty()) {
+    auto bytes = input->View();
+    const auto before = bytes.size();
+    auto status = parse(bytes);
+    input->Consume(before - bytes.size());
+    if (!status.ok()) co_return status;
     if (!ready->empty()) co_return absl::OkStatus();
 
     const std::size_t bulk_reservation = parser->BulkReadReservationSize();
@@ -1171,6 +1183,30 @@ Task<absl::Status> ReadCommandBatch(
       continue;
     }
 
+    if (plain && input->View().empty()) {
+      auto consume = [&](std::span<const std::byte> chunk) {
+        status = admit(chunk.size());
+        if (!status.ok()) return;
+        std::string_view rest(reinterpret_cast<const char*>(chunk.data()),
+                              chunk.size());
+        status = parse(rest);
+        if (status.ok() && !rest.empty()) {
+          // Only a split delimiter or the suffix beyond the batch limit needs
+          // to survive this callback. Return the network buffer before
+          // dispatch.
+          auto tail = input->AppendBuffer(rest.size());
+          std::memcpy(tail.data(), rest.data(), rest.size());
+          input->Commit(rest.size());
+        }
+      };
+      auto read = co_await plain->VisitSome(consume);
+      if (!read.ok()) co_return read.status();
+      if (*read == 0)
+        co_return absl::UnavailableError("peer closed connection");
+      if (!status.ok()) co_return status;
+      continue;
+    }
+
     std::span<std::byte> buffer = input->AppendBuffer();
     auto read_result = co_await stream.ReadSome(buffer);
     if (!read_result.ok()) [[unlikely]] {
@@ -1182,12 +1218,8 @@ Task<absl::Status> ReadCommandBatch(
     // Read into the already allocated socket buffer first, then charge once
     // for the bytes that the parser may retain. This keeps admission out of
     // every string append while bounding stalled and pipelined clients.
-    if (!client_buffers->TryAcquire(*read_result)) [[unlikely]] {
-      RecordRequestInputError(RequestInputError::kClientMemory);
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "client request buffers exceed the memory limit");
-    }
+    status = admit(*read_result);
+    if (!status.ok()) co_return status;
     input->Commit(*read_result);
   }
   co_return absl::OkStatus();
