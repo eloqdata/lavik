@@ -201,14 +201,14 @@ SPDK 模式需要可由 SPDK 访问的 NVMe 设备。设备绑定、hugepage 配
 
 - 启用 io_uring 的 Linux 6.1 或更新版本（发行包面向 `x86_64` 和 `aarch64`）
 - CMake 3.26 或更新版本（随附的 Meta 依赖要求）
-- C++23 编译器（建议 GCC 13+ 或较新的 Clang）
+- C++23 编译器（下方命令使用 GCC 14）
 - Ninja、Git，以及 OpenSSL 开发头文件和静态库；可选的内核旁路依赖还需要 GNU Make
 
-在 Ubuntu 24.04 上，先安装 Git 以获取源码：
+在 Ubuntu 24.04 上，先安装 Git 和 GCC 14：
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git
+sudo apt-get install -y git gcc-14 g++-14
 ```
 
 #### 编译与安装
@@ -220,7 +220,7 @@ cd lavik
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
-./scripts/configure_release.sh
+CC=gcc-14 CXX=g++-14 ./scripts/configure_release.sh
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```
@@ -234,7 +234,7 @@ sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin
 ./scripts/install_build_deps.sh --with-bypass
 git -C bycorf submodule update --init third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
-CC=gcc-13 CXX=g++-13 ./scripts/configure_release.sh -DLAVIK_KERNEL_BYPASS=ON
+CC=gcc-14 CXX=g++-14 ./scripts/configure_release.sh -DLAVIK_KERNEL_BYPASS=ON
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```

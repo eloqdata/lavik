@@ -207,15 +207,15 @@ The standard io_uring build requires:
 
 - Linux 6.1 or newer with io_uring enabled (`x86_64` and `aarch64` are the release-package targets)
 - CMake 3.26 or newer (required by the bundled Meta dependency)
-- a C++23 compiler (GCC 13+ or a recent Clang is recommended)
+- a C++23 compiler (the commands below use GCC 14)
 - Ninja, Git, and OpenSSL development headers/static libraries; GNU Make is
   additionally required by the optional bypass dependencies
 
-On Ubuntu 24.04, install Git to obtain the source:
+On Ubuntu 24.04, install Git and GCC 14:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git
+sudo apt-get install -y git gcc-14 g++-14
 ```
 
 #### Compile and install
@@ -227,7 +227,7 @@ cd lavik
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
-./scripts/configure_release.sh
+CC=gcc-14 CXX=g++-14 ./scripts/configure_release.sh
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```
@@ -241,7 +241,7 @@ local build, run these additional commands in the same checkout:
 ./scripts/install_build_deps.sh --with-bypass
 git -C bycorf submodule update --init third_party/spdk third_party/dpdk
 git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
-CC=gcc-13 CXX=g++-13 ./scripts/configure_release.sh -DLAVIK_KERNEL_BYPASS=ON
+CC=gcc-14 CXX=g++-14 ./scripts/configure_release.sh -DLAVIK_KERNEL_BYPASS=ON
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```
