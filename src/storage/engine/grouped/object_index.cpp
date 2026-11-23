@@ -529,6 +529,16 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
   return NodeHandle(std::move(*replacement));
 }
 
+std::generator<const GroupIndexPage&> PhysicalPages(const NodeHandle& node) {
+  if (!node) co_return;
+  if (node->page_) {
+    co_yield *node->page_;
+  } else {
+    for (const auto& child : node->children_)
+      co_yield std::ranges::elements_of(PhysicalPages(child));
+  }
+}
+
 }  // namespace
 
 struct GroupedPhysicalState {
@@ -1280,18 +1290,8 @@ std::generator<const GroupedObject::RecordView&> GroupedObject::Records()
     co_return;
   }
 
-  // Each branch consumes at least one of the 72 identity bits. Saving right
-  // siblings keeps left-to-right traversal in one bounded coroutine frame.
-  std::array<const GroupIndexNode*, 72> pending;
-  std::size_t depth = 0;
   auto overrides = physical_->Overrides();
-  auto* node = physical_->root_.get();
-  while (node) {
-    while (!node->page_) {
-      pending[depth++] = node->children_[1].get();
-      node = node->children_[0].get();
-    }
-    const auto& page = *node->page_;
+  for (const auto& page : PhysicalPages(physical_->root_)) {
     for (std::size_t i = 0; i < page.ids_.size(); ++i) {
       const auto id = page.ids_[i];
       if (!overrides.empty() && overrides.front().id_ == id) {
@@ -1306,7 +1306,6 @@ std::generator<const GroupedObject::RecordView&> GroupedObject::Records()
         co_yield record;
       }
     }
-    node = depth ? pending[--depth] : nullptr;
   }
   assert(overrides.empty());
 }
