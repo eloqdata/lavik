@@ -39,9 +39,15 @@ struct HttpEndpoint {
   std::string host_;
   // A client TLS context, prepared off-worker. Empty selects plaintext.
   std::shared_ptr<bycorf::TlsContext> tls_;
+
+  // Exact Host field used on the wire, including a non-default port.
+  [[nodiscard]] std::string Authority() const;
 };
 
 enum class HttpMethod { kGet, kHead, kPut, kPost, kPatch, kDelete };
+
+// HTTP method token used in the request line and signature.
+[[nodiscard]] std::string_view MethodName(HttpMethod method);
 
 struct HttpHeader {
   std::string name_;
@@ -71,6 +77,8 @@ struct HttpResponse {
 struct HttpRequestOptions {
   std::chrono::milliseconds timeout_{30000};
   std::size_t max_response_body_bytes_ = 16 * 1024 * 1024;
+  // Status-only consumers can close after the headers of a 4xx/5xx response.
+  bool skip_error_body_ = false;
 };
 
 // One connection per HTTP/1.1 exchange. The immutable client may serve

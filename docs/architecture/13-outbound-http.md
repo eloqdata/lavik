@@ -34,7 +34,9 @@ leave the remote outcome unknown. The caller decides whether to retry.
 The response retains the final status and ordered header fields, including
 duplicates. The client incrementally reads fixed-length, chunked and
 close-delimited bodies into bounded memory. HTTP error statuses are returned
-with their responses. Transport, framing, deadline and size failures return
+with their responses. A caller that only consumes error statuses can finish
+after the final error headers and close the connection. Transport, framing,
+deadline and size failures return
 an error status from the exchange.
 
 The public API is in [http_client.h](../../include/lavik/net/http_client.h)

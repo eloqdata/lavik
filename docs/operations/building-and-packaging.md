@@ -169,6 +169,10 @@ Abseil CRC translation units used by the durable storage format. The latter is
 important because Abseil compiles its hardware CRC engine only when the target
 exposes the required instruction macros; leaving those translation units at
 the compiler baseline silently selects its generic table implementation.
+
+The S3 client build requires the libxml2 development headers (Ubuntu package
+`libxml2-dev`) for S3 listing responses.
+
 OpenSSL is linked statically, so the resulting executable does not depend on
 `libssl.so` or `libcrypto.so`. The build machine still needs the OpenSSL
 headers and static archives (`libssl-dev` on Ubuntu, which provides `libssl.a`

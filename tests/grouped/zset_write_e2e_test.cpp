@@ -1390,13 +1390,16 @@ TEST(GroupedSortedSetWriteE2e, MemberReadsLockOnlyRequestedLeaves) {
                                       : "LAVIK_ZSET_GROUP_PAUSE_FILE",
                            gate.c_str());
     Server server(disk, 1);
+    // Recovery can outlast the lock observation window on a loaded runner.
+    // Complete a round trip before starting the holder and its deadline.
+    Client holder_client(server.port());
+    ASSERT_EQ(holder_client.Command({"PING"}).text_, "PONG") << server.Log();
     std::future<Reply> holder, disjoint, conflict;
     absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
     const auto before = expected[a];
     holder = std::async(std::launch::async, [&] {
-      Client client(server.port());
-      return pause_read ? client.Command({"ZMSCORE", key, a, a})
-                        : client.Command({"ZINCRBY", key, "0.25", a});
+      return pause_read ? holder_client.Command({"ZMSCORE", key, a, a})
+                        : holder_client.Command({"ZINCRBY", key, "0.25", a});
     });
     bool held = false;
     const auto marker = pause_read
