@@ -310,6 +310,10 @@ class PendingUpload {
 
   PendingUpload(bycorf::Worker& worker, Write write)
       : handle_(std::move(write).ReleaseHandle()), owner_(handle_) {
+    // Starting the writer manually bypasses the usual Task awaiter, which
+    // registers background children before their first resume.
+    if (bycorf::CurrentTaskClass() == bycorf::TaskClass::kBackground)
+      worker.RegisterBackground(handle_);
     worker.Enqueue(handle_);
   }
   PendingUpload(const PendingUpload&) = delete;

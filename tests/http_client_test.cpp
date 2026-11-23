@@ -288,13 +288,37 @@ bycorf::Task<absl::Status> CheckClient(
   co_return absl::OkStatus();
 }
 
+bycorf::Task<absl::Status> CheckBackgroundUpload(bycorf::Worker& worker,
+                                                 absl::Status& result) {
+  // Keep the writer blocked until the response reader aborts it. The writer
+  // then resumes the joining caller on its own scheduling class.
+  std::string body(16 * 1024 * 1024, 'x');
+  HttpRequest put{
+      .method_ = HttpMethod::kPut, .target_ = "/object", .body_ = body};
+  Peer reject{
+      .first = "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\n\r\n",
+      .delay = 4s,
+      .before_reply = 100ms};
+  auto reply = co_await SendToPeer(worker, reject, put, {.timeout_ = 2s});
+  result = reply.status();
+  if (reply.ok() &&
+      (reply->status_ != 412 ||
+       bycorf::CurrentTaskClass() != bycorf::TaskClass::kBackground))
+    result = absl::InternalError("expected early 412 on the background caller");
+  worker.RequestStop();
+  co_return absl::OkStatus();
+}
+
 bycorf::Task<absl::Status> Run(
     bycorf::Worker& worker,
     const std::shared_ptr<bycorf::TlsContext>& server_tls,
     const std::shared_ptr<bycorf::TlsContext>& client_tls,
     absl::Status& result) {
   result = co_await CheckClient(worker, server_tls, client_tls);
-  worker.RequestStop();
+  if (result.ok())
+    worker.SpawnBackground(CheckBackgroundUpload(worker, result));
+  else
+    worker.RequestStop();
   co_return absl::OkStatus();
 }
 }  // namespace
