@@ -423,7 +423,8 @@ bycorf::Task<absl::StatusOr<HttpResponse>> HttpClient::Send(
   if (!head.ok()) co_return head.status();
   const auto remaining = deadline - std::chrono::steady_clock::now();
   if (remaining <= remaining.zero())
-    co_return absl::DeadlineExceededError("HTTP request timed out");
+    co_return absl::DeadlineExceededError(
+        "HTTP request timed out before connecting");
   auto stream = co_await bycorf::ConnectTcp(*worker, endpoint_.address_,
                                             endpoint_.port_, remaining);
   if (!stream.ok()) co_return stream.status();

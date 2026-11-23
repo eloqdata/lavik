@@ -137,6 +137,10 @@ bycorf::Task<absl::Status> CheckExpiredConnect(bycorf::Worker& worker) {
       .method_ = HttpMethod::kPut, .target_ = "/object", .body_ = "value"};
   worker.Spawn(DelayWorkerResume());
   auto reply = co_await client.Send(std::move(put), {.timeout_ = 50ms});
+  // A deschedule before connect is submitted leaves the accept queue empty.
+  if (absl::IsDeadlineExceeded(reply.status()) &&
+      reply.status().message() == "HTTP request timed out before connecting")
+    co_return absl::OkStatus();
   if (!absl::IsDeadlineExceeded(reply.status()) ||
       !reply.status().message().contains("before sending headers"))
     co_return absl::InternalError(
