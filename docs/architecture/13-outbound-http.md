@@ -25,7 +25,10 @@ is omitted.
 Each `HttpClient::Send` opens one connection on the calling worker and owns
 it through handshake, request write, response read and close. Concurrent
 calls have independent connections and timers. The caller keeps the client
-and any borrowed upload bytes alive until the exchange completes.
+and any borrowed upload bytes alive until the exchange completes. After
+sending the headers, an exchange with a body reads the response concurrently
+with the upload. An early final response retires any pending send before the
+caller regains ownership of its upload buffer.
 
 One deadline covers the entire exchange. The worker checks it before sending
 and closes the stream if it expires during I/O. A timeout after a write can

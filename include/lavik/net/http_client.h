@@ -91,6 +91,8 @@ class HttpClient {
 
   // The deadline covers connect, TLS, send and response. The client manages
   // Host, framing and connection headers and performs no automatic retries.
+  // A complete final response can end an upload early. Any outstanding write
+  // retires before Send returns and the caller may reuse the request body.
   [[nodiscard]] bycorf::Task<absl::StatusOr<HttpResponse>> Send(
       HttpRequest request, HttpRequestOptions options = {}) const;
 

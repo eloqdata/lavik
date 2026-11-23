@@ -274,6 +274,12 @@ struct ExchangeDeadline {
   bycorf::TcpStream* stream = nullptr;
   bycorf::TimerCancelHandle cancel;
   absl::Status failure;
+
+  void Disarm() noexcept {
+    if (!stream) return;
+    stream = nullptr;
+    cancel.Cancel();
+  }
 };
 
 bycorf::Task<absl::Status> Expire(
@@ -290,16 +296,54 @@ bycorf::Task<absl::Status> Expire(
   if (state->stream) {
     if (state->failure.ok())
       state->failure = absl::DeadlineExceededError("HTTP request timed out");
-    (void)state->stream->Close();
+    state->stream->Abort();
   }
   co_return absl::OkStatus();
+}
+
+// The exchange owns both coroutine frames. Start the write on this worker,
+// read the response in the parent, and join before releasing borrowed bytes.
+// Awaiting the original Task would start an already suspended writer again.
+class PendingUpload {
+ public:
+  using Write = bycorf::Task<absl::Status>;
+
+  PendingUpload(bycorf::Worker& worker, Write write)
+      : handle_(std::move(write).ReleaseHandle()), owner_(handle_) {
+    // Starting the writer manually bypasses the usual Task awaiter, which
+    // registers background children before their first resume.
+    if (bycorf::CurrentTaskClass() == bycorf::TaskClass::kBackground)
+      worker.RegisterBackground(handle_);
+    worker.Enqueue(handle_);
+  }
+  PendingUpload(const PendingUpload&) = delete;
+  PendingUpload& operator=(const PendingUpload&) = delete;
+
+  bool await_ready() const noexcept { return owner_.done(); }
+  void await_suspend(std::coroutine_handle<> parent) noexcept {
+    handle_.promise().continuation_ = parent;
+  }
+  absl::Status await_resume() { return std::move(owner_).TakeResult(); }
+
+ private:
+  Write::handle_type handle_;
+  Write owner_;
+};
+
+bycorf::Task<absl::Status> WriteBody(
+    bycorf::TcpStream& stream, std::string_view body,
+    std::chrono::steady_clock::time_point deadline) {
+  if (std::chrono::steady_clock::now() >= deadline)
+    co_return absl::DeadlineExceededError(
+        "HTTP request timed out before sending body");
+  co_return co_await stream.WriteAll(std::as_bytes(std::span(body)));
 }
 
 bycorf::Task<absl::StatusOr<HttpResponse>> Exchange(
     bycorf::TcpStream& stream, const HttpEndpoint& endpoint,
     const HttpRequest& request, const std::string& head,
-    HttpRequestOptions options,
-    std::chrono::steady_clock::time_point deadline) {
+    HttpRequestOptions options, std::chrono::steady_clock::time_point deadline,
+    ExchangeDeadline& timer) {
   if (endpoint.tls_) {
     auto status = co_await stream.StartTls(
         endpoint.tls_, false,
@@ -311,14 +355,22 @@ bycorf::Task<absl::StatusOr<HttpResponse>> Exchange(
         "HTTP request timed out before sending headers");
   auto status = co_await stream.WriteAll(std::as_bytes(std::span(head)));
   if (!status.ok()) co_return status;
-  if (!request.body_.empty()) {
-    if (std::chrono::steady_clock::now() >= deadline)
-      co_return absl::DeadlineExceededError(
-          "HTTP request timed out before sending body");
-    status = co_await stream.WriteAll(std::as_bytes(std::span(request.body_)));
-    if (!status.ok()) co_return status;
-  }
-  co_return co_await ReadResponse(stream, request.method_, options);
+  if (request.body_.empty())
+    co_return co_await ReadResponse(stream, request.method_, options);
+
+  PendingUpload upload(*bycorf::ThisWorker().self_,
+                       WriteBody(stream, request.body_, deadline));
+  auto response = co_await ReadResponse(stream, request.method_, options);
+  // Once a complete final response is in hand, retiring the send can take a
+  // CQ turn. That bookkeeping must not turn an on-time response into a timeout.
+  if (response.ok() && timer.failure.ok() &&
+      std::chrono::steady_clock::now() < deadline)
+    timer.Disarm();
+  const bool finished_sending = upload.await_ready();
+  if (!finished_sending) stream.Abort();
+  auto sent = co_await upload;
+  if (!response.ok() && finished_sending && !sent.ok()) co_return sent;
+  co_return response;
 }
 }  // namespace
 
@@ -375,7 +427,8 @@ bycorf::Task<absl::StatusOr<HttpResponse>> HttpClient::Send(
   if (!head.ok()) co_return head.status();
   const auto remaining = deadline - std::chrono::steady_clock::now();
   if (remaining <= remaining.zero())
-    co_return absl::DeadlineExceededError("HTTP request timed out");
+    co_return absl::DeadlineExceededError(
+        "HTTP request timed out before connecting");
   auto stream = co_await bycorf::ConnectTcp(*worker, endpoint_.address_,
                                             endpoint_.port_, remaining);
   if (!stream.ok()) co_return stream.status();
@@ -383,8 +436,7 @@ bycorf::Task<absl::StatusOr<HttpResponse>> HttpClient::Send(
   auto state = std::make_shared<ExchangeDeadline>();
   state->stream = &*stream;
   absl::Cleanup close = [&] {
-    state->stream = nullptr;
-    state->cancel.Cancel();
+    state->Disarm();
     (void)stream->Close();
   };
   // Connect may have succeeded while this worker was descheduled. The timer
@@ -393,10 +445,10 @@ bycorf::Task<absl::StatusOr<HttpResponse>> HttpClient::Send(
     co_return absl::DeadlineExceededError(
         "HTTP request timed out before sending headers");
   worker->Spawn(Expire(*worker, state, deadline));
-  auto result =
-      co_await Exchange(*stream, endpoint_, request, *head, options, deadline);
+  auto result = co_await Exchange(*stream, endpoint_, request, *head, options,
+                                  deadline, *state);
   if (!state->failure.ok()) co_return state->failure;
-  if (std::chrono::steady_clock::now() >= deadline)
+  if (state->stream && std::chrono::steady_clock::now() >= deadline)
     co_return absl::DeadlineExceededError("HTTP request timed out");
   co_return result;
 }
