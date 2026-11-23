@@ -44,6 +44,7 @@ struct Peer {
   std::string last{};
   std::chrono::milliseconds delay{};
   std::shared_ptr<bycorf::TlsContext> tls{};
+  std::chrono::milliseconds before_reply{};
 };
 
 bycorf::Task<absl::Status> Reply(bycorf::Worker& worker,
@@ -69,6 +70,10 @@ bycorf::Task<absl::Status> Reply(bycorf::Worker& worker,
     if (!count.ok()) co_return count.status();
     if (!*count) co_return absl::DataLossError("incomplete probe request");
     used += *count;
+  }
+  if (peer.before_reply.count()) {
+    auto wait = co_await bycorf::SleepFor(worker, peer.before_reply);
+    if (!wait.ok()) co_return wait;
   }
   auto status = co_await stream.WriteAll(std::as_bytes(std::span(peer.first)));
   if (!status.ok()) co_return status;
@@ -186,6 +191,32 @@ bycorf::Task<absl::Status> CheckClient(
     co_return absl::InternalError(
         "expected certificate verification failure for wrong.invalid: " +
         tls_error.ToString());
+
+  // Withhold window updates for the rest of the request. A sequential
+  // uploader cannot observe the rejection before its deadline. The delayed
+  // response also makes the TLS writer contend on real socket backpressure.
+  std::string large_body(16 * 1024 * 1024, 'x');
+  HttpRequest put{
+      .method_ = HttpMethod::kPut, .target_ = "/object", .body_ = large_body};
+  for (bool https : {false, true}) {
+    Peer reject{
+        .first =
+            "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 3\r\n\r\nold",
+        .delay = 4s,
+        .tls = https ? server_tls : nullptr,
+        .before_reply = 100ms};
+    reply = co_await SendToPeer(worker, reject, put, {.timeout_ = 2s},
+                                https ? client_tls : nullptr);
+    if (!reply.ok()) co_return reply.status();
+    if (reply->status_ != 412 || reply->body_ != "old")
+      co_return absl::DataLossError(
+          "lost final response during backpressured upload");
+  }
+
+  Peer silent{.first = "", .before_reply = 4s};
+  reply = co_await SendToPeer(worker, silent, put, {.timeout_ = 100ms});
+  if (!absl::IsDeadlineExceeded(reply.status()))
+    co_return absl::InternalError("missing stalled upload deadline");
 
   HttpRequest head{.method_ = HttpMethod::kHead, .target_ = "/object"};
   Peer headers{.first = "HTTP/1.1 200 OK\r\nContent-Length: 8192\r\n\r\n"};
