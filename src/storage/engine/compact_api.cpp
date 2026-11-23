@@ -171,7 +171,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   };
   const RecordLocation location =
       exists ? MaterializeIndexLocation(*found) : RecordLocation{};
-  if (replication && value_type != ValueType::kStream)
+  if (replication)
     replication->persistent_predecessor_ =
         exists && location.expire_at_ms_ == 0;
   const ExtentManifest extents =
