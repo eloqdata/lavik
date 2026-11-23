@@ -538,8 +538,8 @@ absl::StatusOr<std::string> EncodeRedisExportCommand(
 
   // Redis does not know Lavik extensions. Export a successful whole-Hash
   // replacement as DEL + HSET inside the enclosing atomic envelope. Source
-  // append/transaction settlement already supplies the final absolute expiry
-  // effect, so this neither reads old fields nor extends the key's lifetime.
+  // supplies the absolute deadline for expiring hashes. DEL + HSET already
+  // produces the persistent result when the source omits a redundant PERSIST.
   for (const auto& child : children) {
     if (!child.args_.empty() &&
         EqualCaseInsensitive(child.args_[0], "LAVIK.HREPLACE")) {

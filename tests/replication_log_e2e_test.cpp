@@ -348,6 +348,12 @@ class ReplicationLogService final : public bycorf::Service {
                     lavik::storage::SnapshotRecord::Kind::kDelete &&
                 (*pending)[2].command_ != nullptr,
             "scanned-key deletion left the FIFO and reordered a type change");
+      const auto& hash_effect = (*pending)[0].command_->args_;
+      Check(hash_effect == std::vector<std::string>(
+                               {std::string(lavik::kReplicatedExecCommand), "2",
+                                "0", "4", "HSET", key, "pending", "value", "0",
+                                "2", "PERSIST", key}),
+            "FULL capture lost the hash persistence companion");
       auto overrides = co_await storage_->ReadPartitionFullSyncOverrides(
           session_id, partition_id, 8);
       if (!overrides.ok()) co_return overrides.status();
@@ -3660,15 +3666,47 @@ class ReplicationLogService final : public bycorf::Service {
     status = co_await ExecuteClientCommand(
         4, {"PEXPIRE", "journal-counter", "600000"}, ":1\r\n");
     if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HSET", "journal-hash", "old", "extra"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"LAVIK.HREPLACE", "journal-hash", "field", "replaced"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HMSET", "journal-hash", "temporary", "seed"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HSETNX", "journal-hash", "number", "2"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HSETNX", "journal-hash", "number", "99"}, ":0\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HINCRBY", "journal-hash", "number", "3"}, ":5\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HINCRBYFLOAT", "journal-hash", "number", "0.5"}, "$3\r\n5.5\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HDEL", "journal-hash", "number", "temporary"}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"PEXPIRE", "journal-hash", "600000"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HSET", "journal-hash", "field", "value"}, ":0\r\n");
+    if (!status.ok()) co_return status;
+    const auto hash_expiry =
+        co_await storage_->GetExpiration(4, "journal-hash");
     auto family_fence = co_await storage_->FenceReplicationLog();
     if (!family_fence.ok()) co_return family_fence.status();
-    Check(*family_fence == 7 &&
-              storage_->LocalReplicationLogInfo().tail_lsn_ == 6,
+    Check(*family_fence == 16 &&
+              storage_->LocalReplicationLogInfo().tail_lsn_ == 15,
           "publisher fence did not separate prior and future commands");
 
     std::vector<ReplicatedCommand> family_commands;
     ReplicationLogCursor cursor{};
-    while (cursor.lsn_ <= 6) {
+    while (cursor.lsn_ < *family_fence) {
       const std::uint64_t lsn = cursor.lsn_;
       std::string encoded;
       do {
@@ -3684,8 +3722,10 @@ class ReplicationLogService final : public bycorf::Service {
       if (!decoded.ok()) co_return decoded.status();
       family_commands.push_back(std::move(*decoded));
     }
-    const std::vector<std::string> expected_names{"LPUSH", "HSET", "SADD",
-                                                  "ZADD",  "SET",  "PEXPIREAT"};
+    const std::vector<std::string> expected_names{
+        "LPUSH",     "HSET", "SADD",           "ZADD",      "SET",
+        "PEXPIREAT", "HSET", "LAVIK.HREPLACE", "HMSET",     "HSETNX",
+        "HSET",      "HSET", "HDEL",           "PEXPIREAT", "HSET"};
     Check(family_commands.size() == expected_names.size(),
           "single-key command journal count changed");
     for (std::size_t i = 0; i < expected_names.size(); ++i) {
@@ -3694,7 +3734,27 @@ class ReplicationLogService final : public bycorf::Service {
                 effect.front() == expected_names[i],
             "single-key command journal order changed");
     }
-    const auto expiry_effect = ReplicatedEffectAt(family_commands.back(), 0);
+    Check(ReplicatedEffectAt(family_commands[1], 1) ==
+              std::vector<std::string>({"PERSIST", "journal-hash"}),
+          "hash creation lost its final persistence effect");
+    const std::vector<std::vector<std::string>> persistent_updates{
+        {"HSET", "journal-hash", "old", "extra"},
+        {"LAVIK.HREPLACE", "journal-hash", "field", "replaced"},
+        {"HMSET", "journal-hash", "temporary", "seed"},
+        {"HSETNX", "journal-hash", "number", "2"},
+        {"HSET", "journal-hash", "number", "5"},
+        {"HSET", "journal-hash", "number", "5.5"},
+        {"HDEL", "journal-hash", "number", "temporary"}};
+    for (std::size_t i = 0; i < persistent_updates.size(); ++i) {
+      Check(family_commands[6 + i].args_ == persistent_updates[i],
+            "persistent hash update did not publish its single field mutation");
+    }
+    Check(ReplicatedEffectAt(family_commands.back(), 1) ==
+              std::vector<std::string>(
+                  {"PEXPIREAT", "journal-hash",
+                   std::to_string(hash_expiry.expire_at_ms_)}),
+          "expiring hash update lost its absolute deadline");
+    const auto expiry_effect = ReplicatedEffectAt(family_commands[5], 0);
     Check(expiry_effect.size() == 3 && expiry_effect[1] == "journal-counter",
           "relative expiry was not normalized to PEXPIREAT");
 
@@ -3715,6 +3775,13 @@ class ReplicationLogService final : public bycorf::Service {
     status = co_await ExecuteClientCommand(4, {"HGET", "journal-hash", "field"},
                                            "$5\r\nvalue\r\n");
     if (!status.ok()) co_return status;
+    status =
+        co_await ExecuteClientCommand(4, {"HLEN", "journal-hash"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    const auto replayed_expiry =
+        co_await storage_->GetExpiration(4, "journal-hash");
+    Check(replayed_expiry.expire_at_ms_ == hash_expiry.expire_at_ms_,
+          "hash replay changed the source deadline");
     status =
         co_await ExecuteClientCommand(4, {"SCARD", "journal-set"}, ":2\r\n");
     if (!status.ok()) co_return status;

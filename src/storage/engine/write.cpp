@@ -2246,9 +2246,12 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
                                         : ++partition.mutation_sequence_;
   std::shared_ptr<ReplicationCommandAppend> fullsync_command;
   if (replication != nullptr) {
-    AppendReplicationExpirationEffect(
-        &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
-        kind == RecordKind::kValue ? expire_at_ms : 0);
+    if (!replication->inherits_persistent_hash_ ||
+        !partition.fullsync_subscribers_.empty()) {
+      AppendReplicationExpirationEffect(
+          &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
+          kind == RecordKind::kValue ? expire_at_ms : 0);
+    }
     // Admitted effects may grow beyond the backlog budget. Validate the
     // encoding's argument and arithmetic bounds before changing data.
     const auto argc = replication->args_.size();

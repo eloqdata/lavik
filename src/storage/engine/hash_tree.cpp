@@ -1851,6 +1851,13 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     co_return result;
   }
 
+  if (replication != nullptr) {
+    // Field mutations publish the predecessor's key-level deadline. Only a
+    // surviving, previously persistent hash proves PERSIST is redundant.
+    replication->inherits_persistent_hash_ = value_type == ValueType::kHash &&
+                                             exists && result.key_exists_ &&
+                                             expire_at_ms == 0;
+  }
   if (replication != nullptr && value_type == ValueType::kSet &&
       operation.kind_ == HashOperationKind::kPopRandom) {
     replication->args_.clear();
