@@ -529,22 +529,6 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
   return NodeHandle(std::move(*replacement));
 }
 
-void VisitPhysical(const NodeHandle& node,
-                   const GroupedObject::RecordVisitor& visitor) {
-  if (!node) return;
-  if (!node->page_) {
-    VisitPhysical(node->children_[0], visitor);
-    VisitPhysical(node->children_[1], visitor);
-    return;
-  }
-  const auto& page = *node->page_;
-  for (std::size_t i = 0; i < page.ids_.size(); ++i) {
-    const auto id = page.ids_[i];
-    visitor(id, page.locations_[i], ManifestFor(page, id),
-            ((page.retired_ >> i) & 1) != 0);
-  }
-}
-
 }  // namespace
 
 struct GroupedPhysicalState {
@@ -1283,35 +1267,53 @@ bool GroupedObject::SameLogicalRoot(const GroupedObject& other) const noexcept {
              : directory().root() == other.directory().root();
 }
 
-void GroupedObject::ForEachRecord(const RecordVisitor& visitor) const {
+std::generator<const GroupedObject::RecordView&> GroupedObject::Records()
+    const {
   if (physical_->string_size_) {
     for (std::size_t i = 0; i < physical_->string_size_; ++i) {
       const auto& page = physical_->string_pages_[i / kGroupIndexPageEntries];
       const GroupedRecordId id{i + 1, 0};
-      visitor(id, *page->entries_[i % kGroupIndexPageEntries],
-              ManifestFor(*page->owner_->page_, id), false);
+      RecordView record{id, *page->entries_[i % kGroupIndexPageEntries],
+                        ManifestFor(*page->owner_->page_, id), false};
+      co_yield record;
     }
-    return;
+    co_return;
   }
-  if (physical_->overrides_.size() == 0) {
-    VisitPhysical(physical_->root_, visitor);
-    return;
+
+  // Each branch consumes at least one of the 72 identity bits. Saving right
+  // siblings keeps left-to-right traversal in one bounded coroutine frame.
+  std::array<const GroupIndexNode*, 72> pending;
+  std::size_t depth = 0;
+  auto overrides = physical_->Overrides();
+  auto* node = physical_->root_.get();
+  while (node) {
+    while (!node->page_) {
+      pending[depth++] = node->children_[1].get();
+      node = node->children_[0].get();
+    }
+    const auto& page = *node->page_;
+    for (std::size_t i = 0; i < page.ids_.size(); ++i) {
+      const auto id = page.ids_[i];
+      if (!overrides.empty() && overrides.front().id_ == id) {
+        const auto& replacement = overrides.front();
+        RecordView record{id, replacement.entry_, nullptr,
+                          replacement.retired_};
+        co_yield record;
+        overrides = overrides.subspan(1);
+      } else {
+        RecordView record{id, page.locations_[i], ManifestFor(page, id),
+                          ((page.retired_ >> i) & 1) != 0};
+        co_yield record;
+      }
+    }
+    node = depth ? pending[--depth] : nullptr;
   }
-  std::size_t cursor = 0;
-  VisitPhysical(
-      physical_->root_,
-      [&](GroupedRecordId id, const RecordIndexValue& entry,
-          const std::shared_ptr<const std::vector<ExtentRef>>& extents,
-          bool retired) {
-        if (cursor < physical_->overrides_.size() &&
-            physical_->overrides_[cursor].id_ == id) {
-          const auto& replacement = physical_->overrides_[cursor++];
-          visitor(id, replacement.entry_, nullptr, replacement.retired_);
-        } else {
-          visitor(id, entry, extents, retired);
-        }
-      });
-  assert(cursor == physical_->overrides_.size());
+  assert(overrides.empty());
+}
+
+void GroupedObject::ForEachRecord(const RecordVisitor& visitor) const {
+  for (const auto& [id, entry, extents, retired] : Records())
+    visitor(id, entry, extents, retired);
 }
 
 GroupedObjectIndex::GroupedObjectIndex(

@@ -515,6 +515,10 @@ target_precompile_headers(lavik_module PRIVATE
 )
 
 target_compile_features(lavik_module PUBLIC cxx_std_23)
+# libstdc++ exposes std::generator only when sized deallocation is enabled.
+target_compile_options(lavik_module PUBLIC
+  $<$<COMPILE_LANG_AND_ID:CXX,Clang>:-fsized-deallocation>
+)
 target_compile_definitions(lavik_module PUBLIC
   $<$<BOOL:${LAVIK_KERNEL_BYPASS}>:LAVIK_KERNEL_BYPASS=1>
   LAVIK_ASAN_BUILD=$<BOOL:${LAVIK_ASAN_BUILD}>

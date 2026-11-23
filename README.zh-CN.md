@@ -201,7 +201,7 @@ SPDK 模式需要可由 SPDK 访问的 NVMe 设备。设备绑定、hugepage 配
 
 - 启用 io_uring 的 Linux 6.1 或更新版本（发行包面向 `x86_64` 和 `aarch64`）
 - CMake 3.26 或更新版本（随附的 Meta 依赖要求）
-- C++23 编译器（下方命令使用 GCC 14）
+- 支持 `std::generator` 的 C++23 编译器和标准库（下方命令使用 GCC 14）
 - Ninja、Git，以及 OpenSSL 开发头文件和静态库；可选的内核旁路依赖还需要 GNU Make
 
 在 Ubuntu 24.04 上，先安装 Git 和 GCC 14：
@@ -220,7 +220,8 @@ cd lavik
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
-CC=gcc-14 CXX=g++-14 ./scripts/configure_release.sh
+export CC=gcc-14 CXX=g++-14
+./scripts/configure_release.sh
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```

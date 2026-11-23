@@ -17,6 +17,7 @@
 #pragma once
 
 #include <functional>
+#include <generator>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -189,6 +190,16 @@ class GroupedObject {
                         : directory().root().group_count_;
   }
   std::size_t record_count() const noexcept;
+  struct RecordView {
+    GroupedRecordId id_;
+    const RecordIndexValue& entry_;
+    std::shared_ptr<const std::vector<ExtentRef>> extents_;
+    bool retired_;
+  };
+  // Includes active and retired identities in physical index order. Keep this
+  // object alive throughout iteration and materialize block epoch/owner before
+  // suspending the consuming task. The yielded view expires on increment.
+  std::generator<const RecordView&> Records() const;
   using RecordVisitor = std::function<void(
       GroupedRecordId, const RecordIndexValue&,
       const std::shared_ptr<const std::vector<ExtentRef>>&, bool)>;

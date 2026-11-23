@@ -45,7 +45,7 @@ if [[ "${ID:-}" != ubuntu || "${VERSION_ID:-}" != 24.04 ]]; then
 fi
 
 packages=(
-  build-essential gcc-13 g++-13 cmake ninja-build git
+  build-essential gcc-14 g++-14 cmake ninja-build git
   pkg-config python3 libssl-dev libxml2-dev golang-go curl ca-certificates xz-utils
 )
 if "$with_bypass"; then

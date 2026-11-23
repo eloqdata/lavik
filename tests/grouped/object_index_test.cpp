@@ -1238,16 +1238,17 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
     expected[group.id_] = replacement.block_id();
     if (step % 7 == 0) snapshots.push_back({current, expected});
     EXPECT_EQ(current->record_count(), input.locations_.size());
-    std::map<GroupedRecordId, std::uint64_t> visited;
-    current->ForEachRecord([&](GroupedRecordId id,
-                               const RecordIndexValue& entry,
-                               const auto& extents, bool retired) {
+    auto next = expected.begin();
+    for (const auto& [id, entry, extents, retired] : current->Records()) {
+      ASSERT_NE(next, expected.end());
+      EXPECT_EQ(id, next->first);
+      EXPECT_EQ(entry.block_id(), next->second);
       EXPECT_FALSE(retired);
       EXPECT_EQ(extents, nullptr);
       EXPECT_EQ(current->FindRecord(id), &entry);
-      EXPECT_TRUE(visited.emplace(id, entry.block_id()).second);
-    });
-    EXPECT_EQ(visited, expected);
+      ++next;
+    }
+    EXPECT_EQ(next, expected.end());
   }
   for (const auto& snapshot : snapshots)
     for (const auto& [id, block] : snapshot.blocks)

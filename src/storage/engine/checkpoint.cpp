@@ -1341,10 +1341,11 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
                         root.size() +
                         (extents ? extents->size() * sizeof(ExtentRef) : 0);
     if (object)
-      object->ForEachRecord([&](auto, const auto&, const auto& refs, bool) {
+      for (const auto& record : object->Records()) {
+        const auto& refs = record.extents_;
         total += sizeof(CheckpointGroupHeader) +
                  (refs ? refs->size() * sizeof(ExtentRef) : 0);
-      });
+      }
     // One object's directory/key is temporary, never its value. This also
     // admits keys larger than an 8 MiB checkpoint chunk without silently
     // expanding checkpoint scratch beyond maxmemory.
@@ -1376,16 +1377,13 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     append_extents(extents);
     append(root.data(), root.size());
     absl::Status status = account_extents(extents);
+    if (!status.ok()) co_return status;
     if (object)
-      object->ForEachRecord([&](GroupedRecordId id,
-                                const RecordIndexValue& value,
-                                const ExtentManifest& refs, bool retired) {
-        if (!status.ok()) return;
+      for (const auto& [id, value, refs, retired] : object->Records()) {
         const auto physical = MaterializeIndexLocation(value);
         if (physical.tx_tagged()) {
-          status = absl::FailedPreconditionError(
+          co_return absl::FailedPreconditionError(
               "checkpoint group still transaction-tagged");
-          return;
         }
         CheckpointGroupHeader group{
             .location = SaveLocation(physical),
@@ -1397,8 +1395,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
           const auto* route =
               object->ordered_directory().FindRecord(id.prefix_);
           if (!route) {
-            status = absl::DataLossError("checkpoint ordered route missing");
-            return;
+            co_return absl::DataLossError("checkpoint ordered route missing");
           }
           group.previous = route->previous_;
           group.next = route->next_;
@@ -1417,8 +1414,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
             if (it != directory.groups().end()) route = &it->second;
           }
           if (!route) {
-            status = absl::DataLossError("checkpoint prefix route missing");
-            return;
+            co_return absl::DataLossError("checkpoint prefix route missing");
           }
           group.lsn = route->lsn_;
           group.encoded_bytes = route->encoded_bytes_;
@@ -1426,8 +1422,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         append(&group, sizeof(group));
         append_extents(refs);
         status = account_extents(refs);
-      });
-    if (!status.ok()) co_return status;
+        if (!status.ok()) co_return status;
+      }
     if (bytes.size() != total)
       co_return absl::InternalError(
           "checkpoint object size changed during freeze");

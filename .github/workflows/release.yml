@@ -47,8 +47,8 @@ jobs:
             suffix: ''
             bypass: 'ON'
     env:
-      CC: gcc-13
-      CXX: g++-13
+      CC: gcc-14
+      CXX: g++-14
       # Limit peak memory during compilation and LTO on hosted runners.
       LAVIK_PACKAGE_JOBS: '2'
       LAVIK_PACKAGE_KERNEL_BYPASS: ${{ matrix.bypass }}
