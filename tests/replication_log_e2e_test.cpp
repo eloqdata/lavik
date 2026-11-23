@@ -3734,7 +3734,7 @@ class ReplicationLogService final : public bycorf::Service {
                 effect.front() == expected_names[i],
             "single-key command journal order changed");
     }
-    for (std::size_t i = 0; i < 3; ++i) {
+    for (std::size_t i = 0; i < 4; ++i) {
       const auto create = ReplicatedEffectAt(family_commands[i], 0);
       Check(ReplicatedEffectAt(family_commands[i], 1) ==
                 std::vector<std::string>({"PERSIST", create[1]}),
@@ -3888,9 +3888,10 @@ class ReplicationLogService final : public bycorf::Service {
            {"BITFIELD", key, "SET", "u8", "0", "1"},
            "*1\r\n:120\r\n"},
           {{"RPUSH", key, payload}, ":1\r\n", {"LPUSH", key, "head"}, ":2\r\n"},
-          {{"SADD", key, payload},
+          {{"SADD", key, payload}, ":1\r\n", {"SADD", key, "member"}, ":1\r\n"},
+          {{"ZADD", key, "1", payload},
            ":1\r\n",
-           {"SADD", key, "member"},
+           {"ZADD", key, "2", "member"},
            ":1\r\n"}};
       for (const auto& c : cases) {
         for (bool expiring : {false, true}) {
