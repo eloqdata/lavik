@@ -412,6 +412,8 @@ struct alignas(std::max_align_t) CommandRequest {
   // which advertised port cluster replies select. The slot count needs only
   // 0, 1, or 2; two distinct slots are already a terminal CROSSSLOT witness.
   std::uint8_t replication_origin_ : 1 = false;
+  // Internal ONLINE replay attempt; a NULL HREPLACE result selects strict EXEC.
+  std::uint8_t require_persistent_hash_ : 1 = false;
   std::uint8_t connection_tls_ : 1 = false;
   std::uint8_t cluster_slot_sample_count_ : 2 = 0;
   std::uint8_t write_admission_role_epoch_valid_ : 1 = false;
@@ -501,6 +503,7 @@ struct alignas(std::max_align_t) CommandRequest {
         .db_id_ = db_id_,
         .resp_version_ = resp_version_,
         .replication_origin_ = replication_origin_,
+        .require_persistent_hash_ = require_persistent_hash_,
         .connection_tls_ = connection_tls_,
         .cluster_slot_sample_count_ = cluster_slot_sample_count_,
         .write_admission_role_epoch_valid_ = write_admission_role_epoch_valid_,
@@ -803,6 +806,9 @@ Task<absl::Status> ReplaceLuaFunctionCatalog(
 // Transaction envelopes rendezvous on every source flow before this primitive
 // applies their ordered effects atomically on the replica.
 Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command);
+// Replays a non-transaction-envelope event on an ONLINE native data flow.
+Task<absl::Status> ApplyOnlineReplicatedCommand(
+    const ReplicatedCommand& command);
 
 // Replays a FULL mutation after checking which effects are already covered by
 // newer/equal per-key snapshot versions. The caller owns the partition's

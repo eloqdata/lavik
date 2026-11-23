@@ -88,6 +88,7 @@ Task<CommandReply> ExecuteHashCommandImpl(
   }
   storage::HashOperation operation;
   operation.diagnostics_ = request.latency_trace_;
+  operation.require_persistent_hash_ = request.require_persistent_hash_;
   switch (request.kind_) {
     case CommandKind::kHSet:
     case CommandKind::kHMSet:

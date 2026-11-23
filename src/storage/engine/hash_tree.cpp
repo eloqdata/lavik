@@ -918,6 +918,13 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   const std::uint64_t now_ms =
       operation.now_ms_ == 0 ? UnixTimeMillis() : operation.now_ms_;
   const bool exists = stored_value && !IsExpired(*found, now_ms);
+  // HREPLACE holds the exclusive key lock through publication. Check PERSIST
+  // redundancy here so a declined replay attempt has made no mutation.
+  if (operation.require_persistent_hash_ &&
+      (!exists || found->value_.value_type() != ValueType::kHash ||
+       MaterializeIndexLocation(*found).expire_at_ms_ != 0)) {
+    co_return HashResult{};
+  }
   if (retry_exclusive &&
       (!exists || !found->key_complete() || !found->value_.grouped() ||
        found->value_.value_type() != value_type ||

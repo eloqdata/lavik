@@ -8637,7 +8637,7 @@ auto ReplicationManager::ReplicationGroup::StageReplicaOnlineCommands(
           applied = co_await MaybePauseBeforeReplicaCommandApply();
         });
         if (applied.ok()) {
-          applied = co_await ApplyReplicatedCommand(pending.command_);
+          applied = co_await ApplyOnlineReplicatedCommand(pending.command_);
         }
         LAVIK_FAULT_INJECT(if (applied.ok()) {
           InjectPeerFlowCancelAfterCommandApply(session, flow_id,

@@ -918,6 +918,8 @@ enum class HashOperationKind : std::uint8_t {
 // fields_/values_ arrays; field-only operations leave values_ empty.
 struct HashOperation {
   HashOperationKind kind_ = HashOperationKind::kLength;
+  // Replay may elide a trailing PERSIST only for an already persistent Hash.
+  bool require_persistent_hash_ = false;
   OnlineLatencyTrace* diagnostics_ = nullptr;
   // Point commands dominate this interface. Inline the common operand pair
   // without retaining a worker-wide scratch buffer across coroutine waits.

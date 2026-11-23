@@ -131,6 +131,27 @@ for _ in {1..600}; do
 done
 [[ $(replica_get "${replica_port}" baseline) == online ]]
 
+# ONLINE replacement must preserve both persistent and expiring Hashes.
+# Poll the Hash itself: a marker on a different flow is not a replay barrier.
+for key in persistent-replace expiring-replace; do
+  "${redis_cli}" -p "${source_port}" HSET "${key}" old original >/dev/null
+  if [[ ${key} == expiring-replace ]]; then
+    [[ $("${redis_cli}" -p "${source_port}" PEXPIRE "${key}" 600000) == 1 ]]
+  fi
+  deadline=$("${redis_cli}" -p "${source_port}" PEXPIRETIME "${key}")
+  [[ $("${redis_cli}" -p "${source_port}" LAVIK.HREPLACE "${key}" new replaced) == OK ]]
+  for _ in {1..600}; do
+    actual=$(printf 'READONLY\nHGET %s new\n' "${key}" |
+      "${redis_cli}" --raw -p "${replica_port}" | tail -1)
+    [[ ${actual} == replaced ]] && break
+    sleep 0.05
+  done
+  [[ ${actual} == replaced ]]
+  actual=$(printf 'READONLY\nHLEN %s\nPEXPIRETIME %s\n' "${key}" "${key}" |
+    "${redis_cli}" --raw -p "${replica_port}" | tail -2)
+  [[ ${actual} == "$(printf '1\n%s' "${deadline}")" ]]
+done
+
 # A replica is not a native source. Probe rejection must leave the third node
 # writable and must not replace the active source/replica relationship.
 cascade_reply=$("${redis_cli}" -p "${third_port}" LAVIK.REPLICAOF 127.0.0.1 "${replica_port}" 2>&1)

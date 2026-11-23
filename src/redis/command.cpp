@@ -14277,9 +14277,28 @@ absl::StatusOr<std::vector<CommandRequest>> ParseReplicatedExec(
 
 }  // namespace
 
-Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
+Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args,
+                                       bool online = false) {
   auto commands = ParseReplicatedExec(args);
   if (!commands.ok()) co_return commands.status();
+  if (online && commands->size() == 2) {
+    auto& replace = commands->front();
+    const auto& persist = commands->back();
+    if (replace.kind_ == CommandKind::kHReplace && replace.args_.size() >= 4 &&
+        replace.args_.size() % 2 == 0 &&
+        persist.kind_ == CommandKind::kPersist && persist.args_.size() == 2 &&
+        replace.db_id_ == persist.db_id_ &&
+        replace.args_[1] == persist.args_[1]) {
+      replace.require_persistent_hash_ = true;
+      ReplyBuilder builder;
+      auto reply = co_await ExecuteCommand(replace, builder);
+      if (reply.encoded_ == "+OK\r\n") co_return absl::OkStatus();
+      if (reply.encoded_ != "$-1\r\n") {
+        co_return absl::FailedPreconditionError(std::string(reply.encoded_));
+      }
+      replace.require_persistent_hash_ = false;
+    }
+  }
   ConnectionContext context;
   context.strict_replication_apply_ = true;
   context.queued_ = std::move(*commands);
@@ -14388,6 +14407,15 @@ Task<absl::Status> ApplyFullSyncCommand(const ReplicatedCommand& command,
     co_return absl::FailedPreconditionError(std::string(reply.encoded_));
   }
   co_return absl::OkStatus();
+}
+
+Task<absl::Status> ApplyOnlineReplicatedCommand(
+    const ReplicatedCommand& command) {
+  if (!command.args_.empty() && command.args_[0] == kReplicatedExecCommand &&
+      (g_storage == nullptr || command.db_id_ < g_storage->database_count())) {
+    return ApplyReplicatedExec(command.args_, true);
+  }
+  return ApplyReplicatedCommand(command);
 }
 
 Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
