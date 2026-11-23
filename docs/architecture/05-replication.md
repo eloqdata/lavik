@@ -757,7 +757,7 @@ client write
   -> per-flow ordered ACK
 ```
 
-Ordered standalone in-place updates to live persistent Hashes and Sets inherit the key's persistence during replay.
+Ordered standalone in-place updates to live persistent Hashes, Lists and Sets inherit the key's persistence during replay.
 The source publishes the canonical mutation without a trailing PERSIST.
 Operations with selected values retain their deterministic
 replay arguments. Creation and updates on expiring keys keep their existing
