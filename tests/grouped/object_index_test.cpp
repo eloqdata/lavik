@@ -788,6 +788,17 @@ TEST(GroupedObjectIndexTest, ExternalGroupManifestIsSparseAndRequired) {
   ASSERT_TRUE(object.ok()) << object.status();
   const auto retained = (*object)->ExtentsFor(input.locations_[0].id_);
   ASSERT_NE(retained, nullptr);
+  const auto owners = retained.use_count();
+  bool visited_external = false;
+  for (const auto& record : (*object)->Records()) {
+    if (record.id_ == input.locations_[0].id_) {
+      EXPECT_EQ(record.extents_, retained);
+      EXPECT_EQ(retained.use_count(), owners);
+      visited_external = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(visited_external);
   EXPECT_NE(retained, extents);
   EXPECT_EQ(*retained, *extents);
   for (std::size_t i = 1; i < input.locations_.size(); ++i) {

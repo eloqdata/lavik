@@ -193,7 +193,8 @@ class GroupedObject {
   struct RecordView {
     GroupedRecordId id_;
     const RecordIndexValue& entry_;
-    std::shared_ptr<const std::vector<ExtentRef>> extents_;
+    // Borrow the page's handle. Only a consumer retaining it needs a copy.
+    const std::shared_ptr<const std::vector<ExtentRef>>& extents_;
     bool retired_;
   };
   // Includes active and retired identities in physical index order. Keep this

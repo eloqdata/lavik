@@ -411,13 +411,16 @@ const RecordIndexValue* FindBaseRecord(const NodeHandle& root,
              : &page->locations_[found - page->ids_.begin()];
 }
 
-std::shared_ptr<const std::vector<ExtentRef>> ManifestFor(
+// Missing manifests also need a stable reference throughout a yielded view.
+constinit const std::shared_ptr<const std::vector<ExtentRef>> kEmptyManifest;
+
+const std::shared_ptr<const std::vector<ExtentRef>>& ManifestFor(
     const GroupIndexPage& page, GroupedRecordId id) {
-  if (page.extents_.empty()) return nullptr;
+  if (page.extents_.empty()) return kEmptyManifest;
   const auto bytes = GroupKey(id);
   const std::string_view key(bytes.data(), bytes.size());
   const auto* entry = page.extents_.Find(ComputeDigest(key), key);
-  return entry ? entry->value_ : nullptr;
+  return entry ? entry->value_ : kEmptyManifest;
 }
 
 absl::StatusOr<NodeHandle> UpdatePhysical(
@@ -1296,7 +1299,7 @@ std::generator<const GroupedObject::RecordView&> GroupedObject::Records()
       const auto id = page.ids_[i];
       if (!overrides.empty() && overrides.front().id_ == id) {
         const auto& replacement = overrides.front();
-        RecordView record{id, replacement.entry_, nullptr,
+        RecordView record{id, replacement.entry_, kEmptyManifest,
                           replacement.retired_};
         co_yield record;
         overrides = overrides.subspan(1);
