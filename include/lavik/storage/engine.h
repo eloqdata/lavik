@@ -663,9 +663,9 @@ struct ReplicationCommandAppend {
   ReplicationEventKind kind_ = ReplicationEventKind::kMutation;
   std::uint8_t db_id_ = 0;
   std::uint16_t partition_id_ = 0;
-  // Source-local proof for this write attempt. Ordered hash updates inherit
-  // persistence from the live predecessor; FULL capture keeps its TTL effect.
-  bool inherits_persistent_hash_ = false;
+  // Set by in-place mutations that observed a live, persistent predecessor
+  // under key admission. Retries must use the new incarnation's observation.
+  bool persistent_predecessor_ = false;
   std::uint64_t partition_sequence_ = 0;
   // Lifetime-only ownership of already-admitted canonical storage. Shared
   // full-sync copies keep the same charge alive without re-admitting it;

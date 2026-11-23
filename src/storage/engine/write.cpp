@@ -2246,7 +2246,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
                                         : ++partition.mutation_sequence_;
   std::shared_ptr<ReplicationCommandAppend> fullsync_command;
   if (replication != nullptr) {
-    if (!replication->inherits_persistent_hash_ ||
+    // Only a final PERSIST can be inferred from an ordered in-place update.
+    // FULL rebuilds keep explicit expiration effects alongside the mutation.
+    if (!replication->persistent_predecessor_ || expire_at_ms != 0 ||
         !partition.fullsync_subscribers_.empty()) {
       AppendReplicationExpirationEffect(
           &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,

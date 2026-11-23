@@ -3734,9 +3734,12 @@ class ReplicationLogService final : public bycorf::Service {
                 effect.front() == expected_names[i],
             "single-key command journal order changed");
     }
-    Check(ReplicatedEffectAt(family_commands[1], 1) ==
-              std::vector<std::string>({"PERSIST", "journal-hash"}),
-          "hash creation lost its final persistence effect");
+    for (std::size_t i = 1; i < 3; ++i) {
+      const auto create = ReplicatedEffectAt(family_commands[i], 0);
+      Check(ReplicatedEffectAt(family_commands[i], 1) ==
+                std::vector<std::string>({"PERSIST", create[1]}),
+            "collection creation lost its final persistence effect");
+    }
     const std::vector<std::vector<std::string>> persistent_updates{
         {"HSET", "journal-hash", "old", "extra"},
         {"LAVIK.HREPLACE", "journal-hash", "field", "replaced"},
@@ -3860,6 +3863,62 @@ class ReplicationLogService final : public bycorf::Service {
     status = co_await ExecuteClientCommand(6, {"GET", "strict-counter"},
                                            "$1\r\n1\r\n");
     if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ExerciseInPlaceExpirationEffects() {
+    constexpr std::uint8_t kDb = 4;
+    const std::string key = "in-place-expiration";
+    struct Case {
+      std::vector<std::string> seed;
+      std::string seed_reply;
+      std::vector<std::string> write;
+      std::string write_reply;
+    };
+    std::uint64_t epoch = 1000;
+    for (std::size_t size : {16, 16 * 1024}) {
+      const std::string payload(size, 'x');
+      const std::vector<Case> cases{{{"SADD", key, payload},
+                                     ":1\r\n",
+                                     {"SADD", key, "member"},
+                                     ":1\r\n"}};
+      for (const auto& c : cases) {
+        for (bool expiring : {false, true}) {
+          auto status =
+              co_await ExecuteClientCommand(kDb, c.seed, c.seed_reply);
+          if (!status.ok()) co_return status;
+          if (expiring) {
+            std::vector<std::string> expire{"PEXPIRE", key, "600000"};
+            status =
+                co_await ExecuteClientCommand(kDb, std::move(expire), ":1\r\n");
+            if (!status.ok()) co_return status;
+          }
+          const auto prior = co_await storage_->GetExpiration(kDb, key);
+          status = co_await storage_->EnableReplicationLog(++epoch, 8 * kMiB);
+          if (!status.ok()) co_return status;
+          status = co_await ExecuteClientCommand(kDb, c.write, c.write_reply);
+          if (!status.ok()) co_return status;
+          auto command = co_await ReadSinglePublishedCommand(1);
+          if (!command.ok()) co_return command.status();
+          const auto& expected = c.write;
+          if (expiring) {
+            Check(ReplicatedEffectAt(*command, 0) == expected &&
+                      ReplicatedEffectAt(*command, 1) ==
+                          std::vector<std::string>(
+                              {"PEXPIREAT", key,
+                               std::to_string(prior.expire_at_ms_)}),
+                  "in-place update lost the absolute source deadline");
+          } else {
+            Check(command->args_ == expected,
+                  "persistent update should publish only " + expected.front());
+          }
+          status = co_await storage_->DisableReplicationLog();
+          if (!status.ok()) co_return status;
+          auto deleted = co_await storage_->Delete(kDb, key);
+          if (!deleted.ok()) co_return deleted.status();
+        }
+      }
+    }
     co_return absl::OkStatus();
   }
 
@@ -4588,6 +4647,10 @@ class ReplicationLogService final : public bycorf::Service {
 
     current_stage_ = "published collection commands";
     status = co_await ExercisePublishedCollectionCommands();
+    if (!status.ok()) co_return status;
+
+    current_stage_ = "in-place expiration effects";
+    status = co_await ExerciseInPlaceExpirationEffects();
     if (!status.ok()) co_return status;
 
     current_stage_ = "published wide-argument command";
