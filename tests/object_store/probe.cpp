@@ -128,7 +128,12 @@ bycorf::Task<absl::Status> S3RoundTrip(const Endpoint& endpoint) {
   const std::string replacement("new\0bytes", 9);
   auto overwrite = co_await client.Put(first, replacement, *tag);
   if (!overwrite.ok()) co_return overwrite.status();
-  auto stale = co_await client.Put(first, bytes, *tag);
+  S3Client limited(host, "us-east-1", endpoint.bucket, endpoint.credentials,
+                   {.max_response_body_bytes_ = 0});
+  auto too_large = co_await limited.Get(first);
+  if (!absl::IsResourceExhausted(too_large.status()))
+    co_return absl::DataLossError("S3 GET ignored its response body limit");
+  auto stale = co_await limited.Put(first, bytes, *tag);
   if (!absl::IsFailedPrecondition(stale.status()))
     co_return absl::DataLossError(
         "stale S3 If-Match did not return FailedPrecondition");
@@ -162,7 +167,7 @@ bycorf::Task<absl::Status> S3RoundTrip(const Endpoint& endpoint) {
         "invalid S3 signature did not return PermissionDenied");
   auto removed = co_await client.Delete(first);
   if (!removed.ok()) co_return removed;
-  get = co_await client.Get(first);
+  get = co_await limited.Get(first);
   if (!absl::IsNotFound(get.status()))
     co_return absl::DataLossError(
         "S3 GET after delete did not return NotFound");

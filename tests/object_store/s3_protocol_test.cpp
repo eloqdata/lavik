@@ -53,7 +53,8 @@ auto ListResponse(std::string_view fields) {
 
 TEST(S3Protocol, DecodesKeysAndPreservesOpaqueToken) {
   auto page = ParseListPage(
-      ListResponse("<IsTruncated>true</IsTruncated><Contents><Key>a%00+%25</"
+      ListResponse("<KeyCount>1</KeyCount><IsTruncated>true</"
+                   "IsTruncated><Contents><Key>a%00+%25</"
                    "Key></Contents>"
                    "<NextContinuationToken>&amp;%2B/+</NextContinuationToken>"),
       "", 1);
@@ -61,6 +62,23 @@ TEST(S3Protocol, DecodesKeysAndPreservesOpaqueToken) {
   ASSERT_EQ(page->keys_.size(), 1);
   EXPECT_EQ(page->keys_[0], std::string("a\0+%", 4));
   EXPECT_EQ(page->next_token_, "&%2B/+");
+}
+
+TEST(S3Protocol, VerifiesKeyCountBeforeCompletingTheListing) {
+  const std::string final = "<IsTruncated>false</IsTruncated>";
+  auto empty =
+      ParseListPage(ListResponse(final + "<KeyCount>0</KeyCount>"), "", 2);
+  ASSERT_TRUE(empty.ok()) << empty.status();
+  EXPECT_TRUE(empty->keys_.empty());
+  EXPECT_TRUE(empty->next_token_.empty());
+
+  for (const char* count :
+       {"<KeyCount>2</KeyCount>", "<KeyCount>1x</KeyCount>", ""}) {
+    auto page = ParseListPage(
+        ListResponse(final + count + "<Contents><Key>a</Key></Contents>"), "",
+        2);
+    EXPECT_TRUE(absl::IsDataLoss(page.status())) << count;
+  }
 }
 
 TEST(S3Protocol, RejectsMalformedPagesWithoutReportingCompletion) {

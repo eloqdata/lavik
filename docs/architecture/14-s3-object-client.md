@@ -25,8 +25,10 @@ include their session token in the signed fields.
 
 PUT returns the service's opaque ETag. A caller can supply that value in
 `If-Match` when overwriting the object. A rejected precondition is returned
-to the caller. A deadline or transport failure after sending a write leaves
-its outcome unknown. The application owns reconciliation and retry policy.
+to the caller once its response headers have been read. HTTP writes the
+request body before reading those headers. A peer that stops accepting an
+upload can therefore surface as a transport error or deadline, leaving its
+outcome unknown. The application owns reconciliation and retry policy.
 
 Each prefix listing returns one page of decoded keys and an opaque
 continuation token. A caller advances through the pages with the same prefix

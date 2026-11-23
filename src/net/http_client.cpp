@@ -140,8 +140,8 @@ class Reader {
   std::size_t position_ = 0;
 };
 bycorf::Task<absl::StatusOr<HttpResponse>> ReadResponse(
-    bycorf::TcpStream& stream, HttpMethod method, std::size_t body_limit) {
-  Reader reader(stream, body_limit);
+    bycorf::TcpStream& stream, HttpMethod method, HttpRequestOptions options) {
+  Reader reader(stream, options.max_response_body_bytes_);
   HttpResponse response;
   std::size_t header_bytes = 0;
   do {
@@ -177,7 +177,8 @@ bycorf::Task<absl::StatusOr<HttpResponse>> ReadResponse(
 
   // Framing fields on HEAD and 304 can describe a hypothetical GET.
   if (method == HttpMethod::kHead || response.status_ == 204 ||
-      response.status_ == 304)
+      response.status_ == 304 ||
+      (options.skip_error_body_ && response.status_ >= 400))
     co_return response;
 
   std::optional<std::size_t> length;
@@ -296,7 +297,8 @@ bycorf::Task<absl::Status> Expire(
 
 bycorf::Task<absl::StatusOr<HttpResponse>> Exchange(
     bycorf::TcpStream& stream, const HttpEndpoint& endpoint,
-    const HttpRequest& request, const std::string& head, std::size_t limit,
+    const HttpRequest& request, const std::string& head,
+    HttpRequestOptions options,
     std::chrono::steady_clock::time_point deadline) {
   if (endpoint.tls_) {
     auto status = co_await stream.StartTls(
@@ -316,7 +318,7 @@ bycorf::Task<absl::StatusOr<HttpResponse>> Exchange(
     status = co_await stream.WriteAll(std::as_bytes(std::span(request.body_)));
     if (!status.ok()) co_return status;
   }
-  co_return co_await ReadResponse(stream, request.method_, limit);
+  co_return co_await ReadResponse(stream, request.method_, options);
 }
 }  // namespace
 
@@ -373,7 +375,8 @@ bycorf::Task<absl::StatusOr<HttpResponse>> HttpClient::Send(
   if (!head.ok()) co_return head.status();
   const auto remaining = deadline - std::chrono::steady_clock::now();
   if (remaining <= remaining.zero())
-    co_return absl::DeadlineExceededError("HTTP request timed out");
+    co_return absl::DeadlineExceededError(
+        "HTTP request timed out before connecting");
   auto stream = co_await bycorf::ConnectTcp(*worker, endpoint_.address_,
                                             endpoint_.port_, remaining);
   if (!stream.ok()) co_return stream.status();
@@ -391,8 +394,8 @@ bycorf::Task<absl::StatusOr<HttpResponse>> HttpClient::Send(
     co_return absl::DeadlineExceededError(
         "HTTP request timed out before sending headers");
   worker->Spawn(Expire(*worker, state, deadline));
-  auto result = co_await Exchange(*stream, endpoint_, request, *head,
-                                  options.max_response_body_bytes_, deadline);
+  auto result =
+      co_await Exchange(*stream, endpoint_, request, *head, options, deadline);
   if (!state->failure.ok()) co_return state->failure;
   if (std::chrono::steady_clock::now() >= deadline)
     co_return absl::DeadlineExceededError("HTTP request timed out");

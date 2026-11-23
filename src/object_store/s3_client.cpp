@@ -193,6 +193,16 @@ absl::StatusOr<S3ListPage> internal::ParseListPage(std::string_view body,
       return absl::DataLossError("oversized S3 list page");
     page.keys_.push_back(*std::move(key));
   }
+  // Our ListObjectsV2 requests omit delimiter, so every counted item must
+  // appear as a Contents entry. A short final page would end recovery early.
+  auto count = Field(root, "KeyCount");
+  if (!count.ok()) return count.status();
+  unsigned declared;
+  const auto* end = count->data() + count->size();
+  const auto parsed = std::from_chars(count->data(), end, declared);
+  if (parsed.ec != std::errc{} || parsed.ptr != end ||
+      declared != page.keys_.size())
+    return absl::DataLossError("inconsistent S3 KeyCount");
   return page;
 }
 
@@ -204,7 +214,11 @@ S3Client::S3Client(net::HttpEndpoint endpoint, std::string region,
       region_(std::move(region)),
       bucket_(std::move(bucket)),
       credentials_(std::move(credentials)),
-      options_(options) {}
+      options_(options) {
+  // S3 status mapping uses only the final HTTP status, including when the
+  // XML error document exceeds the configured successful GET body limit.
+  options_.skip_error_body_ = true;
+}
 
 absl::Status internal::SignRequest(HttpRequest& request, std::string_view query,
                                    std::string_view authority,

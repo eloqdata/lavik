@@ -77,6 +77,8 @@ struct HttpResponse {
 struct HttpRequestOptions {
   std::chrono::milliseconds timeout_{30000};
   std::size_t max_response_body_bytes_ = 16 * 1024 * 1024;
+  // Status-only consumers can close after the headers of a 4xx/5xx response.
+  bool skip_error_body_ = false;
 };
 
 // One connection per HTTP/1.1 exchange. The immutable client may serve
