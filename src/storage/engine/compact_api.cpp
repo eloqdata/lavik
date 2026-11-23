@@ -171,6 +171,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   };
   const RecordLocation location =
       exists ? MaterializeIndexLocation(*found) : RecordLocation{};
+  if (replication && value_type == ValueType::kString)
+    replication->persistent_predecessor_ =
+        exists && location.expire_at_ms_ == 0;
   const ExtentManifest extents =
       exists ? ExtentsFor(store, found) : ExtentManifest{};
   // Only typed single-key ZADD/ZREM/ZINCRBY opt in. Arbitrary callbacks may

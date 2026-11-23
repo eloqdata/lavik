@@ -3879,6 +3879,14 @@ class ReplicationLogService final : public bycorf::Service {
     for (std::size_t size : {16, 16 * 1024}) {
       const std::string payload(size, 'x');
       const std::vector<Case> cases{
+          {{"SET", key, payload},
+           "+OK\r\n",
+           {"APPEND", key, "!"},
+           ":" + std::to_string(size + 1) + "\r\n"},
+          {{"SET", key, payload},
+           "+OK\r\n",
+           {"BITFIELD", key, "SET", "u8", "0", "1"},
+           "*1\r\n:120\r\n"},
           {{"RPUSH", key, payload}, ":1\r\n", {"LPUSH", key, "head"}, ":2\r\n"},
           {{"SADD", key, payload},
            ":1\r\n",
