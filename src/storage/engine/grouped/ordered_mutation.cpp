@@ -76,8 +76,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   }
   // Grouped sorted-set intent writes can arrive directly without a compact
   // lookup. A promotion has no previous group and retains the caller's proof.
-  if (replication && previous &&
-      previous->version().root_.value_type() == ValueType::kSortedSet)
+  if (replication && previous)
     replication->persistent_predecessor_ =
         previous->version().root_.expire_at_ms_ == 0;
   const auto field_count = plan.root_.logical_size();

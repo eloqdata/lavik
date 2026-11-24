@@ -3892,7 +3892,11 @@ class ReplicationLogService final : public bycorf::Service {
           {{"ZADD", key, "1", payload},
            ":1\r\n",
            {"ZADD", key, "2", "member"},
-           ":1\r\n"}};
+           ":1\r\n"},
+          {{"XADD", key, "1-0", "field", payload},
+           "$3\r\n1-0\r\n",
+           {"XADD", key, "2-*", "field", "value"},
+           "$3\r\n2-0\r\n"}};
       for (const auto& c : cases) {
         for (bool expiring : {false, true}) {
           auto status =
@@ -3911,7 +3915,8 @@ class ReplicationLogService final : public bycorf::Service {
           if (!status.ok()) co_return status;
           auto command = co_await ReadSinglePublishedCommand(1);
           if (!command.ok()) co_return command.status();
-          const auto& expected = c.write;
+          auto expected = c.write;
+          if (expected.front() == "XADD") expected[2] = "2-0";
           if (expiring) {
             Check(ReplicatedEffectAt(*command, 0) == expected &&
                       ReplicatedEffectAt(*command, 1) ==

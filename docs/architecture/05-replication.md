@@ -757,9 +757,10 @@ client write
   -> per-flow ordered ACK
 ```
 
-Ordered standalone in-place updates to live persistent Strings, Hashes, Lists, Sets and Sorted Sets inherit the key's persistence during replay.
+Ordered standalone in-place updates to live persistent Strings, Hashes, Lists,
+Sets, Sorted Sets and Streams inherit the key's persistence during replay.
 The source publishes the canonical mutation without a trailing PERSIST.
-Operations with selected values retain their deterministic
+Operations with selected values or generated IDs retain their deterministic
 replay arguments. Creation and updates on expiring keys keep their existing
 expiration encoding. FULL capture and transaction settlement retain explicit
 expiration effects.
