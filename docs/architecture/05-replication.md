@@ -757,12 +757,12 @@ client write
   -> per-flow ordered ACK
 ```
 
-Standalone field writes to a live persistent Hash publish a single mutation.
-HINCRBY and HINCRBYFLOAT publish HSET with the resulting field value. The
-ordered replay inherits the key's persistence. Hash creation and updates to a
-surviving expiring Hash carry the final persistence or absolute-expiration
-effect. During FULL capture the partition
-retains that explicit effect for Hash updates as well.
+Ordered standalone in-place updates to live persistent Hashes and Sets inherit the key's persistence during replay.
+The source publishes the canonical mutation without a trailing PERSIST.
+Operations with selected values retain their deterministic
+replay arguments. Creation and updates on expiring keys keep their existing
+expiration encoding. FULL capture and transaction settlement retain explicit
+expiration effects.
 
 Canonical commands use the LRC1 command-body encoding: a four-byte magic,
 one-byte version, one-byte logical database, argument count, per-argument
