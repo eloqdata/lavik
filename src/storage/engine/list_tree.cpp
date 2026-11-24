@@ -588,6 +588,9 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   const ExtentManifest extents =
       exists ? ExtentsFor(store, found) : ExtentManifest{};
   const std::uint64_t expire_at_ms = exists ? location.expire_at_ms_ : 0;
+  if (replication)
+    replication->persistent_predecessor_ =
+        exists && location.expire_at_ms_ == 0;
 
   ListResult result;
   result.key_exists_ = exists;
