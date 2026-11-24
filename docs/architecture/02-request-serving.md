@@ -158,8 +158,10 @@ racing closure is either rejected or remains visible to the drain.
    borrows it when free; commands retained concurrently by a pipeline or MULTI
    own additional independent objects. Queueing and request handoff transfer
    handles without relocating arguments. Completion or abandonment clears the
-   embedded object's buffers and releases their overflow heaps, or deletes an
-   additional object outright; connections keep no cache of extra objects.
+   embedded object's buffers or deletes an additional object outright. Data
+   workers may retain one admitted, bounded overflow byte buffer for reuse by
+   another connection's incremental bulk parser. Idle capacity expires on the
+   receiving worker; connections keep no spare allocations.
    The connection outlives every handle borrowing its embedded storage,
    including queued MULTI commands. Cross-worker execution borrows the request
    until the originating worker's await completes, so releasing arguments needs

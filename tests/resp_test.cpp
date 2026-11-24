@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "lavik/memory.h"
+#include "resp_byte_spare.h"
 
 namespace lavik {
 namespace {
@@ -95,6 +96,69 @@ TEST(RespParserTest, PackedBytesSpillAtInlineBoundaryAndReleaseOnReturn) {
     EXPECT_TRUE(ArgumentsAreInline(empty));
     EXPECT_TRUE(ArgumentBytesAreInline(empty));
   }
+}
+
+TEST(RespParserTest, ReusesSpilledSetBytesAcrossConnectionsOnlyAfterRelease) {
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  RespByteSpare spare;
+  CommandArgsStorage first_slot, second_slot;
+  first_slot.byte_spare_ = second_slot.byte_spare_ = &spare.buffer_;
+  RespCommandParser first(kDefaultClientQueryBufferLimit, &first_slot);
+  RespCommandParser second(kDefaultClientQueryBufferLimit, &second_slot);
+  const std::string prefix = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1024\r\n";
+  const std::string value(1024, '\0');
+  const auto wire = prefix + value + "\r\n";
+  auto a = first.Parse(wire);
+  auto b = second.Parse(wire);
+  ASSERT_EQ(a.state_, RespParseState::kOk);
+  ASSERT_EQ(b.state_, RespParseState::kOk);
+  const char* allocation = a.command_.args_.Get().bytes.data();
+  EXPECT_NE(b.command_.args_.Get().bytes.data(), allocation);
+  // Pipeline overflow can outlive its connection and has independent storage.
+  auto pipeline = first.Parse(wire);
+  ASSERT_EQ(pipeline.state_, RespParseState::kOk);
+  spare.AdmitFor(a.command_.args_.Get());
+  a.command_.args_.Reset();
+  b.command_.args_.Reset();
+  const auto small = first.Parse("*1\r\n$4\r\nPING\r\n");
+  ASSERT_EQ(small.state_, RespParseState::kOk);
+  EXPECT_TRUE(ArgumentBytesAreInline(small.command_.args_));
+  ASSERT_EQ(second.Parse(prefix + value.substr(0, 100)).state_,
+            RespParseState::kNeedMoreData);
+  auto reused = second.Parse(value.substr(100) + "\r\n");
+  ASSERT_EQ(reused.state_, RespParseState::kOk);
+  EXPECT_EQ(reused.command_.args_.Get().bytes.data(), allocation);
+  EXPECT_EQ(reused.command_.args_[1], "k");
+  EXPECT_EQ(reused.command_.args_[2], value);
+  EXPECT_EQ(pipeline.command_.args_[2], value);
+}
+
+TEST(RespParserTest, RecycledCapacityIsBoundedAdmittedAndExpires) {
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  RespByteSpare spare;
+  CommandArgs args;
+  auto& bytes = args.bytes;
+  bytes.resize(8192);
+  const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
+  spare.AdmitFor(args);
+  spare.buffer_.Offer(bytes);
+  EXPECT_EQ(bytes.size(), 8192u);
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+  bytes.clear();
+  bytes.resize(2048);
+  spare.AdmitFor(args);
+  spare.buffer_.Offer(bytes);
+  EXPECT_GT(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+  spare.Tick();
+  EXPECT_GT(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+  spare.Tick();
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+  ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+  bytes.resize(2048);
+  spare.AdmitFor(args);
+  spare.buffer_.Offer(bytes);
+  EXPECT_EQ(bytes.size(), 2048u);
+  EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
 }
 
 TEST(RespParserTest, PackedGrowthPreservesEarlierEmptyBinaryAndVerbatimArgs) {
