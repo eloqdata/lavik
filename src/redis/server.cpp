@@ -953,6 +953,13 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
 
 class RequestInputBuffer {
  public:
+  explicit RequestInputBuffer(const TcpStream& stream)
+      : plaintext_(stream.GetPlaintextView()) {}
+
+  // TcpService finishes TLS negotiation before RESP serving starts. The
+  // ordinary and Pub/Sub readers share this input until close or handoff.
+  const std::optional<TcpStream::PlaintextView> plaintext_;
+
   std::string_view View() const noexcept {
     if (begin_ == end_) return {};
     return std::string_view(
@@ -1076,7 +1083,6 @@ Task<absl::Status> ReadCommandBatch(
     std::optional<absl::Status>* deferred_error) {
   constexpr std::size_t kBulkBytesPerYield = 256 * 1024;
   std::size_t bulk_bytes_since_yield = 0;
-  const auto plain = stream.GetPlaintextView();
   auto parse = [&](std::string_view& bytes) -> absl::Status {
     // A socket read can suspend across CONFIG SET on another worker.
     parser->SetQueryBufferLimit(
@@ -1183,7 +1189,7 @@ Task<absl::Status> ReadCommandBatch(
       continue;
     }
 
-    if (plain && input->View().empty()) {
+    if (input->plaintext_ && input->View().empty()) {
       auto consume = [&](std::span<const std::byte> chunk) {
         status = admit(chunk.size());
         if (!status.ok()) return;
@@ -1199,7 +1205,7 @@ Task<absl::Status> ReadCommandBatch(
           input->Commit(rest.size());
         }
       };
-      auto read = co_await plain->VisitSome(consume);
+      auto read = co_await input->plaintext_->VisitSome(consume);
       if (!read.ok()) co_return read.status();
       if (*read == 0)
         co_return absl::UnavailableError("peer closed connection");
@@ -1893,7 +1899,7 @@ Task<absl::Status> RedisService::HandoffReplicationConnection(
 
 Task<absl::Status> RedisService::Serve(TcpStream& stream,
                                        ConnectionContext& ctx) {
-  RequestInputBuffer input;
+  RequestInputBuffer input(stream);
   RespCommandParser parser(client_query_buffer_limit(),
                            &ctx.command_args_storage_);
   CommandBatch ready;
