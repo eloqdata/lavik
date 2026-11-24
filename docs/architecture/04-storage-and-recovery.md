@@ -722,9 +722,6 @@ drains the owning operation before destroying its storage state.
 Standalone replacements do not immediately retire the old durable record.
 The old version remains live in physical accounting until the replacement's
 flush completes, ensuring recovery always has at least one durable copy.
-After retirement settlement, the worker may retain one empty batch buffer for reuse.
-Idle capacity is admitted against the worker's retained-memory budget and released
-by periodic flush maintenance after expiry.
 
 Multi-key durable writes use transaction blocks. Each participant's
 tagged records become durable first. `CommitTxWrites` waits for all participant

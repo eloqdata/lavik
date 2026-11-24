@@ -24,49 +24,6 @@
 
 namespace lavik::storage {
 
-TEST(RetiredRecordSpareTest, ReusesOneAllocationWithoutRetainingExtentOwners) {
-  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
-  RetiredRecordSpare spare;
-  RetiredRecordSpare::Records first(128), concurrent(8), next;
-  auto manifest = std::make_shared<const std::vector<ExtentRef>>();
-  first.back().dependent_extents_ = manifest;
-  auto* storage = first.data();
-  const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
-  const auto bytes = AllocatorUsableSizeForRequest(first.capacity() *
-                                                   sizeof(StagedRetiredRecord));
-  spare.Offer(first);
-  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline + bytes);
-  EXPECT_EQ(manifest.use_count(), 1);
-  spare.Offer(concurrent);
-  EXPECT_EQ(concurrent.size(), 8u);
-  spare.Take(next);
-  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
-  ASSERT_TRUE(next.empty());
-  next.resize(128);
-  EXPECT_EQ(next.data(), storage);
-  spare.Offer(next);
-  spare.Trim(RetiredRecordSpare::Clock::time_point::max());
-  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
-  spare.Take(next);
-  EXPECT_EQ(next.capacity(), 0u);
-}
-
-TEST(RetiredRecordSpareTest, SkipsOversizedOrUnadmittedStorage) {
-  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
-  RetiredRecordSpare spare;
-  RetiredRecordSpare::Records oversized(
-      512 * 1024 / sizeof(StagedRetiredRecord) + 1);
-  RetiredRecordSpare::Records next, small(128);
-  spare.Offer(oversized);
-  spare.Take(next);
-  EXPECT_EQ(next.capacity(), 0u);
-  ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
-  absl::Cleanup restore = [] { (void)InitMemoryLimit(1024 * kMiB, 1); };
-  spare.Offer(small);
-  spare.Take(next);
-  EXPECT_EQ(next.capacity(), 0u);
-}
-
 class WriteBufferTestPeer {
  public:
   enum class Scenario {

@@ -32,7 +32,6 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     if (store->worker_->stop_requested()) {
       break;
     }
-    store->retired_record_spare_.Trim(RetiredRecordSpare::Clock::now());
     // The process failure latch can also be set by a non-runtime caller.
     // Normal progress is notified by I/O completion, without a timer wait.
     if (store->write_failed_ || RuntimeFailureLatched()) {
