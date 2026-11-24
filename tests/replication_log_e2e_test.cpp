@@ -44,6 +44,7 @@
 #include "lavik/command_table.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
+#include "lavik/rdb.h"
 #include "lavik/replication_command.h"
 #include "lavik/replication_history.h"
 #include "lavik/resp.h"
@@ -791,7 +792,7 @@ class ReplicationLogService final : public bycorf::Service {
     Check(history.state_ == ReplicationLogState::kActive &&
               history.log_epoch_ == kEpoch && history.tail_lsn_ == 1,
           "continuation allocation invalidated the admitted script history");
-    Check(body.args_.size() >= 2 && body.args_[1] == "4" &&
+    Check(body.args_.size() >= 2 && body.args_[1] == "2" &&
               ReplicatedEffectAt(body, 0) ==
                   std::vector<std::string>({"SET", first, "kept"}) &&
               ReplicatedEffectAt(body, 1) ==
@@ -3866,6 +3867,87 @@ class ReplicationLogService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
 
+  bycorf::Task<absl::Status> ExerciseCanonicalExpirationEffects() {
+    constexpr std::uint8_t db = 4;
+    const std::string key = "ttl-effects-key";
+    const std::string other = "ttl-effects-other";
+    const std::string deadline = "4000000000000";
+    auto dump = lavik::rdb::EncodeDump(
+        {.encoded_ = "v",
+         .logical_size_ = 1,
+         .value_type_ = lavik::storage::ValueType::kString});
+    if (!dump.ok()) co_return dump.status();
+    using Args = std::vector<std::string>;
+    struct Case {
+      Args write;
+      std::string reply;
+      Args expected;
+    };
+    auto move = lavik::EncodeReplicationCommandEffects(
+        {{db, {"RPOP", key}}, {db, {"LPUSH", other, "b"}}});
+    std::vector<Case> cases{
+        {{"MSETNX", key, "v", other, "v"},
+         ":1\r\n",
+         {"MSET", key, "v", other, "v"}},
+        {{"MSET", key, "v"}, "+OK\r\n", {"MSET", key, "v"}},
+        {{"MSET", key, "v", other, "v"},
+         "+OK\r\n",
+         {"MSET", key, "v", other, "v"}},
+        {{"PEXPIREAT", key, deadline}, ":1\r\n", {"PEXPIREAT", key, deadline}},
+        {{"GETEX", key, "PERSIST"}, "$1\r\nv\r\n", {"PERSIST", key}},
+        {{"GETEX", key, "PXAT", deadline},
+         "$1\r\nv\r\n",
+         {"PEXPIREAT", key, deadline}},
+        {{"PERSIST", key}, ":1\r\n", {"PERSIST", key}},
+        {{"RESTORE", key, "0", *dump, "REPLACE"},
+         "+OK\r\n",
+         {"RESTORE", key, "0", *dump, "REPLACE"}},
+        {{"RESTORE", key, deadline, *dump, "REPLACE", "ABSTTL"},
+         "+OK\r\n",
+         {"RESTORE", key, deadline, *dump, "REPLACE", "ABSTTL"}},
+    };
+    lavik::ConnectionContext connection;
+    connection.selected_db_ = db;
+    std::uint64_t epoch = 1300;
+    auto check = [&](const Case& c) -> bycorf::Task<absl::Status> {
+      auto status = co_await storage_->EnableReplicationLog(++epoch, 8 * kMiB);
+      if (!status.ok()) co_return status;
+      status = co_await DispatchClientCommand(connection, c.write, c.reply);
+      if (!status.ok()) co_return status;
+      auto command = co_await ReadSinglePublishedCommand(1);
+      if (!command.ok()) co_return command.status();
+      Check(command->args_ == c.expected,
+            "unexpected TTL effects for " + c.write.front());
+      co_return co_await storage_->DisableReplicationLog();
+    };
+    for (const auto& c : cases) {
+      auto status = co_await check(c);
+      if (!status.ok()) co_return status;
+    }
+    Args del{"DEL", key, other};
+    auto status = co_await ExecuteClientCommand(db, del, ":2\r\n");
+    if (!status.ok()) co_return status;
+    Args source{"RPUSH", key, "a", "b"}, destination{"RPUSH", other, "c"};
+    status = co_await ExecuteClientCommand(db, source, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(db, destination, ":1\r\n");
+    if (!status.ok()) co_return status;
+    Case lmove{{"LMOVE", key, other, "RIGHT", "LEFT"}, "$1\r\nb\r\n", move};
+    status = co_await check(lmove);
+    if (!status.ok()) co_return status;
+    const std::string hash = "ttl-effects-hash";
+    const std::string script =
+        "redis.call('HSET', KEYS[1], 'a', '1'); "
+        "return redis.call('HSET', KEYS[1], 'b', '2')";
+    Case create{
+        {"EVAL", script, "1", hash},
+        ":1\r\n",
+        lavik::EncodeReplicationCommandEffects({{db, {"HSET", hash, "a", "1"}},
+                                                {db, {"HSET", hash, "b", "2"}},
+                                                {db, {"PERSIST", hash}}})};
+    co_return co_await check(create);
+  }
+
   bycorf::Task<absl::Status> ExerciseInPlaceExpirationEffects() {
     constexpr std::uint8_t kDb = 4;
     const std::string key = "in-place-expiration";
@@ -4665,6 +4747,9 @@ class ReplicationLogService final : public bycorf::Service {
     status = co_await ExercisePublishedCollectionCommands();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "canonical expiration effects";
+    status = co_await ExerciseCanonicalExpirationEffects();
+    if (!status.ok()) co_return status;
     current_stage_ = "in-place expiration effects";
     status = co_await ExerciseInPlaceExpirationEffects();
     if (!status.ok()) co_return status;

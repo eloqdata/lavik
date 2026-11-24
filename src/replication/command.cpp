@@ -19,6 +19,7 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <new>
 #include <optional>
 
@@ -414,66 +415,81 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
   return absl::ResourceExhaustedError("replication command is too large");
 }
 
-bool IsPublishOnlyReplicationCommand(
-    const ReplicatedCommand& command) noexcept {
-  if (command.db_id_ >= storage::kLogicalDatabaseCount) return false;
-  const std::span<const std::string> args(command.args_);
-  if (args.empty()) return false;
-  auto is_publish = [](std::span<const std::string> child) {
-    return child.size() == 3 && absl::EqualsIgnoreCase(child[0], "PUBLISH");
-  };
-  if (args[0] != kReplicatedExecCommand) return is_publish(args);
-  if (args.size() < 2) return false;
-  auto parse_size = [](std::string_view text, std::uint64_t* value) {
-    const auto parsed =
-        std::from_chars(text.data(), text.data() + text.size(), *value);
-    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
-  };
-  std::uint64_t count = 0;
-  // Each child needs its DB, argc, and all three PUBLISH arguments. Check
-  // the complete envelope before granting the partition-reset exemption;
-  // a valid leading publication must not hide a later storage mutation.
-  if (!parse_size(args[1], &count) || count == 0 ||
-      count > (args.size() - 2) / 5) {
-    return false;
-  }
-  std::size_t offset = 2;
-  for (std::uint64_t index = 0; index < count; ++index) {
-    std::uint64_t db_id = 0;
-    std::uint64_t argc = 0;
-    if (!parse_size(args[offset], &db_id) ||
-        db_id >= storage::kLogicalDatabaseCount ||
-        !parse_size(args[offset + 1], &argc) || argc != 3 ||
-        !is_publish(args.subspan(offset + 2, 3))) {
-      return false;
-    }
-    offset += 5;
-  }
-  return offset == args.size();
+namespace {
+
+bool ParseUnsigned(std::string_view text, std::uint64_t& value) {
+  const auto [end, ec] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  return ec == std::errc{} && end == text.data() + text.size();
 }
 
-void AppendReplicationExpirationEffect(std::vector<std::string>* args,
-                                       std::uint8_t command_db_id,
-                                       std::uint8_t effect_db_id,
-                                       std::string_view key, bool exists,
-                                       std::uint64_t expire_at_ms) {
-  if (args == nullptr || args->empty() || !exists) return;
-  // SET already clears the previous TTL, while SetLocked canonicalizes a
-  // requested or retained TTL to an absolute PXAT argument before publishing
-  // the command. Wrapping it in a replicated EXEC with a second PERSIST or
-  // PEXPIREAT is redundant and makes the replica write an extra transactional
-  // record plus commit for every ordinary SET.
-  if ((*args)[0] == "SET") return;
+// Borrow arguments in place: a transaction may contain large binary values.
+template <typename Visit>
+bool VisitCanonicalCommands(std::uint8_t db, std::span<const std::string> args,
+                            Visit visit) {
+  if (db >= storage::kLogicalDatabaseCount || args.empty()) return false;
+  if (args[0] != kReplicatedExecCommand) return visit(db, args);
+  std::uint64_t count = 0;
+  if (args.size() < 2 || !ParseUnsigned(args[1], count) || count == 0)
+    return false;
+  args = args.subspan(2);
+  for (std::uint64_t i = 0; i < count; ++i) {
+    std::uint64_t child_db = 0, argc = 0;
+    if (args.size() < 2 || !ParseUnsigned(args[0], child_db) ||
+        child_db >= storage::kLogicalDatabaseCount ||
+        !ParseUnsigned(args[1], argc) || argc == 0 || argc > args.size() - 2 ||
+        !visit(child_db, args.subspan(2, argc)))
+      return false;
+    args = args.subspan(2 + argc);
+  }
+  return args.empty();
+}
+
+// Canonical effects contain resolved conditions and absolute times. Report the
+// keys whose deadlines they set explicitly, including keys repeated by MSET.
+template <typename Visit>
+bool VisitExplicitExpiration(std::span<const std::string> args, Visit visit) {
+  if (args.size() < 2) return false;
+  const auto named = [&](std::string_view name) {
+    return absl::EqualsIgnoreCase(args[0], name);
+  };
+  if (named("MSET") && args.size() >= 3 && args.size() % 2 == 1) {
+    for (std::size_t i = 1; i < args.size(); i += 2) visit(args[i], 0);
+    return true;
+  }
+  std::uint64_t deadline = 0;
+  if (named("SET")) {
+    if (args.size() != 3 &&
+        !(args.size() == 5 && absl::EqualsIgnoreCase(args[3], "PXAT") &&
+          ParseUnsigned(args[4], deadline)))
+      return false;
+  } else if (named("PERSIST")) {
+    if (args.size() != 2) return false;
+  } else if (named("PEXPIREAT")) {
+    if (args.size() != 3 || !ParseUnsigned(args[2], deadline) || deadline == 0)
+      return false;
+  } else if (named("RESTORE")) {
+    if (args.size() < 5 || !absl::EqualsIgnoreCase(args[4], "REPLACE"))
+      return false;
+    if (args.size() == 5) {
+      if (args[2] != "0") return false;
+    } else if (args.size() != 6 || !absl::EqualsIgnoreCase(args[5], "ABSTTL") ||
+               !ParseUnsigned(args[2], deadline))
+      return false;
+  } else {
+    return false;
+  }
+  visit(args[1], deadline);
+  return true;
+}
+
+void AppendFinalDeadline(std::vector<std::string>* args,
+                         std::uint8_t command_db_id, std::uint8_t effect_db_id,
+                         std::string_view key, std::uint64_t expire_at_ms) {
   if ((*args)[0] == kReplicatedExecCommand) {
     if (args->size() < 2) return;
     std::uint64_t count = 0;
-    const std::string& encoded_count = (*args)[1];
-    const char* begin = encoded_count.data();
-    const char* end = begin + encoded_count.size();
-    const auto parsed = std::from_chars(begin, end, count);
-    if (parsed.ec != std::errc{} || parsed.ptr != end) {
-      return;
-    }
+    if (!ParseUnsigned((*args)[1], count)) return;
     (*args)[1] = std::to_string(count + 1);
   } else {
     std::vector<std::string> command = std::move(*args);
@@ -496,6 +512,156 @@ void AppendReplicationExpirationEffect(std::vector<std::string>* args,
     args->emplace_back("PEXPIREAT");
     args->emplace_back(key);
     args->push_back(std::to_string(expire_at_ms));
+  }
+}
+
+// These canonical mutations preserve a live persistent predecessor. A timed
+// predecessor can disappear before replay, so its deadline cannot be inferred.
+bool PreservesPersistence(std::span<const std::string> args) {
+  static constexpr std::string_view names[] = {"APPEND",
+                                               "SETBIT",
+                                               "SETRANGE",
+                                               "BITFIELD",
+                                               "INCR",
+                                               "INCRBY",
+                                               "DECR",
+                                               "DECRBY",
+                                               "INCRBYFLOAT",
+                                               "HSET",
+                                               "HMSET",
+                                               "LAVIK.HREPLACE",
+                                               "HSETNX",
+                                               "HDEL",
+                                               "HINCRBY",
+                                               "HINCRBYFLOAT",
+                                               "LPUSH",
+                                               "RPUSH",
+                                               "LPUSHX",
+                                               "RPUSHX",
+                                               "LPOP",
+                                               "RPOP",
+                                               "LSET",
+                                               "LINSERT",
+                                               "LTRIM",
+                                               "LREM",
+                                               "SADD",
+                                               "SREM",
+                                               "ZADD",
+                                               "ZINCRBY",
+                                               "ZREM",
+                                               "ZREMRANGEBYRANK",
+                                               "ZREMRANGEBYSCORE",
+                                               "ZREMRANGEBYLEX",
+                                               "ZPOPMIN",
+                                               "ZPOPMAX",
+                                               "XADD",
+                                               "XDEL",
+                                               "XTRIM",
+                                               "XACK",
+                                               "XCLAIM",
+                                               "XAUTOCLAIM",
+                                               "XSETID",
+                                               "XGROUP"};
+  return (args.size() == 4 && absl::EqualsIgnoreCase(args[0], "SET") &&
+          absl::EqualsIgnoreCase(args[3], "KEEPTTL")) ||
+         std::any_of(std::begin(names), std::end(names), [&](auto name) {
+           return absl::EqualsIgnoreCase(args[0], name);
+         });
+}
+
+}  // namespace
+
+bool IsPublishOnlyReplicationCommand(
+    const ReplicatedCommand& command) noexcept {
+  return VisitCanonicalCommands(
+      command.db_id_, command.args_, [](std::uint8_t, auto child) {
+        return child.size() == 3 && absl::EqualsIgnoreCase(child[0], "PUBLISH");
+      });
+}
+
+void AppendReplicationExpirationEffect(std::vector<std::string>* args,
+                                       std::uint8_t command_db_id,
+                                       std::uint8_t effect_db_id,
+                                       std::string_view key, bool exists,
+                                       std::uint64_t expire_at_ms) {
+  if (!args || args->empty() || !exists) return;
+  bool encoded = false;
+  if (command_db_id == effect_db_id) {
+    VisitExplicitExpiration(
+        *args, [&](std::string_view target, std::uint64_t deadline) {
+          if (target == key && deadline == expire_at_ms) encoded = true;
+        });
+  }
+  if (!encoded)
+    AppendFinalDeadline(args, command_db_id, effect_db_id, key, expire_at_ms);
+}
+
+void AppendTransactionExpirationEffects(
+    std::vector<std::string>& args, std::uint8_t db_id,
+    std::span<const storage::TxShardWrites> shards) {
+  if (args.empty()) return;
+  using Key = std::pair<std::uint8_t, std::string_view>;
+  struct State {
+    const storage::TxShardWrites::ExpirationEffect* last = nullptr;
+    std::optional<std::uint64_t> replay_deadline;
+    std::size_t generation = 0;
+  };
+  const RetainedAllocationDomain admitted{.externally_admitted_ = true};
+  using Entry = std::pair<const Key, State>;
+  std::map<Key, State, std::less<>, RetainedAllocator<Entry>> keys{
+      std::less<>{}, RetainedAllocator<Entry>(admitted)};
+  std::vector<State*, RetainedAllocator<State*>> order{
+      RetainedAllocator<State*>(admitted)};
+  for (const auto& shard : shards) {
+    for (const auto& effect : shard.expiration_effects_) {
+      auto [it, first] = keys.try_emplace({effect.db_id_, effect.key_});
+      auto& state = it->second;
+      if (first) {
+        order.push_back(&state);
+        if (effect.persistent_predecessor_) state.replay_deadline = 0;
+      }
+      if (effect.fullsync_capture_) state.replay_deadline.reset();
+      state.last = &effect;
+    }
+  }
+  if (keys.empty()) return;
+  // An unclassified child may move TTLs between databases or keys. Later
+  // explicit effects can establish knowledge again without rescanning all keys.
+  std::size_t generation = 0;
+  auto observe = [&](std::uint8_t db, std::span<const std::string> child) {
+    auto set = [&](std::string_view key, std::uint64_t deadline) {
+      auto it = keys.find(Key{db, key});
+      if (it != keys.end()) {
+        it->second.replay_deadline = deadline;
+        it->second.generation = generation;
+      }
+    };
+    if (VisitExplicitExpiration(child, set) ||
+        absl::EqualsIgnoreCase(child[0], "PUBLISH"))
+      return true;
+    if (absl::EqualsIgnoreCase(child[0], "DEL")) {
+      for (const auto& key : child.subspan(1)) set(key, 0);
+      return true;
+    }
+    if (!PreservesPersistence(child)) {
+      ++generation;
+      return true;
+    }
+    const unsigned key_index =
+        absl::EqualsIgnoreCase(child[0], "XGROUP") ? 2 : 1;
+    if (child.size() <= key_index) return false;
+    auto it = keys.find(Key{db, child[key_index]});
+    if (it != keys.end() && it->second.replay_deadline != 0)
+      it->second.replay_deadline.reset();
+    return true;
+  };
+  const bool understood = VisitCanonicalCommands(db_id, args, observe);
+  for (const auto* state : order) {
+    const auto& effect = *state->last;
+    if (effect.exists_ && (!understood || state->generation != generation ||
+                           state->replay_deadline != effect.expire_at_ms_))
+      AppendFinalDeadline(&args, db_id, effect.db_id_, effect.key_,
+                          effect.expire_at_ms_);
   }
 }
 

@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -182,6 +183,91 @@ TEST(ReplicationCommandTest, SetAlreadyCarriesFinalExpirationSemantics) {
                                            123456);
   EXPECT_EQ(expiring, (std::vector<std::string>{"SET", "key", "value", "PXAT",
                                                 "123456"}));
+}
+
+TEST(ReplicationCommandTest, CompanionMustMatchDatabaseKeyAndAbsoluteDeadline) {
+  const std::vector<std::string> mset{"mset", "a", "value", "b", "a"};
+  for (const auto key : {"a", "b"}) {
+    auto args = mset;
+    lavik::AppendReplicationExpirationEffect(&args, 2, 2, key, true, 0);
+    EXPECT_EQ(args, mset);
+  }
+  for (const auto& [db, key] :
+       std::vector<std::pair<unsigned, std::string>>{{1, "a"}, {2, "value"}}) {
+    auto args = mset;
+    lavik::AppendReplicationExpirationEffect(&args, 2, db, key, true, 0);
+    EXPECT_EQ(args.front(), lavik::kReplicatedExecCommand);
+    EXPECT_EQ(args.back(), key);
+  }
+  for (auto args : std::vector<std::vector<std::string>>{
+           {"PEXPIREAT", "k", "101"},
+           {"RESTORE", "k", "100", "payload", "REPLACE"},
+           {"SET", "k", "v", "KEEPTTL"}}) {
+    lavik::AppendReplicationExpirationEffect(&args, 2, 2, "k", true, 100);
+    EXPECT_EQ(args.front(), lavik::kReplicatedExecCommand);
+    EXPECT_EQ(args.back(), "100");
+  }
+}
+
+TEST(ReplicationCommandTest, TransactionNeedsPersistenceFromFirstPredecessor) {
+  using Effect = lavik::storage::TxShardWrites::ExpirationEffect;
+  const auto original = lavik::EncodeReplicationCommandEffects(
+      {{2, {"HSET", "k", "a", "1"}}, {2, {"HSET", "k", "b", "2"}}});
+  for (bool first_persistent : {false, true}) {
+    for (bool fullsync : {false, true}) {
+      std::array<lavik::storage::TxShardWrites, 1> shards;
+      auto& effects = shards.front().expiration_effects_;
+      effects.push_back(Effect{.key_ = "k",
+                               .db_id_ = 2,
+                               .exists_ = true,
+                               .persistent_predecessor_ = first_persistent});
+      effects.push_back(Effect{.key_ = "k",
+                               .db_id_ = 2,
+                               .exists_ = true,
+                               .persistent_predecessor_ = true,
+                               .fullsync_capture_ = fullsync});
+      auto args = original;
+      lavik::AppendTransactionExpirationEffects(args, 2, shards);
+      if (first_persistent && !fullsync) {
+        EXPECT_EQ(args, original);
+      } else {
+        EXPECT_EQ(args[1], "3");
+        EXPECT_EQ(args[args.size() - 2], "PERSIST");
+      }
+    }
+  }
+}
+
+TEST(ReplicationCommandTest, TransferInvalidatesPredecessorUntilExplicitReset) {
+  const auto original = lavik::EncodeReplicationCommandEffects(
+      {{0, {"COPY", "source", "k", "REPLACE"}}, {1, {"PERSIST", "k"}}});
+  std::array<lavik::storage::TxShardWrites, 1> shards;
+  for (std::uint8_t db : {0, 1}) {
+    shards.front().expiration_effects_.push_back(
+        {.key_ = "k",
+         .db_id_ = db,
+         .exists_ = true,
+         .persistent_predecessor_ = true});
+  }
+  auto args = original;
+  lavik::AppendTransactionExpirationEffects(args, 0, shards);
+  auto expected = original;
+  expected[1] = "3";
+  expected.insert(expected.end(), {"0", "2", "PERSIST", "k"});
+  EXPECT_EQ(args, expected);
+}
+
+TEST(ReplicationCommandTest, TimedKeyMayExpireBetweenSourceAndReplay) {
+  const auto original = lavik::EncodeReplicationCommandEffects(
+      {{0, {"PEXPIREAT", "k", "123"}}, {0, {"HSET", "k", "field", "v"}}});
+  std::array<lavik::storage::TxShardWrites, 1> shards;
+  shards.front().expiration_effects_.push_back(
+      {.key_ = "k", .expire_at_ms_ = 123, .exists_ = true});
+  auto args = original;
+  lavik::AppendTransactionExpirationEffects(args, 0, shards);
+  EXPECT_EQ(args[1], "3");
+  EXPECT_EQ(args[args.size() - 3], "PEXPIREAT");
+  EXPECT_EQ(args.back(), "123");
 }
 
 TEST(ReplicationCommandTest, OtherWritesStillReceiveExpirationEffect) {

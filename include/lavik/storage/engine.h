@@ -1348,6 +1348,10 @@ struct TxShardWrites {
     std::uint64_t expire_at_ms_ = 0;
     std::uint8_t db_id_ = 0;
     bool exists_ = false;
+    // Ordered replay can inherit persistence from the first write to this key.
+    // FULL capture cannot assume the same predecessor at its handoff boundary.
+    bool persistent_predecessor_ = false;
+    bool fullsync_capture_ = false;
   };
 
   struct Fence {  // highest staged offset per destination block

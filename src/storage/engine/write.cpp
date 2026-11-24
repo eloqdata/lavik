@@ -2246,8 +2246,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
                                         : ++partition.mutation_sequence_;
   std::shared_ptr<ReplicationCommandAppend> fullsync_command;
   if (replication != nullptr) {
-    // Only a final PERSIST can be inferred from an ordered in-place update.
-    // FULL rebuilds keep explicit expiration effects alongside the mutation.
+    // FULL replay cannot inherit persistence from the source predecessor.
+    // Its canonical mutation or a companion must establish the final TTL.
     if (!replication->persistent_predecessor_ || expire_at_ms != 0 ||
         !partition.fullsync_subscribers_.empty()) {
       AppendReplicationExpirationEffect(
@@ -2316,6 +2316,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
       AlignRecord(RecordHeaderBytes(key.size(), key_indirect, tx != nullptr,
                                     expire_at_ms != 0) +
                   static_cast<std::size_t>(logical_payload_bytes));
+  bool persistent_predecessor = false;
   if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
     auto extents =
         co_await WriteExtentValueLocked(store, std::string_view{}, value);
@@ -2347,8 +2348,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         .key_indirect_ = key_indirect,
         .mark_watched_ = true,
     };
-    status = co_await WriteRecordLocked(store, record_write, *extents,
-                                        std::move(commit_retirements), trace);
+    status = co_await WriteRecordLocked(
+        store, record_write, *extents, std::move(commit_retirements), trace,
+        nullptr, tx ? &persistent_predecessor : nullptr);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -2374,8 +2376,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         .key_indirect_ = key_indirect,
         .mark_watched_ = true,
     };
-    status = co_await WriteRecordLocked(store, record_write, nullptr,
-                                        std::move(commit_retirements), trace);
+    status = co_await WriteRecordLocked(
+        store, record_write, nullptr, std::move(commit_retirements), trace,
+        nullptr, tx ? &persistent_predecessor : nullptr);
   }
   if (status.ok() && grouped && grouped->root_->batch_) {
     mutation_sequence = grouped->root_->batch_->sequence_;
@@ -2399,6 +2402,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         .expire_at_ms_ = kind == RecordKind::kValue ? expire_at_ms : 0,
         .db_id_ = db_id,
         .exists_ = kind == RecordKind::kValue,
+        .persistent_predecessor_ = persistent_predecessor,
+        .fullsync_capture_ = !partition.fullsync_subscribers_.empty(),
     });
     // Account capacity growth and this key incrementally: a large MSET must
     // not rescan every earlier expiration entry after each individual write.
@@ -2869,7 +2874,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     WorkerStore& store, const RecordWriteRequest& request,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
-    SetLatencyTrace* trace, DeferredCommitBatch* deferred_batch) {
+    SetLatencyTrace* trace, DeferredCommitBatch* deferred_batch,
+    bool* persistent_predecessor) {
   auto private_trace =
       !trace && request.tx_ ? MakeSetTrace(request.tx_->diagnostics_) : nullptr;
   if (!trace) trace = private_trace.get();
@@ -3979,6 +3985,8 @@ acquire_active_stream:
       previous.has_value() && previous->kind() == RecordKind::kValue;
   const bool is_live = request.kind_ == RecordKind::kValue;
   const bool was_expiring = was_live && previous->expire_at_ms_ != 0;
+  if (persistent_predecessor)
+    *persistent_predecessor = was_live && !was_expiring;
   const bool is_expiring = is_live && request.expire_at_ms_ != 0;
   if (grouped_root) {
     GroupedObjectVersion version{
