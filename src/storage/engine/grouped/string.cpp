@@ -168,6 +168,9 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
   if (!exists) grouped.reset();
   const auto location =
       exists ? MaterializeIndexLocation(*found) : RecordLocation{};
+  if (replication)
+    replication->persistent_predecessor_ =
+        exists && location.expire_at_ms_ == 0;
   const std::uint64_t old_size = exists ? location.logical_size_ : 0;
   StringSegmentResult result{.value_ = {}, .length_ = old_size};
   std::uint64_t start = bit ? static_cast<std::uint64_t>(operation.start_) / 8

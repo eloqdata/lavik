@@ -74,6 +74,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, true,
         nullptr, mutation_precondition, nullptr, nullptr, detail.get());
   }
+  // Grouped sorted-set intent writes can arrive directly without a compact
+  // lookup. A promotion has no previous group and retains the caller's proof.
+  if (replication && previous)
+    replication->persistent_predecessor_ =
+        previous->version().root_.expire_at_ms_ == 0;
   const auto field_count = plan.root_.logical_size();
   const auto value_type = OrderedValueType(plan.root_.kind_);
   if ((field_count == 0 && value_type != ValueType::kStream) ||
