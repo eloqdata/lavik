@@ -816,6 +816,50 @@ struct StagedRetiredRecord {
 
 static_assert(sizeof(StagedRetiredRecord) == 48);
 
+// One owner-local spare shared by all append tails. Settlement may suspend
+// on a remote owner, so only a completely settled batch can offer its storage.
+class RetiredRecordSpare {
+ public:
+  using Records = std::vector<StagedRetiredRecord>;
+  using Clock = std::chrono::steady_clock;
+
+  void Take(Records& batch) {
+    assert(batch.capacity() == 0);
+    if (!spare_.capacity()) return;
+    batch.swap(spare_);
+    charge_.Reset();
+  }
+
+  void Offer(Records& settled) {
+    // Covers an 8 MiB block of 1 KiB overwrites (8192 receipts at 48 B).
+    constexpr std::size_t kMaxBytes = 512 * 1024;
+    if (spare_.capacity() || settled.empty() ||
+        settled.capacity() > kMaxBytes / sizeof(StagedRetiredRecord))
+      return;
+    const auto bytes = AllocatorUsableSizeForRequest(
+        settled.capacity() * sizeof(StagedRetiredRecord));
+    if (bytes > kMaxBytes) return;
+    auto reservation = TryReserveMemory(bytes);
+    if (!reservation) return;
+    settled.clear();  // Drop the old records' extent owners before reuse.
+    spare_.swap(settled);
+    charge_.Adopt(&*reservation, bytes);
+    expires_ = Clock::now() + std::chrono::seconds(1);
+  }
+
+  void Trim(Clock::time_point now) {
+    if (spare_.capacity() && (now >= expires_ || WouldExceedMemoryLimit(0))) {
+      Records{}.swap(spare_);
+      charge_.Reset();
+    }
+  }
+
+ private:
+  Records spare_;
+  RetainedMemoryCharge charge_;
+  Clock::time_point expires_{};
+};
+
 struct TxCleanerBlock {
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
@@ -2166,6 +2210,7 @@ class StorageEngine::Impl {
     ReplicationPublisherWaiter* replication_publisher_waiters_tail_ = nullptr;
     AsyncNotification replication_publisher_admission_ready_;
     absl::flat_hash_map<std::uint64_t, StagedRecordBatch> staged_records_;
+    RetiredRecordSpare retired_record_spare_;
     // External manifests are exceptional and relatively large. Keeping them
     // here, keyed by the index entry (and migrated on a TTL type change),
     // avoids a shared_ptr in every ordinary key while preserving O(1) FLUSHDB

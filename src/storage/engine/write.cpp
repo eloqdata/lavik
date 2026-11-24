@@ -1658,6 +1658,7 @@ Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
       co_return dead;
     }
   }
+  store->retired_record_spare_.Offer(staged_records);
   co_return absl::OkStatus();
 }
 
@@ -4121,6 +4122,8 @@ acquire_active_stream:
   auto& staged = store.staged_records_[updated.block_id_];
   if ((!request.for_defrag_ || defer_defrag_retirement) && !route_to_commit &&
       previous.has_value()) {
+    if (staged.retired_records_.capacity() == 0)
+      store.retired_record_spare_.Take(staged.retired_records_);
     staged.retired_records_.push_back(
         StagedRetiredRecordOf(*previous, previous_dependent_extents));
     if (previous->external() && retired_value_extents != nullptr) {
