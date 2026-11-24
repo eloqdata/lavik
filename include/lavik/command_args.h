@@ -289,48 +289,6 @@ inline std::vector<std::string> CopyCommandArgs(
   return {args.begin(), args.end()};
 }
 
-// The Data server may recycle a completed connection slot's byte allocation on
-// its owning worker. Standalone protocol users supply no spare.
-class CommandByteSpare {
- public:
-  using Bytes = decltype(CommandArgs::bytes);
-  // An owning service admits the limit before retaining overflow storage.
-  // A zero limit leaves the slot disabled.
-  void Enable(std::size_t limit) noexcept { limit_ = limit; }
-  void Disable() noexcept {
-    spare_.clear();
-    limit_ = 0;
-    recently_returned_ = false;
-  }
-  bool ConsumeReturnFlag() noexcept {
-    return std::exchange(recently_returned_, false);
-  }
-
-  void TryGrow(Bytes& bytes, std::size_t additional) noexcept {
-    if (spare_.capacity() <= CommandArgs::kInlineBytes ||
-        bytes.size() > spare_.capacity() ||
-        additional > spare_.capacity() - bytes.size())
-      return;
-    // Copy the parsed prefix before transferring the contiguous allocation.
-    spare_.assign(bytes.begin(), bytes.end());
-    bytes.clear();
-    bytes.swap(spare_);
-  }
-
-  void Offer(Bytes& bytes) noexcept {
-    if (bytes.capacity() <= spare_.capacity() || bytes.capacity() > limit_)
-      return;
-    bytes.resize(0);  // Abseil clear() would release the allocation.
-    spare_.swap(bytes);
-    recently_returned_ = true;
-  }
-
- private:
-  Bytes spare_;
-  std::size_t limit_ = 0;
-  bool recently_returned_ = false;
-};
-
 class CommandArgsHandle;
 
 // Never relocate a live slot: its offsets and inline bytes must survive parser,
@@ -338,8 +296,9 @@ class CommandArgsHandle;
 // object; concurrent commands own separate heap objects. Parsing may grow
 // buffers; completed requests are read-only.
 struct CommandArgsStorage : CommandArgs {
-  // The optional spare must outlive this storage and run on its owner worker.
-  CommandByteSpare* byte_spare_ = nullptr;
+  // Only this exact capacity may survive handle release. The Data worker
+  // updates it after admission. Standalone slots keep only inline storage.
+  std::size_t retained_byte_capacity_ = kInlineBytes;
   CommandArgsStorage() = default;
   ~CommandArgsStorage() { assert(!borrowed_); }
   CommandArgsStorage(const CommandArgsStorage&) = delete;
@@ -393,19 +352,9 @@ class CommandArgsHandle {
     storage.borrowed_ = true;
     return CommandArgsHandle(&storage);
   }
-  // Clears borrowed storage, offering its byte overflow to the owner, or
-  // deletes an independently owned object. Additional pipeline/MULTI objects
-  // are not cached.
+  // Returns the embedded slot to its connection. Independently owned
+  // pipeline and MULTI arguments are destroyed with their handle.
   void Reset() noexcept;
-  // Preserve packed offsets when a received bulk fragment outgrows its slot.
-  void AppendBulkBytes(std::string_view value) {
-    auto& args = Get();
-    if (value.size() > args.bytes.capacity() - args.bytes.size() &&
-        storage_->byte_spare_ != nullptr) {
-      storage_->byte_spare_->TryGrow(args.bytes, value.size());
-    }
-    args.AppendLast(value);
-  }
   [[gnu::always_inline]] bool HasStorage() const noexcept {
     return storage_ != nullptr;
   }
@@ -475,10 +424,12 @@ inline void CommandArgsHandle::Reset() noexcept {
   auto* slot = std::exchange(storage_, nullptr);
   if (slot == nullptr) return;
   if (slot->borrowed_) {
-    if (slot->byte_spare_ != nullptr &&
-        slot->bytes.capacity() > CommandArgs::kInlineBytes)
-      slot->byte_spare_->Offer(slot->bytes);
-    slot->clear();
+    slot->args.clear();
+    if (slot->bytes.capacity() == slot->retained_byte_capacity_) {
+      slot->bytes.resize(0);  // Abseil clear() releases heap storage.
+    } else {
+      slot->bytes.clear();
+    }
     slot->borrowed_ = false;
   } else {
     delete slot;

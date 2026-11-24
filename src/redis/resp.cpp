@@ -154,7 +154,7 @@ void RespCommandParser::ResetCommand() {
   state_ = State::kArrayStart;
   length_text_.clear();
   // A completed command has already transferred its handle. An abandoned
-  // command releases its handle just like a completed request.
+  // command returns its argument handle through the same release path.
   command_.args_.Reset();
   arguments_remaining_ = 0;
   bulk_remaining_ = 0;
@@ -476,7 +476,7 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
           // Allocation failure remains process-fatal through the coroutine's
           // unhandled-exception policy.
           if (bulk_prepared_ == 0) [[likely]] {
-            command_.args_.AppendBulkBytes(input.substr(pos, take));
+            command_.args_.Get().AppendLast(input.substr(pos, take));
           } else {
             const auto prepared = std::min(take, bulk_prepared_);
             std::memcpy(command_.args_.Get().MutableLast().data() +
@@ -484,7 +484,7 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
                         input.data() + pos, prepared);
             bulk_prepared_ -= prepared;
             if (take > prepared)
-              command_.args_.AppendBulkBytes(
+              command_.args_.Get().AppendLast(
                   input.substr(pos + prepared, take - prepared));
           }
           bulk_remaining_ -= take;

@@ -57,6 +57,7 @@
 #if BYCORF_KERNEL_BYPASS
 #include "bycorf/io/dpdk_backend.h"
 #endif
+#include "absl/cleanup/cleanup.h"
 #include "bycorf/io/spdk_storage.h"
 #include "bycorf/net/server.h"
 #include "bycorf/net/tcp_service.h"
@@ -88,7 +89,7 @@
 #include "lavik/version.h"
 #include "lua_eval.h"
 #include "request_gate.h"
-#include "resp_byte_spare.h"
+#include "resp_buffer_budget.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik {
@@ -527,7 +528,6 @@ class RedisService final : public TcpService, public ClientLimit {
       std::optional<absl::Status>* deferred_read_error);
   Task<absl::Status> ImportRdb();
   Task<absl::Status> MonitorRuntimeHealth(Worker& worker);
-  Task<absl::Status> TrimRespByteSpare(Worker& worker);
 
   class RequestGuard {
    public:
@@ -584,7 +584,7 @@ class RedisService final : public TcpService, public ClientLimit {
   // result without making a worker take a mutex. Neither flag is reset.
   absl::Status replication_quiesce_status_;
   RequestGate request_gate_;
-  std::unique_ptr<RespByteSpare[]> byte_spares_;
+  std::unique_ptr<RespBufferBudget[]> resp_buffer_budgets_;
   Server* server_ = nullptr;
 };
 
@@ -654,7 +654,7 @@ void RedisService::Prepare(unsigned thread_count) {
   // barrier. Global data-worker IDs remain the contiguous prefix [0, N).
   thread_count = storage_->worker_count();
   request_gate_.Prepare(thread_count);
-  byte_spares_ = std::make_unique<RespByteSpare[]>(thread_count);
+  resp_buffer_budgets_ = std::make_unique<RespBufferBudget[]>(thread_count);
   PrepareMonitor(thread_count);
   PreparePubSub(thread_count);
   recovery_ready_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
@@ -951,7 +951,6 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
       worker.SpawnBackground(RunRdbBackupScheduler(worker));
     }
   }
-  worker.SpawnBackground(TrimRespByteSpare(worker));
   replication_->StorageReady(worker);
   co_return co_await TcpService::Run(worker, ctx);
 }
@@ -1375,15 +1374,6 @@ bool ShutdownRequested() {
   return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
-Task<absl::Status> RedisService::TrimRespByteSpare(Worker& worker) {
-  while (!worker.stop_requested()) {
-    auto slept = co_await SleepFor(worker, std::chrono::seconds(1));
-    if (!slept.ok()) break;
-    byte_spares_[worker.id()].Tick();
-  }
-  co_return absl::OkStatus();
-}
-
 Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
   bool storage_failure_handled = false;
   bool replication_quiesce_handled = false;
@@ -1451,6 +1441,10 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
 Task<absl::Status> RedisService::Serve(TcpStream stream) {
   static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
+  auto& budget = resp_buffer_budgets_[ThisWorker().id_];
+  absl::Cleanup release_buffer_credit = [&] {
+    budget.Release(ctx.command_args_storage_);
+  };
   ctx.hello_authenticator_ = &authenticator_;
   ctx.hello_replication_ = replication_;
   ctx.hello_handler_ = &ExecuteHelloFromContext;
@@ -1668,6 +1662,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
 
   // Serve waits for this reader to finish before reusing the connection's
   // builder. The writer consumes owned queue entries, never this buffer.
+  auto& budget = resp_buffer_budgets_[ThisWorker().id_];
   ReplyBuilder& builder = ctx.reply_builder_;
   auto enqueue_command_reply = [&](CommandReply reply) -> Task<absl::Status> {
     if (reply.disk_value_.valid()) {
@@ -1707,7 +1702,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
             stream, input, parser, ready, client_buffers,
             &client_query_buffer_limit_bytes_, unassigned_input_bytes,
             deferred_read_error);
-        byte_spares_[ThisWorker().id_].AdmitFor(ctx.command_args_storage_);
+        budget.Admit(ctx.command_args_storage_);
       }
     }
     if (!read_status.ok()) {
@@ -1914,8 +1909,7 @@ Task<absl::Status> RedisService::HandoffReplicationConnection(
 
 Task<absl::Status> RedisService::Serve(TcpStream& stream,
                                        ConnectionContext& ctx) {
-  auto& spare = byte_spares_[ThisWorker().id_];
-  ctx.command_args_storage_.byte_spare_ = &spare.buffer_;
+  auto& budget = resp_buffer_budgets_[ThisWorker().id_];
   RequestInputBuffer input(stream);
   RespCommandParser parser(client_query_buffer_limit(),
                            &ctx.command_args_storage_);
@@ -1943,7 +1937,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
             stream, &input, &parser, &ready, &client_buffers,
             &client_query_buffer_limit_bytes_, &unassigned_input_bytes,
             &deferred_read_error);
-        spare.AdmitFor(ctx.command_args_storage_);
+        budget.Admit(ctx.command_args_storage_);
       }
       if (!read_status.ok()) [[unlikely]] {
         if (read_status.code() == absl::StatusCode::kUnavailable) [[unlikely]] {

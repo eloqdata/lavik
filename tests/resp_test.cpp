@@ -29,7 +29,7 @@
 #include <vector>
 
 #include "lavik/memory.h"
-#include "resp_byte_spare.h"
+#include "resp_buffer_budget.h"
 
 namespace lavik {
 namespace {
@@ -98,66 +98,92 @@ TEST(RespParserTest, PackedBytesSpillAtInlineBoundaryAndReleaseOnReturn) {
   }
 }
 
-TEST(RespParserTest, ReusesSpilledSetBytesAcrossConnectionsOnlyAfterRelease) {
+TEST(RespParserTest, ConnectionRetainsOnlyItsOwnEmbeddedByteBuffer) {
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
-  RespByteSpare spare;
-  CommandArgsStorage first_slot, second_slot;
-  first_slot.byte_spare_ = second_slot.byte_spare_ = &spare.buffer_;
-  RespCommandParser first(kDefaultClientQueryBufferLimit, &first_slot);
-  RespCommandParser second(kDefaultClientQueryBufferLimit, &second_slot);
+  BindMemoryAccountingShard(0);
+  RespBufferBudget budget;
+  CommandArgsStorage slot;
+  RespCommandParser parser(kDefaultClientQueryBufferLimit, &slot);
   const std::string prefix = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1024\r\n";
   const std::string value(1024, '\0');
   const auto wire = prefix + value + "\r\n";
-  auto a = first.Parse(wire);
-  auto b = second.Parse(wire);
-  ASSERT_EQ(a.state_, RespParseState::kOk);
-  ASSERT_EQ(b.state_, RespParseState::kOk);
-  const char* allocation = a.command_.args_.Get().bytes.data();
-  EXPECT_NE(b.command_.args_.Get().bytes.data(), allocation);
-  // Pipeline overflow can outlive its connection and has independent storage.
-  auto pipeline = first.Parse(wire);
+  const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
+  auto first = parser.Parse(wire);
+  ASSERT_EQ(first.state_, RespParseState::kOk);
+  auto pipeline = parser.Parse(wire);
   ASSERT_EQ(pipeline.state_, RespParseState::kOk);
-  spare.AdmitFor(a.command_.args_.Get());
-  a.command_.args_.Reset();
-  b.command_.args_.Reset();
-  const auto small = first.Parse("*1\r\n$4\r\nPING\r\n");
-  ASSERT_EQ(small.state_, RespParseState::kOk);
-  EXPECT_TRUE(ArgumentBytesAreInline(small.command_.args_));
-  ASSERT_EQ(second.Parse(prefix + value.substr(0, 100)).state_,
+  const auto* allocation = slot.bytes.data();
+  EXPECT_NE(pipeline.command_.args_.Get().bytes.data(), allocation);
+  budget.Admit(slot);
+  const auto charge = AllocatorUsableSizeForRequest(slot.bytes.capacity());
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline + charge);
+  first.command_.args_.Reset();
+  ASSERT_EQ(parser.Parse(prefix + value.substr(0, 100)).state_,
             RespParseState::kNeedMoreData);
-  auto reused = second.Parse(value.substr(100) + "\r\n");
-  ASSERT_EQ(reused.state_, RespParseState::kOk);
-  EXPECT_EQ(reused.command_.args_.Get().bytes.data(), allocation);
-  EXPECT_EQ(reused.command_.args_[1], "k");
-  EXPECT_EQ(reused.command_.args_[2], value);
+  auto next = parser.Parse(value.substr(100) + "\r\n");
+  ASSERT_EQ(next.state_, RespParseState::kOk);
+  budget.Admit(slot);
+  EXPECT_EQ(slot.bytes.data(), allocation);
+  EXPECT_EQ(next.command_.args_[2], value);
   EXPECT_EQ(pipeline.command_.args_[2], value);
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline + charge);
+  next.command_.args_.Reset();
+  // Growth beyond the per-connection cap drops the old credit. The live
+  // command keeps its complete value until its handle is released.
+  const std::string big(8192, 'b');
+  auto oversize = parser.Parse("*1\r\n$8192\r\n" + big + "\r\n");
+  ASSERT_EQ(oversize.state_, RespParseState::kOk);
+  budget.Admit(slot);
+  EXPECT_EQ(oversize.command_.args_[0], big);
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+  oversize.command_.args_.Reset();
+  EXPECT_EQ(slot.bytes.capacity(), CommandArgs::kInlineBytes);
 }
 
-TEST(RespParserTest, RecycledCapacityIsBoundedAdmittedAndExpires) {
+TEST(RespParserTest, FullWorkerBudgetSkipsRetentionUntilAConnectionCloses) {
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
-  RespByteSpare spare;
-  CommandArgs args;
-  auto& bytes = args.bytes;
-  bytes.resize(8192);
+  BindMemoryAccountingShard(0);
+  RespBufferBudget budget;
+  constexpr auto capacity = RespBufferBudget::kConnectionLimit;
   const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
-  spare.AdmitFor(args);
-  spare.buffer_.Offer(bytes);
-  EXPECT_EQ(bytes.size(), 8192u);
+  std::vector<CommandArgsStorage> slots(RespBufferBudget::kWorkerLimit /
+                                        capacity);
+  for (auto& slot : slots) {
+    auto handle = CommandArgsHandle::TryBorrow(slot);
+    slot.bytes.resize(capacity);
+    budget.Admit(slot);
+  }
+  ASSERT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+            baseline + RespBufferBudget::kWorkerLimit);
+  CommandArgsStorage extra;
+  auto fill = [&] {
+    auto handle = CommandArgsHandle::TryBorrow(extra);
+    extra.bytes.resize(capacity, 'x');
+    budget.Admit(extra);
+    EXPECT_EQ(extra.bytes.back(), 'x');
+  };
+  fill();
+  EXPECT_EQ(extra.bytes.capacity(), CommandArgs::kInlineBytes);
+  budget.Release(slots.back());
+  slots.pop_back();
+  fill();
+  EXPECT_EQ(extra.bytes.capacity(), capacity);
+  for (auto& slot : slots) budget.Release(slot);
+  budget.Release(extra);
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
-  bytes.clear();
-  bytes.resize(2048);
-  spare.AdmitFor(args);
-  spare.buffer_.Offer(bytes);
-  EXPECT_GT(GetWorkerMemoryStats(0).retained_bytes_, baseline);
-  spare.Tick();
-  EXPECT_GT(GetWorkerMemoryStats(0).retained_bytes_, baseline);
-  spare.Tick();
-  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+}
+
+TEST(RespParserTest, FailedMemoryAdmissionReturnsOverflowOnRelease) {
   ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
-  bytes.resize(2048);
-  spare.AdmitFor(args);
-  spare.buffer_.Offer(bytes);
-  EXPECT_EQ(bytes.size(), 2048u);
+  BindMemoryAccountingShard(0);
+  RespBufferBudget budget;
+  CommandArgsStorage slot;
+  auto handle = CommandArgsHandle::TryBorrow(slot);
+  slot.bytes.resize(1024);
+  budget.Admit(slot);
+  EXPECT_EQ(slot.bytes.size(), 1024u);
+  handle.Reset();
+  EXPECT_EQ(slot.bytes.capacity(), CommandArgs::kInlineBytes);
   EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
 }
 
