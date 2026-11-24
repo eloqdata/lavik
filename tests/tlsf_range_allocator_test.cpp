@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "lavik/tlsf_range_allocator.h"
+#include "bycorf/base/tlsf_range_allocator.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +30,7 @@
 namespace lavik {
 namespace {
 
+using bycorf::TlsfRangeAllocator;
 using Allocation = TlsfRangeAllocator::Allocation;
 using Metadata = TlsfRangeAllocator::Metadata;
 

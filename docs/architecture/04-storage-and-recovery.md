@@ -129,7 +129,7 @@ create, extend, truncate, or preallocate a missing regular file. On the POSIX
 io_uring backend, every worker opens the complete configured path table for
 direct I/O. Every worker owns one fixed read arena and separate write slots.
 Read leases borrow aligned variable-length ranges, allocated and coalesced by
-an owner-local range allocator; descriptors are preallocated outside DMA memory.
+an owner-local instance of Bycorf’s TLSF range allocator; descriptors are preallocated outside DMA memory.
 The read arena is split into registered regions where kernel limits require it.
 Buffer-pool capacity is independent of registration success.
 If full io_uring registration fails, a finite memlock allowance permits a
@@ -1446,7 +1446,7 @@ current source code are authoritative for present storage behavior.
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
 | System-state manifest, catalog COW extents, full-sync fence, population token, promotion base, and one-use shutdown certificate | `src/storage/engine/system_state.cpp`, `include/lavik/storage/engine.h` |
-| Aligned buffer ownership, arena range allocation, registered-I/O fallback, chunked reads, and cross-worker lease return | `include/lavik/storage/buffer_pool.h`, `include/lavik/tlsf_range_allocator.h`, `src/storage/buffer_pool.cpp`, `src/storage/engine/read.cpp` |
+| Aligned buffer ownership, arena range allocation, registered-I/O fallback, chunked reads, and cross-worker lease return | `include/lavik/storage/buffer_pool.h`, `bycorf/include/bycorf/base/tlsf_range_allocator.h`, `src/storage/buffer_pool.cpp`, `src/storage/engine/read.cpp` |
 | Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |
 | Temporary Redis export block allocation, framed command stream, readback, release, and restart discard | `src/storage/engine/redis_export_backlog.cpp`, `src/storage/engine/recovery.cpp` |
