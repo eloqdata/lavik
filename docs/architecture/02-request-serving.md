@@ -116,11 +116,13 @@ racing closure is either rejected or remains visible to the drain.
 
 ## Request pipeline
 
-1. `ReadCommandBatch` feeds `RespCommandParser` through a small connection-local
-   buffer. Large bulk bodies can instead receive directly into parser-owned
-   argument storage after their first payload bytes arrive. The opt-in Bycorf
-   read drains already-received buffers without waiting to fill the destination;
-   TLS continues through its decrypted read path. Up to 128 parsed commands are
+1. `ReadCommandBatch` parses ordinary plaintext input directly from a Bycorf receive
+   buffer on the owning worker. Command arguments own their bytes. A split
+   delimiter or unparsed batch suffix moves into connection-local storage
+   before the receive buffer is recycled. TLS supplies decrypted input through
+   local storage. Large bulk bodies can instead receive directly into parser-owned
+   argument storage after their first payload bytes arrive. The plaintext bulk
+   read drains already-received buffers without waiting to fill the destination. Up to 128 parsed commands are
    retained in wire order.
    Ordinary connections collectively hold at most `maxmemory-clients`, which
    accepts an absolute byte size or a percentage of effective maxmemory and

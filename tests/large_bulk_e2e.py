@@ -274,6 +274,30 @@ def check_query_limit_shrink(port, tls, control, baseline, prefix):
         assert control.call("CONFIG", "SET", config, previous) == b"OK"
 
 
+def check_receive_boundaries(port, control, baseline):
+    with connection(port) as client:
+        # Leave CR in one receive buffer and prove the server has consumed
+        # this input before allowing LF to arrive on a subsequent read.
+        first = wire("ECHO", b"split")[:-1]
+        client.sock.sendall(first)
+        wait_buffered(control, lambda n: n == baseline + len(first), "split CRLF")
+        client.sock.sendall(b"\n")
+        assert response(client.reader) == b"split"
+
+        # More than one dispatch batch fits in one transport buffer. Distinct
+        # replies expose skipped, duplicated or reordered commands at the cut.
+        values = [str(i).encode() for i in range(150)]
+        client.sock.sendall(b"".join(wire("ECHO", v) for v in values) + b"*x\r\n")
+        assert [response(client.reader) for _ in values] == values
+        try:
+            response(client.reader)
+        except ErrorReply:
+            pass
+        else:
+            raise AssertionError("missing deferred protocol error")
+    wait_released(control, baseline)
+
+
 def check(port, tls, control, baseline):
     prefix = "large-bulk:tls" if tls else "large-bulk:tcp"
     check_roundtrips(port, tls, control, baseline, prefix)
@@ -329,10 +353,14 @@ def run(root, binary):
         root / "roundtrips",
         "large-bulk",
         workers=1,
+        # Exercise provided-buffer reuse on kernels that support it. The
+        # quota fixture below also covers the per-connection receive backend.
+        recv_buffers=64,
         extra=tls_options(tls_port),
     ) as (_, port, _):
         with connection(port) as control:
             baseline = buffered_bytes(control)
+            check_receive_boundaries(port, control, baseline)
             check(port, False, control, baseline)
             check(tls_port, True, control, baseline)
 

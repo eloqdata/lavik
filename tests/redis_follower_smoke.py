@@ -72,6 +72,7 @@ def process(
     workers=2,
     max_memory="1G",
     metrics_port=0,
+    recv_buffers=0,
 ):
     port = port or H.free_port()
     directory.mkdir(exist_ok=True)
@@ -113,7 +114,7 @@ def process(
             "--metrics-port",
             str(metrics_port),
             "--recv-buffers-per-worker",
-            "0",
+            str(recv_buffers),
             "--max-memory",
             max_memory,
             "--registered-buffer-mb-per-worker",
