@@ -587,6 +587,18 @@ void AppendReplicationExpirationEffect(std::vector<std::string>* args,
   if (!args || args->empty() || !exists) return;
   bool encoded = false;
   if (command_db_id == effect_db_id) {
+    // Numeric after-images use SET KEEPTTL. The committed deadline lets
+    // this single SET reproduce persistence or expiration even on late replay.
+    if (args->size() == 4 && absl::EqualsIgnoreCase((*args)[0], "SET") &&
+        (*args)[1] == key && absl::EqualsIgnoreCase((*args)[3], "KEEPTTL")) {
+      if (expire_at_ms == 0) {
+        args->pop_back();
+      } else {
+        args->back() = "PXAT";
+        args->push_back(std::to_string(expire_at_ms));
+      }
+      return;
+    }
     VisitExplicitExpiration(
         *args, [&](std::string_view target, std::uint64_t deadline) {
           if (target == key && deadline == expire_at_ms) encoded = true;

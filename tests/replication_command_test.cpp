@@ -185,6 +185,17 @@ TEST(ReplicationCommandTest, SetAlreadyCarriesFinalExpirationSemantics) {
                                                 "123456"}));
 }
 
+TEST(ReplicationCommandTest, NumericAfterImageEncodesCommittedTtlInSet) {
+  std::vector<std::string> persistent{"SET", "counter", "1", "KEEPTTL"};
+  auto timed = persistent;
+  lavik::AppendReplicationExpirationEffect(&persistent, 0, 0, "counter", true,
+                                           0);
+  lavik::AppendReplicationExpirationEffect(&timed, 0, 0, "counter", true, 100);
+  EXPECT_EQ(persistent, (std::vector<std::string>{"SET", "counter", "1"}));
+  EXPECT_EQ(timed,
+            (std::vector<std::string>{"SET", "counter", "1", "PXAT", "100"}));
+}
+
 TEST(ReplicationCommandTest, CompanionMustMatchDatabaseKeyAndAbsoluteDeadline) {
   const std::vector<std::string> mset{"mset", "a", "value", "b", "a"};
   for (const auto key : {"a", "b"}) {
@@ -201,8 +212,7 @@ TEST(ReplicationCommandTest, CompanionMustMatchDatabaseKeyAndAbsoluteDeadline) {
   }
   for (auto args : std::vector<std::vector<std::string>>{
            {"PEXPIREAT", "k", "101"},
-           {"RESTORE", "k", "100", "payload", "REPLACE"},
-           {"SET", "k", "v", "KEEPTTL"}}) {
+           {"RESTORE", "k", "100", "payload", "REPLACE"}}) {
     lavik::AppendReplicationExpirationEffect(&args, 2, 2, "k", true, 100);
     EXPECT_EQ(args.front(), lavik::kReplicatedExecCommand);
     EXPECT_EQ(args.back(), "100");
