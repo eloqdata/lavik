@@ -1158,13 +1158,19 @@ After scanning, it continues draining live writes while awaiting
 handoff and peer-flow completion.
 
 At the final cut, the source closes and drains snapshot-transaction admission,
-closes and drains command database gates, drains replacement and session
-queues, fences each shared backlog, pins each returned stable cursor, stops
-capture on every flow, and reopens foreground admission before waiting for the
-network cut ACK. The target waits for every flow's cut, closes its own command
+closes and drains command database gates, quiesces active expiration on every
+worker, drains replacement and session queues, fences each
+shared backlog, pins each returned stable cursor, stops capture on every flow,
+and reopens foreground admission before waiting for the network cut ACK.
+Expiration resumes after all source captures stop, and every abort path
+releases the expiration pause and foreground gates. The native stall watchdog
+uses session progress for flows waiting at these all-flow barriers; active
+transfers keep independent progress deadlines, and a wholly stalled session
+still times out. The target waits for every flow's cut, closes its own command
 gates, validates every partition, drains staged storage writes, persists the
 new database epochs, removes sync state, and only then becomes eligible to go
-online. Each flow follows a local protocol phase machine: FULL rebuild frames
+online.
+Each flow follows a local protocol phase machine: FULL rebuild frames
 are accepted only before its cut, the first online cursor must match the
 installed stable cut, and later reset/snapshot/cut frames are rejected;
 CONTINUE accepts no reset/snapshot frames and requires its first cursor to

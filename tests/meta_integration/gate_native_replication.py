@@ -22,6 +22,7 @@ all native connections are admitted by production Meta and Follow Owner.
 
 from contextlib import contextmanager
 import os
+import signal
 import concurrent.futures
 from pathlib import Path
 import re
@@ -2380,6 +2381,110 @@ def small_receive_window(root):
         assert C.readonly_get(target, "{window}key-511") == "v" * 1024
 
 
+def full_cut_expiration(root, cancel=False):
+    """TTL maintenance cannot replenish FULL after foreground gates close."""
+    hold = root / ("cancel-expiration-cut.hold" if cancel else "expiration-cut.hold")
+    hold.touch()
+    expires_at = 0
+
+    def seed(writer):
+        nonlocal expires_at
+        expires_at = int(time.time() * 1000) + 8000
+        # Concentrate expiration on one flow while its peers wait at the cut.
+        # The other two flows must not prevent this one from finishing.
+        for batch in range(20):
+            writer.socket.sendall(
+                b"".join(
+                    C.encode_resp(
+                        [
+                            "SET",
+                            f"{{expiry-cut}}key-{batch * 500 + i}",
+                            "value",
+                            "PXAT",
+                            str(expires_at),
+                        ]
+                    )
+                    for i in range(500)
+                )
+            )
+            for _ in range(500):
+                assert C.read_resp(writer.reader) == "OK"
+
+    with pair(
+        root,
+        "cancel-expiration-cut" if cancel else "expiration-cut",
+        source_workers=3,
+        target_workers=3,
+        seed=seed,
+        require_seed_before_full=True,
+        source_extra_args=("--replication-publish-queue-mb-per-worker", "1"),
+        source_faults={"LAVIK_FULL_SOURCE_CUT_HOLD_FILE": str(hold)},
+    ) as (meta, source, target, writer):
+        stopped = threading.Event()
+        throttle = None
+
+        def slow_receiver():
+            # Short scheduling pauses model slow ACKs without expiring the
+            # replica's lease or blocking the independent source metrics.
+            try:
+                while not stopped.is_set():
+                    os.kill(target.proc.pid, signal.SIGSTOP)
+                    stopped.wait(0.025)
+                    os.kill(target.proc.pid, signal.SIGCONT)
+                    stopped.wait(0.002)
+            finally:
+                os.kill(target.proc.pid, signal.SIGCONT)
+
+        try:
+            H.wait_until(
+                "FULL reached its closed command gate",
+                15,
+                lambda: "fault pause reached: LAVIK_FULL_SOURCE_CUT_HOLD_FILE"
+                in Path(source.log_path).read_text(),
+            )
+            assert time.time() * 1000 < expires_at, "seed expired before the cut"
+            assert source.metric("lavik_storage_expiration_pause_count") == 1
+            while time.time() * 1000 < expires_at + 1000:
+                time.sleep(0.05)
+            # No client command has run since seeding. Without quiescence,
+            # TTL deletion alone fills the supposedly final FIFO here.
+            for worker in range(3):
+                assert (
+                    source.metric(
+                        "lavik_fullsync_publish_queue_bytes", f'{{worker="{worker}"}}'
+                    )
+                    == 0
+                )
+            if cancel:
+                target.force_kill()
+            else:
+                throttle = threading.Thread(target=slow_receiver)
+                throttle.start()
+            hold.unlink()
+            writer.socket.settimeout(5)
+            assert writer.call("GET", "{native}seed") == "baseline"
+            assert writer.call("SET", "{native}after-cut", "available") == "OK"
+            H.wait_until(
+                "cut releases its expiration pause",
+                5,
+                lambda: source.metric("lavik_storage_expiration_pause_count") == 0,
+            )
+        finally:
+            hold.unlink(missing_ok=True)
+            stopped.set()
+            if throttle is not None:
+                throttle.join(timeout=5)
+                assert not throttle.is_alive()
+        if cancel:
+            # A changed target boot correctly aborts initial provisioning.
+            # This case verifies source cleanup, not bootstrap replacement.
+            return
+        ready(meta)
+        assert writer.call("WAIT", 1, 5000) == 1
+        assert C.readonly_get(target, "{expiry-cut}key-0") is None
+        assert C.readonly_get(target, "{native}after-cut") == "available"
+
+
 def target_queue_shutdown(root):
     # Hold the FIFO consumer until the receiver has filled its bounded queue.
     # Socket shutdown cannot wake that capacity wait: terminal stage/ACK
@@ -2418,6 +2523,13 @@ def main():
     ) as directory:
         root = Path(directory)
         if len(sys.argv) > 5:
+            if sys.argv[5:] == ["full_cut_expiration"]:
+                if not C.has_fault(C.DATA, b"LAVIK_FULL_SOURCE_CUT_HOLD_FILE"):
+                    sys.exit(77)
+                full_cut_expiration(root)
+                full_cut_expiration(root, cancel=True)
+                H.log("PASS")
+                return
             if sys.argv[5:] == ["full_override_pressure"]:
                 if not C.has_fault(
                     C.DATA, b"LAVIK_REPLICATION_FULLSYNC_SCAN_PAUSE_FILE"
