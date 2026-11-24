@@ -6550,7 +6550,15 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
   transaction.Seal();
   ClusterShardValidatorContext cluster_validator;
   InstallClusterShardValidator(transaction, request, cluster_validator);
-  ReplicationTransactionGuard replication(request, &transaction);
+  // Only a successful NX decision is published. Replay its unconditional
+  // writes, including the TTL reset on each destination.
+  std::vector<std::string> canonical;
+  if (!request.replication_origin_ && g_storage->ReplicationLogActive()) {
+    canonical.assign(args.begin(), args.end());
+    canonical.front() = "MSET";
+  }
+  ReplicationTransactionGuard replication(request, &transaction,
+                                          std::move(canonical));
   if (!replication.status().ok()) {
     co_return BuiltReply(
         AppendStorageError(reply_builder, replication.status()));
@@ -12120,35 +12128,10 @@ void ReplicationTransactionGuard::SetFinalExpirations(
     return;
   }
   try {
-    using Effect = storage::TxShardWrites::ExpirationEffect;
-    std::vector<const Effect*, RetainedAllocator<const Effect*>> final_effects{
-        RetainedAllocator<const Effect*>(
-            RetainedAllocationDomain{.externally_admitted_ = true})};
-    for (const auto& shard : shard_writes) {
-      for (const auto& effect : shard.expiration_effects_) {
-        auto found = std::find_if(final_effects.begin(), final_effects.end(),
-                                  [&](const auto* prior) {
-                                    return prior->db_id_ == effect.db_id_ &&
-                                           prior->key_ == effect.key_;
-                                  });
-        if (found == final_effects.end()) {
-          final_effects.push_back(&effect);
-        } else {
-          *found = &effect;
-        }
-      }
-    }
-    if (final_effects.empty()) return;
-
     if (transaction_->command_args_.empty()) return;
-    std::vector<std::string> command_args =
-        std::move(transaction_->command_args_);
-    command_args.reserve(command_args.size() + final_effects.size() * 4);
-    for (const auto* effect : final_effects) {
-      AppendReplicationExpirationEffect(&command_args, transaction_->db_id_,
-                                        effect->db_id_, effect->key_,
-                                        effect->exists_, effect->expire_at_ms_);
-    }
+    auto command_args = std::move(transaction_->command_args_);
+    AppendTransactionExpirationEffects(command_args, transaction_->db_id_,
+                                       shard_writes);
     SetCommandArgs(std::move(command_args));
   } catch (const std::length_error&) {
     InvalidatePayload();

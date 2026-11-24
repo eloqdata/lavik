@@ -757,13 +757,14 @@ client write
   -> per-flow ordered ACK
 ```
 
-Ordered standalone in-place updates to live persistent Strings, Hashes, Lists,
-Sets, Sorted Sets and Streams inherit the key's persistence during replay.
-The source publishes the canonical mutation without a trailing PERSIST.
-Operations with selected values or generated IDs retain their deterministic
-replay arguments. Creation and updates on expiring keys keep their existing
-expiration encoding. FULL capture and transaction settlement retain explicit
-expiration effects.
+The source includes a final expiration effect when the canonical command does
+not already establish the committed deadline or persistence. An ordered
+in-place update can inherit persistence from a live persistent key. During
+transaction settlement the source considers the predecessor of the first write
+to each database/key pair and the canonical effects in replay order. FULL
+capture requires the effects themselves to establish the final TTL, since its
+baseline can differ from the predecessor seen by the source. Updates that can
+recreate an expired key carry its absolute deadline for delayed replay.
 
 Canonical commands use the LRC1 command-body encoding: a four-byte magic,
 one-byte version, one-byte logical database, argument count, per-argument

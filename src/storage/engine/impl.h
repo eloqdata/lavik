@@ -5043,7 +5043,8 @@ class StorageEngine::Impl {
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       SetLatencyTrace* trace = nullptr,
-      DeferredCommitBatch* deferred_batch = nullptr);
+      DeferredCommitBatch* deferred_batch = nullptr,
+      bool* persistent_predecessor = nullptr);
 
   Task<absl::StatusOr<IndirectKeyHandle>> EnsureIndirectKey(
       WorkerStore& store, std::string_view key, const Digest& digest,

@@ -141,7 +141,7 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
 // replay still validates enabled databases and command execution.
 bool IsPublishOnlyReplicationCommand(const ReplicatedCommand& command) noexcept;
 
-// Turns one journaled mutation into a strict replicated EXEC and appends the
+// When the canonical mutation does not encode the deadline, append the
 // exact committed after-image for the key's expiration metadata. A past
 // absolute deadline intentionally deletes the value on a delayed replica.
 void AppendReplicationExpirationEffect(std::vector<std::string>* args,
@@ -149,5 +149,11 @@ void AppendReplicationExpirationEffect(std::vector<std::string>* args,
                                        std::uint8_t effect_db_id,
                                        std::string_view key, bool exists,
                                        std::uint64_t expire_at_ms);
+
+// Append final deadlines that ordered replay cannot infer for the affected
+// keys.
+void AppendTransactionExpirationEffects(
+    std::vector<std::string>& args, std::uint8_t db_id,
+    std::span<const storage::TxShardWrites> shards);
 
 }  // namespace lavik
