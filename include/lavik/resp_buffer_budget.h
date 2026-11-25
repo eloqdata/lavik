@@ -48,7 +48,8 @@ class alignas(64) RespBufferBudget {
 
   // Sample the actual packed bytes after a socket read round. Return true
   // only when the caller needs to start the worker's maintenance coroutine.
-  [[nodiscard, gnu::always_inline]] bool Admit(ConnectionArgsStorage& slot) noexcept {
+  [[nodiscard, gnu::always_inline]] bool Admit(
+      ConnectionArgsStorage& slot) noexcept {
     const auto capacity = slot.bytes.capacity();
     if (capacity == slot.active_capacity_) return false;
     return Observe(slot, capacity);
