@@ -365,7 +365,7 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
               }
               bulk_remaining_ = static_cast<std::size_t>(parsed);
               assert(bulk_prepared_ == 0);
-              command_.args_.Get().ResizeLast(0);
+              assert(command_.args_.back().empty());
               state_ = State::kBulkData;
             }
             break;
@@ -409,9 +409,21 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
           if (!reserved.ok()) return Error(reserved, pos);
         }
         args.StartArgument();
-        state_ = argument_type_ == '$' || argument_type_ == '='
-                     ? State::kBulkLength
-                     : State::kLineArgument;
+        if (argument_type_ == '$' || argument_type_ == '=') {
+          // A complete one-digit length is common for command names and keys.
+          // On a short read or a tight query limit, keep the incremental path.
+          if (input.size() - pos >= 3 && input[pos] >= '0' &&
+              input[pos] <= '9' && input[pos + 1] == '\r' &&
+              input[pos + 2] == '\n' && Account(3)) {
+            bulk_remaining_ = static_cast<std::size_t>(input[pos] - '0');
+            pos += 3;
+            state_ = State::kBulkData;
+          } else {
+            state_ = State::kBulkLength;
+          }
+        } else {
+          state_ = State::kLineArgument;
+        }
         break;
       }
 
@@ -482,29 +494,35 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
                          pos);
           }
         }
-        if (bulk_remaining_ == 0) {
-          terminator_bytes_ = 0;
-          state_ = State::kBulkTerminator;
-        }
-        break;
+        if (bulk_remaining_ != 0) break;
+        terminator_bytes_ = 0;
+        state_ = State::kBulkTerminator;
+        [[fallthrough]];
       }
 
       case State::kBulkTerminator:
-        while (pos < input.size() && terminator_bytes_ < 2) {
-          const char expected = terminator_bytes_ == 0 ? '\r' : '\n';
-          if (input[pos] != expected) {
-            return Error(absl::InvalidArgumentError(
-                             "malformed RESP bulk string terminator"),
-                         pos);
+        // Consume a complete delimiter together. The incremental path preserves
+        // the consumed offset for split delimiters and query-limit errors.
+        if (terminator_bytes_ == 0 && input.size() - pos >= 2 &&
+            input[pos] == '\r' && input[pos + 1] == '\n' && Account(2)) {
+          pos += 2;
+        } else {
+          while (pos < input.size() && terminator_bytes_ < 2) {
+            const char expected = terminator_bytes_ == 0 ? '\r' : '\n';
+            if (input[pos] != expected) {
+              return Error(absl::InvalidArgumentError(
+                               "malformed RESP bulk string terminator"),
+                           pos);
+            }
+            ++terminator_bytes_;
+            if (!consume(1)) {
+              return Error(absl::ResourceExhaustedError(
+                               "client request exceeds the query buffer limit"),
+                           pos);
+            }
           }
-          ++terminator_bytes_;
-          if (!consume(1)) {
-            return Error(absl::ResourceExhaustedError(
-                             "client request exceeds the query buffer limit"),
-                         pos);
-          }
+          if (terminator_bytes_ != 2) break;
         }
-        if (terminator_bytes_ != 2) break;
 
         if (argument_type_ == '=') {
           if (command_.args_.back().size() < 4 ||

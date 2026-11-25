@@ -342,6 +342,20 @@ TEST(RespParserTest, EnforcesConfiguredQueryBufferLimitAcrossFragments) {
             "client request exceeds the query buffer limit");
 }
 
+TEST(RespParserTest, ReportsConsumedOffsetAtBulkFramingLimits) {
+  constexpr std::string_view request = "*1\r\n$1\r\nx\r\n";
+  // The length parser consumes the digit, then CRLF as a pair. The payload
+  // terminator consumes each byte independently on a query-limit error.
+  for (auto [limit, consumed] :
+       {std::pair{5u, 6u}, {6u, 8u}, {7u, 8u}, {9u, 10u}, {10u, 11u}}) {
+    RespCommandParser parser(limit);
+    const auto parsed = parser.Parse(request);
+    EXPECT_EQ(parsed.state_, RespParseState::kError) << limit;
+    EXPECT_EQ(parsed.status_.code(), absl::StatusCode::kResourceExhausted);
+    EXPECT_EQ(parsed.consumed_, consumed) << limit;
+  }
+}
+
 TEST(RespParserTest, AcceptsCommandExactlyAtConfiguredQueryBufferLimit) {
   const std::string request = "*1\r\n$4\r\nPING\r\n";
   RespCommandParser parser(request.size());
