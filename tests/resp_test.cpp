@@ -29,7 +29,7 @@
 #include <vector>
 
 #include "lavik/memory.h"
-#include "resp_buffer_budget.h"
+#include "lavik/resp_buffer_budget.h"
 
 namespace lavik {
 namespace {
@@ -102,7 +102,7 @@ TEST(RespParserTest, ConnectionRetainsOnlyItsOwnEmbeddedByteBuffer) {
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
-  CommandArgsStorage slot;
+  ConnectionArgsStorage slot;
   RespCommandParser parser(kDefaultClientQueryBufferLimit, &slot);
   const std::string prefix = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1024\r\n";
   const std::string value(1024, '\0');
@@ -114,7 +114,7 @@ TEST(RespParserTest, ConnectionRetainsOnlyItsOwnEmbeddedByteBuffer) {
   ASSERT_EQ(pipeline.state_, RespParseState::kOk);
   const auto* allocation = slot.bytes.data();
   EXPECT_NE(pipeline.command_.args_.Get().bytes.data(), allocation);
-  budget.Admit(slot);
+  EXPECT_TRUE(budget.Admit(slot));
   const auto charge = AllocatorUsableSizeForRequest(slot.bytes.capacity());
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline + charge);
   first.command_.args_.Reset();
@@ -122,65 +122,129 @@ TEST(RespParserTest, ConnectionRetainsOnlyItsOwnEmbeddedByteBuffer) {
             RespParseState::kNeedMoreData);
   auto next = parser.Parse(value.substr(100) + "\r\n");
   ASSERT_EQ(next.state_, RespParseState::kOk);
-  budget.Admit(slot);
+  EXPECT_FALSE(budget.Admit(slot));
   EXPECT_EQ(slot.bytes.data(), allocation);
   EXPECT_EQ(next.command_.args_[2], value);
   EXPECT_EQ(pipeline.command_.args_[2], value);
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline + charge);
   next.command_.args_.Reset();
-  // Growth beyond the per-connection cap drops the old credit. The live
-  // command keeps its complete value until its handle is released.
+  // A large request may also keep its capacity when admission succeeds.
   const std::string big(8192, 'b');
-  auto oversize = parser.Parse("*1\r\n$8192\r\n" + big + "\r\n");
-  ASSERT_EQ(oversize.state_, RespParseState::kOk);
-  budget.Admit(slot);
-  EXPECT_EQ(oversize.command_.args_[0], big);
+  auto large = parser.Parse("*1\r\n$8192\r\n" + big + "\r\n");
+  ASSERT_EQ(large.state_, RespParseState::kOk);
+  EXPECT_FALSE(budget.Admit(slot));
+  EXPECT_EQ(large.command_.args_[0], big);
+  large.command_.args_.Reset();
+  EXPECT_GE(slot.bytes.capacity(), big.size());
+  EXPECT_GT(GetWorkerMemoryStats(0).retained_bytes_, baseline + charge);
+  budget.Release(slot);
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
-  oversize.command_.args_.Reset();
-  EXPECT_EQ(slot.bytes.capacity(), CommandArgs::kInlineBytes);
 }
 
-TEST(RespParserTest, FullWorkerBudgetSkipsRetentionUntilAConnectionCloses) {
+TEST(RespParserTest, PeakDemandShrinksIdleAndSmallButKeepsHotBuffers) {
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
-  constexpr auto capacity = RespBufferBudget::kConnectionLimit;
+  ConnectionArgsStorage idle, small, hot;
+  auto use = [&](ConnectionArgsStorage& slot, std::size_t bytes) {
+    auto handle = CommandArgsHandle::TryBorrow(slot);
+    slot.bytes.resize(bytes);
+    return budget.Admit(slot);
+  };
+  constexpr auto window = RespBufferBudget::kWindow;
   const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
-  std::vector<CommandArgsStorage> slots(RespBufferBudget::kWorkerLimit /
-                                        capacity);
+  EXPECT_TRUE(use(idle, 16384));
+  EXPECT_FALSE(use(small, 16384));
+  EXPECT_FALSE(use(hot, 16384));
+  auto now = RespBufferBudget::Clock::now();
+  budget.Review(now + window);
+  EXPECT_FALSE(use(small, 1024));
+  EXPECT_FALSE(use(hot, 8192));
+  EXPECT_FALSE(use(hot, 16));  // The window keeps the peak, not the last use.
+  budget.Review(now + 2 * window);
+  EXPECT_EQ(idle.bytes.capacity(), CommandArgs::kInlineBytes);
+  EXPECT_EQ(small.bytes.capacity(), CommandArgs::kInlineBytes);
+  EXPECT_EQ(hot.bytes.capacity(), 16384u);
+  EXPECT_FALSE(use(small, 1024));
+  EXPECT_EQ(small.bytes.capacity(), 1024u);
+  budget.Release(small);
+  EXPECT_EQ(budget.Review(now + 3 * window),
+            RespBufferBudget::Clock::duration::zero());
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+  EXPECT_TRUE(use(idle, 16384));  // An empty worker restarts on new demand.
+  budget.Release(idle);
+}
+
+TEST(RespParserTest, TrimmingPreservesBorrowedPayloadUntilHandleReturns) {
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  BindMemoryAccountingShard(0);
+  RespBufferBudget budget;
+  ConnectionArgsStorage slot;
+  auto handle = CommandArgsHandle::TryBorrow(slot);
+  slot.bytes.resize(8192, 'x');
+  EXPECT_TRUE(budget.Admit(slot));
+  const auto now = RespBufferBudget::Clock::now();
+  budget.Review(now + RespBufferBudget::kWindow);
+  budget.Review(now + 2 * RespBufferBudget::kWindow);
+  EXPECT_EQ(slot.bytes.size(), 8192u);
+  EXPECT_EQ(slot.bytes.back(), 'x');
+  handle.Reset();
+  EXPECT_EQ(slot.bytes.capacity(), CommandArgs::kInlineBytes);
+}
+
+TEST(RespParserTest, LimitsEachMaintenancePassAndUnlinksClosedConnections) {
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  BindMemoryAccountingShard(0);
+  RespBufferBudget budget;
+  std::vector<ConnectionArgsStorage> slots(RespBufferBudget::kReviewBatch + 2);
+  const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
   for (auto& slot : slots) {
     auto handle = CommandArgsHandle::TryBorrow(slot);
-    slot.bytes.resize(capacity);
-    budget.Admit(slot);
+    slot.bytes.resize(8192);
+    EXPECT_EQ(budget.Admit(slot), &slot == &slots.front());
   }
-  ASSERT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
-            baseline + RespBufferBudget::kWorkerLimit);
-  CommandArgsStorage extra;
-  auto fill = [&] {
-    auto handle = CommandArgsHandle::TryBorrow(extra);
-    extra.bytes.resize(capacity, 'x');
-    budget.Admit(extra);
-    EXPECT_EQ(extra.bytes.back(), 'x');
-  };
-  fill();
-  EXPECT_EQ(extra.bytes.capacity(), CommandArgs::kInlineBytes);
   budget.Release(slots.back());
   slots.pop_back();
-  fill();
-  EXPECT_EQ(extra.bytes.capacity(), capacity);
-  for (auto& slot : slots) budget.Release(slot);
-  budget.Release(extra);
+  const auto due = RespBufferBudget::Clock::now() + RespBufferBudget::kWindow;
+  budget.Review(due);
+  budget.Review(due);
+  budget.Review(due + RespBufferBudget::kWindow);
+  EXPECT_EQ(slots.front().bytes.capacity(), CommandArgs::kInlineBytes);
+  EXPECT_EQ(slots.back().bytes.capacity(), 8192u);
+  budget.Review(due + RespBufferBudget::kWindow);
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+}
+
+TEST(RespParserTest, FailedAdmissionReclaimsAlreadyCachedBytesOnReview) {
+  ASSERT_TRUE(InitMemoryLimit(12 * 1024, 1).ok());
+  BindMemoryAccountingShard(0);
+  RespBufferBudget budget;
+  ConnectionArgsStorage cached, rejected;
+  const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
+  auto handle = CommandArgsHandle::TryBorrow(cached);
+  cached.bytes.resize(8192);
+  EXPECT_TRUE(budget.Admit(cached));
+  handle.Reset();
+  handle = CommandArgsHandle::TryBorrow(rejected);
+  rejected.bytes.resize(8192);
+  EXPECT_FALSE(budget.Admit(rejected));
+  EXPECT_EQ(rejected.bytes.size(), 8192u);
+  handle.Reset();
+  EXPECT_EQ(rejected.bytes.capacity(), CommandArgs::kInlineBytes);
+  budget.Review(RespBufferBudget::Clock::now() + RespBufferBudget::kWindow);
+  EXPECT_EQ(cached.bytes.capacity(), CommandArgs::kInlineBytes);
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+  EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
 }
 
 TEST(RespParserTest, FailedMemoryAdmissionReturnsOverflowOnRelease) {
   ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
-  CommandArgsStorage slot;
+  ConnectionArgsStorage slot;
   auto handle = CommandArgsHandle::TryBorrow(slot);
   slot.bytes.resize(1024);
-  budget.Admit(slot);
+  EXPECT_FALSE(budget.Admit(slot));
   EXPECT_EQ(slot.bytes.size(), 1024u);
   handle.Reset();
   EXPECT_EQ(slot.bytes.capacity(), CommandArgs::kInlineBytes);

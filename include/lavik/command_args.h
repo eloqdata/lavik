@@ -299,6 +299,9 @@ struct CommandArgsStorage : CommandArgs {
   // Only this exact capacity may survive handle release. The Data worker
   // updates it after admission. Standalone slots keep only inline storage.
   std::size_t retained_byte_capacity_ = kInlineBytes;
+  // Maintenance must leave a live parser, dispatched request or MULTI handle
+  // in exclusive control of its bytes.
+  bool borrowed() const noexcept { return borrowed_; }
   CommandArgsStorage() = default;
   ~CommandArgsStorage() { assert(!borrowed_); }
   CommandArgsStorage(const CommandArgsStorage&) = delete;

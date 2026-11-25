@@ -82,6 +82,7 @@
 #include "lavik/rdb.h"
 #include "lavik/replication.h"
 #include "lavik/resp.h"
+#include "lavik/resp_buffer_budget.h"
 #include "lavik/session.h"
 #include "lavik/slowlog.h"
 #include "lavik/storage/engine.h"
@@ -89,7 +90,6 @@
 #include "lavik/version.h"
 #include "lua_eval.h"
 #include "request_gate.h"
-#include "resp_buffer_budget.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik {
@@ -528,6 +528,7 @@ class RedisService final : public TcpService, public ClientLimit {
       std::optional<absl::Status>* deferred_read_error);
   Task<absl::Status> ImportRdb();
   Task<absl::Status> MonitorRuntimeHealth(Worker& worker);
+  Task<absl::Status> TrimRespBuffers(Worker& worker, RespBufferBudget& budget);
 
   class RequestGuard {
    public:
@@ -1374,6 +1375,24 @@ bool ShutdownRequested() {
   return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
+Task<absl::Status> RedisService::TrimRespBuffers(Worker& worker,
+                                                 RespBufferBudget& budget) {
+  while (!worker.stop_requested()) {
+    const auto delay = budget.Review(RespBufferBudget::Clock::now());
+    if (delay == RespBufferBudget::Clock::duration::zero()) break;
+    auto status = co_await bycorf::SleepFor(worker, delay);
+    if (!status.ok()) {
+      while (!worker.stop_requested() &&
+             budget.Review(RespBufferBudget::Clock::now(), /*drain=*/true) !=
+                 RespBufferBudget::Clock::duration::zero()) {
+        co_await bycorf::Yield(worker);
+      }
+      co_return status;
+    }
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
   bool storage_failure_handled = false;
   bool replication_quiesce_handled = false;
@@ -1702,7 +1721,10 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
             stream, input, parser, ready, client_buffers,
             &client_query_buffer_limit_bytes_, unassigned_input_bytes,
             deferred_read_error);
-        budget.Admit(ctx.command_args_storage_);
+        if (budget.Admit(ctx.command_args_storage_)) {
+          auto& worker = *ThisWorker().self_;
+          worker.SpawnBackground(TrimRespBuffers(worker, budget));
+        }
       }
     }
     if (!read_status.ok()) {
@@ -1937,7 +1959,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
             stream, &input, &parser, &ready, &client_buffers,
             &client_query_buffer_limit_bytes_, &unassigned_input_bytes,
             &deferred_read_error);
-        budget.Admit(ctx.command_args_storage_);
+        if (budget.Admit(ctx.command_args_storage_)) {
+          auto& worker = *ThisWorker().self_;
+          worker.SpawnBackground(TrimRespBuffers(worker, budget));
+        }
       }
       if (!read_status.ok()) [[unlikely]] {
         if (read_status.code() == absl::StatusCode::kUnavailable) [[unlikely]] {

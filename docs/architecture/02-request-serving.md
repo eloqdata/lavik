@@ -159,10 +159,11 @@ racing closure is either rejected or remains visible to the drain.
    own additional independent objects. Queueing and request handoff transfer
    handles without relocating arguments. Completion or abandonment clears the
    embedded slot or deletes an additional object outright. The connection
-   may retain its admitted packed byte capacity across requests, up to a
-   per-connection limit and a shared budget on its Data worker. The credit
-   ends on capacity change or disconnect. An exhausted budget prevents new
-   retention while ordinary request processing continues.
+   may retain its packed byte capacity across requests subject to its Data
+   worker's memory admission. Worker-local maintenance samples peak demand
+   over time and reclaims idle or underused capacity in bounded batches.
+   Memory pressure also revokes retention. A live handle keeps its bytes
+   through completion, including when the worker revokes the cache credit.
    The connection outlives every handle borrowing its embedded storage,
    including queued MULTI commands. Cross-worker execution borrows the request
    until the originating worker's await completes, so releasing arguments needs

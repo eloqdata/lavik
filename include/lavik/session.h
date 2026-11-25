@@ -26,6 +26,7 @@
 #include "lavik/command_args.h"
 #include "lavik/replication.h"
 #include "lavik/resp.h"
+#include "lavik/resp_buffer_budget.h"
 #include "lavik/storage/format.h"
 #include "lavik/tx/fingerprint.h"
 
@@ -40,7 +41,7 @@ class PubSubSession;
 struct ConnectionContext {
   // One fixed object for sequential commands. Declare it before queued_ so a
   // MULTI command borrowing it is destroyed first, including on disconnect.
-  CommandArgsStorage command_args_storage_;
+  ConnectionArgsStorage command_args_storage_;
   using HelloHandler = std::string_view (*)(const void*, void*,
                                             ConnectionContext&, CommandArgsView,
                                             ReplyBuilder&);
