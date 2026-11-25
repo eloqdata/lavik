@@ -464,7 +464,8 @@ class RedisService final : public TcpService, public ClientLimit {
                long online_mimalloc_purge_delay_ms,
                std::string_view requirepass, std::string load_rdb_file,
                std::uint64_t max_clients,
-               std::size_t client_query_buffer_limit_bytes)
+               std::size_t client_query_buffer_limit_bytes,
+               ClientBufferLimit resp_buffer_cache_limit)
       : TcpService(port),
         storage_(storage),
         replication_(replication),
@@ -473,7 +474,8 @@ class RedisService final : public TcpService, public ClientLimit {
         authenticator_(requirepass),
         load_rdb_file_(std::move(load_rdb_file)),
         max_clients_(max_clients),
-        client_query_buffer_limit_bytes_(client_query_buffer_limit_bytes) {}
+        client_query_buffer_limit_bytes_(client_query_buffer_limit_bytes),
+        resp_buffer_cache_limit_(resp_buffer_cache_limit) {}
 
   void Prepare(unsigned thread_count) override;
   Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
@@ -563,6 +565,7 @@ class RedisService final : public TcpService, public ClientLimit {
   std::atomic<std::uint64_t> max_clients_;
   // Loaded once per socket-read parsing round, not once per RESP token.
   std::atomic<std::size_t> client_query_buffer_limit_bytes_;
+  const ClientBufferLimit resp_buffer_cache_limit_;
   std::atomic<std::uint64_t> active_clients_{0};
   std::unique_ptr<CoroutineBarrier> recovery_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_collect_barrier_;
@@ -656,6 +659,11 @@ void RedisService::Prepare(unsigned thread_count) {
   thread_count = storage_->worker_count();
   request_gate_.Prepare(thread_count);
   resp_buffer_budgets_ = std::make_unique<RespBufferBudget[]>(thread_count);
+  const auto maximum = GetMemoryStats().max_bytes_;
+  for (unsigned worker = 0; worker < thread_count; ++worker) {
+    resp_buffer_budgets_[worker].SetLimit(
+        resp_buffer_cache_limit_.WorkerShare(maximum, worker, thread_count));
+  }
   PrepareMonitor(thread_count);
   PreparePubSub(thread_count);
   recovery_ready_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
@@ -2440,7 +2448,7 @@ int RunServer(ServerOptions options) {
       "storage_read_buffer_bytes={} "
       "record_crc={} "
       "replication_publish_queue_bytes={} per worker max_memory={} "
-      "maxmemory_clients={} "
+      "maxmemory_clients={} resp_buffer_cache_limit={} "
       "client_query_buffer_limit={} "
       "flush_max_ms={} "
       "flush_size_bytes={} "
@@ -2459,6 +2467,7 @@ int RunServer(ServerOptions options) {
       options.record_crc_, options.replication_publish_queue_bytes_,
       options.max_memory_bytes_,
       FormatClientBufferLimit(options.maxmemory_clients_),
+      FormatClientBufferLimit(options.resp_buffer_cache_limit_),
       options.client_query_buffer_limit_bytes_, options.flush_max_ms_,
       options.flush_size_bytes_, options.defrag_max_active_per_device_,
       options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
@@ -2675,7 +2684,8 @@ int RunServer(ServerOptions options) {
   RedisService redis(options.port_, &storage, &replication, &recovery_memory,
                      options.mimalloc_purge_delay_ms_, options.requirepass_,
                      std::move(options.load_rdb_file_), options.max_clients_,
-                     options.client_query_buffer_limit_bytes_);
+                     options.client_query_buffer_limit_bytes_,
+                     options.resp_buffer_cache_limit_);
   InitClientLimit(&redis);
   if (tls_server_context != nullptr) {
     redis.AddTlsEndpoint(options.tls_port_, std::move(tls_server_context));

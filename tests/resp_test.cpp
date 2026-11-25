@@ -102,6 +102,7 @@ TEST(RespParserTest, ConnectionRetainsOnlyItsOwnEmbeddedByteBuffer) {
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
+  budget.SetLimit(1024 * 1024);
   ConnectionArgsStorage slot;
   RespCommandParser parser(kDefaultClientQueryBufferLimit, &slot);
   const std::string prefix = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1024\r\n";
@@ -145,6 +146,7 @@ TEST(RespParserTest, PeakDemandShrinksIdleAndSmallButKeepsHotBuffers) {
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
+  budget.SetLimit(1024 * 1024);
   ConnectionArgsStorage idle, small, hot;
   auto use = [&](ConnectionArgsStorage& slot, std::size_t bytes) {
     auto handle = CommandArgsHandle::TryBorrow(slot);
@@ -179,6 +181,7 @@ TEST(RespParserTest, TrimmingPreservesBorrowedPayloadUntilHandleReturns) {
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
+  budget.SetLimit(1024 * 1024);
   ConnectionArgsStorage slot;
   auto handle = CommandArgsHandle::TryBorrow(slot);
   slot.bytes.resize(8192, 'x');
@@ -196,6 +199,7 @@ TEST(RespParserTest, LimitsEachMaintenancePassAndUnlinksClosedConnections) {
   ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
+  budget.SetLimit(1024 * 1024);
   std::vector<ConnectionArgsStorage> slots(RespBufferBudget::kReviewBatch + 2);
   const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
   for (auto& slot : slots) {
@@ -215,10 +219,11 @@ TEST(RespParserTest, LimitsEachMaintenancePassAndUnlinksClosedConnections) {
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
 }
 
-TEST(RespParserTest, FailedAdmissionReclaimsAlreadyCachedBytesOnReview) {
+TEST(RespParserTest, FailedMemoryAdmissionPreservesHotBuffersOnReview) {
   ASSERT_TRUE(InitMemoryLimit(12 * 1024, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
+  budget.SetLimit(1024 * 1024);
   ConnectionArgsStorage cached, rejected;
   const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
   auto handle = CommandArgsHandle::TryBorrow(cached);
@@ -231,16 +236,49 @@ TEST(RespParserTest, FailedAdmissionReclaimsAlreadyCachedBytesOnReview) {
   EXPECT_EQ(rejected.bytes.size(), 8192u);
   handle.Reset();
   EXPECT_EQ(rejected.bytes.capacity(), CommandArgs::kInlineBytes);
+  ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+  ASSERT_TRUE(WouldExceedMemoryLimit(0));
   budget.Review(RespBufferBudget::Clock::now() + RespBufferBudget::kWindow);
-  EXPECT_EQ(cached.bytes.capacity(), CommandArgs::kInlineBytes);
+  EXPECT_EQ(cached.bytes.capacity(), 8192u);
+  budget.Release(cached);
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
   EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+}
+
+TEST(RespParserTest, CacheCapDeniesRetentionWithoutRejectingOrEvicting) {
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  BindMemoryAccountingShard(0);
+  ConnectionArgsStorage hot, other;
+  RespBufferBudget budget;
+  const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
+  auto fill = [&](ConnectionArgsStorage& slot) {
+    auto handle = CommandArgsHandle::TryBorrow(slot);
+    slot.bytes.resize(1024, 'v');
+    const bool start = budget.Admit(slot);
+    EXPECT_EQ(slot.bytes.back(), 'v');
+    return start;
+  };
+  budget.SetLimit(0);
+  EXPECT_FALSE(fill(other));
+  EXPECT_EQ(other.bytes.capacity(), CommandArgs::kInlineBytes);
+  budget.SetLimit(AllocatorUsableSizeForRequest(1024));
+  EXPECT_TRUE(fill(hot));
+  EXPECT_FALSE(fill(other));
+  EXPECT_EQ(other.bytes.capacity(), CommandArgs::kInlineBytes);
+  budget.Review(RespBufferBudget::Clock::now() + RespBufferBudget::kWindow);
+  EXPECT_EQ(hot.bytes.capacity(), 1024u);
+  budget.Release(hot);
+  EXPECT_FALSE(fill(other));  // The existing maintenance task is still active.
+  EXPECT_EQ(other.bytes.capacity(), 1024u);
+  budget.Release(other);
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
 }
 
 TEST(RespParserTest, FailedMemoryAdmissionReturnsOverflowOnRelease) {
   ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
   BindMemoryAccountingShard(0);
   RespBufferBudget budget;
+  budget.SetLimit(1024 * 1024);
   ConnectionArgsStorage slot;
   auto handle = CommandArgsHandle::TryBorrow(slot);
   slot.bytes.resize(1024);

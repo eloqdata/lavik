@@ -38,6 +38,12 @@ class alignas(64) RespBufferBudget {
   RespBufferBudget(const RespBufferBudget&) = delete;
   RespBufferBudget& operator=(const RespBufferBudget&) = delete;
 
+  // Install this worker's cache share during service preparation.
+  void SetLimit(std::uint64_t bytes) noexcept {
+    assert(TAILQ_EMPTY(&queue_));
+    available_bytes_ = bytes;
+  }
+
   // Sample the actual packed bytes after a socket read round. Return true
   // only when the caller needs to start the worker's maintenance coroutine.
   [[nodiscard]] bool Admit(ConnectionArgsStorage& slot) noexcept {
@@ -53,13 +59,13 @@ class alignas(64) RespBufferBudget {
     if (capacity <= CommandArgs::kInlineBytes ||
         slot.bytes.size() <= capacity / 4)
       return false;
+    if (capacity > available_bytes_) return false;
     const auto bytes = AllocatorUsableSizeForRequest(capacity);
+    if (bytes > available_bytes_) return false;
     auto reservation = TryReserveMemory(bytes);
-    if (!reservation) {
-      admission_failed_ = !TAILQ_EMPTY(&queue_);
-      return false;
-    }
+    if (!reservation) return false;
     reservation->Commit(bytes);
+    available_bytes_ -= bytes;
     slot.retained_byte_capacity_ = capacity;
     slot.peak_bytes_ = slot.bytes.size();
     Schedule(slot, Clock::now());
@@ -73,6 +79,7 @@ class alignas(64) RespBufferBudget {
     TAILQ_REMOVE(&queue_, &slot, review_link_);
     const auto bytes =
         AllocatorUsableSizeForRequest(slot.retained_byte_capacity_);
+    available_bytes_ += bytes;
     ReleaseRetainedMemory(CurrentMemoryAccountingShard(), bytes);
     slot.retained_byte_capacity_ = CommandArgs::kInlineBytes;
   }
@@ -81,15 +88,10 @@ class alignas(64) RespBufferBudget {
   // If a timer fails, drain outstanding cache credits in background batches.
   // Bound each pass, including when many connections went idle together.
   Clock::duration Review(Clock::time_point now, bool drain = false) noexcept {
-    const bool due =
-        !TAILQ_EMPTY(&queue_) && TAILQ_FIRST(&queue_)->review_at_ <= now;
-    const bool pressure =
-        drain || (due && (std::exchange(admission_failed_, false) ||
-                          WouldExceedMemoryLimit(0)));
     for (std::size_t i = 0; i < kReviewBatch; ++i) {
       auto* slot = TAILQ_FIRST(&queue_);
       if (!slot || (!drain && slot->review_at_ > now)) break;
-      if (pressure || slot->peak_bytes_ <= slot->retained_byte_capacity_ / 4) {
+      if (drain || slot->peak_bytes_ <= slot->retained_byte_capacity_ / 4) {
         Release(*slot);
         // Drop the empty allocation directly. A smaller active workload grows
         // to its new demand on the next request without copying old contents.
@@ -106,7 +108,6 @@ class alignas(64) RespBufferBudget {
                                        next->review_at_ - now);
     }
     maintenance_running_ = false;
-    admission_failed_ = false;
     return Clock::duration::zero();
   }
 
@@ -117,7 +118,7 @@ class alignas(64) RespBufferBudget {
   }
   TAILQ_HEAD(, ConnectionArgsStorage) queue_;
   bool maintenance_running_ = false;
-  bool admission_failed_ = false;
+  std::uint64_t available_bytes_ = 0;
 };
 
 }  // namespace lavik

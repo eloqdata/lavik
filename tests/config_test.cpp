@@ -170,6 +170,28 @@ TEST(RedisConfigTest, ReplicaStaleReadsDefaultYesAndAcceptRedisBoolean) {
   EXPECT_TRUE(options.replication_options_.replica_serve_stale_data_);
 }
 
+TEST(RedisConfigTest, RespBufferCacheLimitIsIndependentOfRequestQuota) {
+  ServerOptions options;
+  EXPECT_EQ(options.resp_buffer_cache_limit_.WorkerShare(1000, 0, 3), 4u);
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"resp-buffer-cache-limit", "256kb"}, &options)
+          .ok());
+  EXPECT_EQ(options.resp_buffer_cache_limit_.WorkerShare(1000, 1, 2),
+            128u * 1024);
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"resp-buffer-cache-limit", "7%"}, &options)
+          .ok());
+  EXPECT_EQ(options.resp_buffer_cache_limit_.WorkerShare(1000, 2, 3), 23u);
+  EXPECT_EQ(options.maxmemory_clients_.Bytes(1000), 50u);
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"resp-buffer-cache-limit", "101%"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"resp-buffer-cache-limit", "0"}, &options)
+          .ok());
+  EXPECT_EQ(options.resp_buffer_cache_limit_.Bytes(1000), 0u);
+}
+
 TEST(RedisConfigTest, AppliesSupportedDirectives) {
   ServerOptions options;
   EXPECT_TRUE(options.replication_options_.backlog_backpressure_);

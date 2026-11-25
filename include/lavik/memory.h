@@ -31,12 +31,20 @@ class RetainedMemoryCharge;
 // memory admission and that representation on the same process-wide limit.
 inline constexpr unsigned kMaxMemoryWorkers = 1024;
 
-// User-facing maxmemory-clients value. Percentage values are resolved against
-// the effective maxmemory after automatic host/cgroup sizing; byte values are
-// absolute. Zero disables the ordinary-client request-buffer limit.
+// Client buffer limits accept absolute bytes or a percentage of effective
+// maxmemory after host/cgroup sizing. Each option defines its zero policy.
 struct ClientBufferLimit {
   std::uint64_t value_ = 5;
   bool percentage_ = true;
+
+  // Resolve a validated percentage (0..100) with integer rounding down.
+  std::uint64_t Bytes(std::uint64_t maximum) const noexcept {
+    return percentage_ ? maximum / 100 * value_ + maximum % 100 * value_ / 100
+                       : value_;
+  }
+  // Divide the resolved cap among Data workers, distributing leftover bytes.
+  std::uint64_t WorkerShare(std::uint64_t maximum, unsigned worker,
+                            unsigned workers) const noexcept;
 };
 
 struct MemoryStats {

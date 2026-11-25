@@ -32,8 +32,7 @@ namespace lavik {
 // "1gb". A suffix is optional; unsuffixed values are bytes.
 absl::StatusOr<std::size_t> ParseMemorySize(std::string_view text);
 
-// Parses Valkey-compatible maxmemory-clients values: an ordinary memory size,
-// a percentage from 0% through 100%, or zero to disable the limit.
+// Parse an absolute byte size or a percentage from 0% through 100%.
 absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(std::string_view text);
 std::string FormatClientBufferLimit(ClientBufferLimit limit);
 
