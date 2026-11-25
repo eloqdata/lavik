@@ -1223,6 +1223,16 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_native_replication PROPERTIES
         LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
       add_test(
+        NAME meta_integration.gate_full_cut_expiration
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                full_cut_expiration
+      )
+      set_tests_properties(meta_integration.gate_full_cut_expiration PROPERTIES
+        LABELS meta-integration TIMEOUT 120 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+      add_test(
         NAME meta_integration.gate_full_override_pressure
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
@@ -1884,6 +1894,7 @@ if (BUILD_TESTING)
     tests/replication_observability_test.cpp
     tests/replica_applied_frontier_test.cpp
     tests/full_sync_handoff_test.cpp
+    tests/full_sync_stall_test.cpp
     tests/ring_buffer_test.cpp
     tests/tx_block_leases_test.cpp
     tests/tx_lock_test.cpp

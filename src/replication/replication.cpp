@@ -16,6 +16,7 @@
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/strings/cord.h"
+#include "full_sync_stall.h"
 #include "lavik/fault_pause.h"
 #include "replication_internal.h"
 
@@ -10807,6 +10808,16 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       active_ = false;
     }
   } command_gate_reopen;
+  struct ExpirationResume {
+    storage::StorageEngine* storage;
+    bool active = false;
+    ~ExpirationResume() { Resume(); }
+    void Resume() {
+      if (!active) return;
+      storage->ResumeExpiration();
+      active = false;
+    }
+  } expiration_resume{storage_};
 
   auto close_transaction_gate = [&]() -> Task<absl::Status> {
     while (!CloseSnapshotTransactionGate()) {
@@ -11144,7 +11155,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   } while (true);
 
   ack_state->observation_->Phase(FullSyncPhase::kCut, SteadyNanos());
-  absl::Status cut_ready = co_await session->WaitSnapshotReady();
+  absl::Status cut_ready = co_await session->WaitSnapshotReady(flow_id);
   if (!cut_ready.ok()) {
     cleanup();
     co_return cut_ready;
@@ -11173,16 +11184,6 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       }
     }
     command_gate_reopen.active_ = true;
-    LAVIK_FAULT_INJECT({
-      // Let process tests put a publisher waiter behind this real final cut.
-      // Its reservation must not prevent the fence below from making progress.
-      auto held = co_await fault_injection::PauseWhileFileExists(
-          "LAVIK_FULL_SOURCE_CUT_HOLD_FILE");
-      if (!held.ok()) {
-        cleanup();
-        co_return held;
-      }
-    });
     while (CommandDbOperationsActive()) {
       if (session->cancelled()) {
         cleanup();
@@ -11196,9 +11197,28 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         co_return waited;
       }
     }
+    // Command gates do not cover storage-origin TTL deletion. Join those
+    // cycles too, or each ACK can admit another expiration record and the
+    // final FIFO drain can keep foreground admission closed indefinitely.
+    absl::Status quiesced = co_await storage_->QuiesceExpiration();
+    if (!quiesced.ok()) {
+      cleanup();
+      co_return quiesced;
+    }
+    expiration_resume.active = true;
+    LAVIK_FAULT_INJECT({
+      // Let process tests put a publisher waiter behind this real final cut.
+      // Its reservation must not prevent the fence below from making progress.
+      auto held = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_FULL_SOURCE_CUT_HOLD_FILE");
+      if (!held.ok()) {
+        cleanup();
+        co_return held;
+      }
+    });
   }
 
-  absl::Status gate_closed = co_await session->WaitSnapshotGateClosed();
+  absl::Status gate_closed = co_await session->WaitSnapshotGateClosed(flow_id);
   if (!gate_closed.ok()) {
     cleanup();
     co_return gate_closed;
@@ -11243,7 +11263,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     cleanup();
     co_return retained;
   }
-  absl::Status fenced = co_await session->WaitSnapshotFenced();
+  absl::Status fenced = co_await session->WaitSnapshotFenced(flow_id);
   if (!fenced.ok()) {
     cleanup();
     co_return fenced;
@@ -11253,11 +11273,13 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   // owner-local barrier (no network round trip) to prove every flow has
   // done the same. Post-reopen writes now enter the retained backlog only.
   cleanup();
-  absl::Status capture_stopped = co_await session->WaitSnapshotCaptureStopped();
+  absl::Status capture_stopped =
+      co_await session->WaitSnapshotCaptureStopped(flow_id);
   if (!capture_stopped.ok()) {
     co_return capture_stopped;
   }
   if (flow_id == 0) {
+    expiration_resume.Resume();
     gate_reopen.Open();
     command_gate_reopen.Open();
     LAVIK_FAULT_INJECT(
@@ -12096,28 +12118,28 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
   }
 
   const auto started = std::chrono::steady_clock::now();
-  std::vector<std::uint64_t> observed_progress(session->worker_count());
+  detail::FullSyncStallWatchdog watchdog(session->worker_count(), started,
+                                         kFullSyncStallTimeout);
   session->control_reader_started_ = true;
   bycorf::ThisWorker().self_->Spawn(WatchMasterControl(stream, session));
-  std::vector<std::chrono::steady_clock::time_point> stall_deadlines(
-      session->worker_count(), started + kFullSyncStallTimeout);
-  for (unsigned flow = 0; flow < session->worker_count(); ++flow) {
-    observed_progress[flow] = session->ProgressGeneration(flow);
-  }
   auto next_progress_log = started + std::chrono::seconds(30);
   bool stalled = false;
   while (!session->cancelled() && !session->all_flows_ready() && !stalled) {
     const auto now = std::chrono::steady_clock::now();
+    // Observe all flows before judging a barrier waiter: the progressing
+    // peer may have a larger flow id. Actual transfer waits retain their own
+    // deadlines, so a healthy peer cannot hide a dead transport.
     for (unsigned flow = 0; flow < session->worker_count(); ++flow) {
-      const std::uint64_t current = session->ProgressGeneration(flow);
-      if (current != observed_progress[flow]) {
-        observed_progress[flow] = current;
-        stall_deadlines[flow] = now + kFullSyncStallTimeout;
-      }
+      watchdog.Observe(flow, session->ProgressGeneration(flow), now);
+    }
+    for (unsigned flow = 0; flow < session->worker_count(); ++flow) {
+      const bool waiting_for_peers = session->WaitingForPeerFlows(flow);
+      // Leaving a barrier publishes fresh activity before clearing its flag.
+      watchdog.Observe(flow, session->ProgressGeneration(flow), now);
       const auto progress = session->Progress(flow);
       if (progress.has_value() &&
           progress->phase_ != ReplicationPhase::kReady &&
-          now >= stall_deadlines[flow]) {
+          watchdog.Stalled(flow, waiting_for_peers, now)) {
         stalled = true;
         break;
       }

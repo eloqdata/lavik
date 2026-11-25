@@ -1460,6 +1460,7 @@ struct ReplicaFlowProgress {
   std::atomic<std::uint16_t> current_partition_{0};
   std::atomic<std::uint64_t> partition_sequence_{0};
   std::atomic<std::uint64_t> activity_generation_{1};
+  std::atomic<bool> waiting_for_peer_flows_{false};
   // Upper bound on what the peer could have consumed. The sender advances it
   // only after a complete socket write; unlike the ACK cursor, it remains a
   // safe reconnect bound when the final ACK was lost with the connection.
@@ -1587,8 +1588,34 @@ struct MasterSession {
     return all_flows_resume_possible_;
   }
 
-  bycorf::CoroutineBarrier::Awaiter WaitSnapshotReady() {
-    return snapshot_ready_.Wait(*bycorf::ThisWorker().self_);
+  // Only owner-local all-flow barriers inherit peer progress. Socket I/O and
+  // publisher drains stay active, retaining independent stall detection.
+  struct PeerFlowWait {
+    explicit PeerFlowWait(ReplicaFlowProgress& progress) : progress_(progress) {
+      progress_.waiting_for_peer_flows_.store(true, std::memory_order_release);
+    }
+    PeerFlowWait(const PeerFlowWait&) = delete;
+    PeerFlowWait& operator=(const PeerFlowWait&) = delete;
+    ~PeerFlowWait() {
+      // Publish a fresh transfer deadline before leaving the barrier state.
+      progress_.activity_generation_.fetch_add(1, std::memory_order_release);
+      progress_.waiting_for_peer_flows_.store(false, std::memory_order_release);
+    }
+    ReplicaFlowProgress& progress_;
+  };
+
+  bool WaitingForPeerFlows(unsigned flow) const {
+    return flows_[flow].waiting_for_peer_flows_.load(std::memory_order_acquire);
+  }
+
+  bycorf::Task<absl::Status> WaitSnapshotBarrier(
+      unsigned flow, bycorf::CoroutineBarrier& barrier) {
+    PeerFlowWait waiting(flows_[flow]);
+    co_return co_await barrier.Wait(*bycorf::ThisWorker().self_);
+  }
+
+  bycorf::Task<absl::Status> WaitSnapshotReady(unsigned flow) {
+    return WaitSnapshotBarrier(flow, snapshot_ready_);
   }
 
   void MarkSnapshotScanComplete() {
@@ -1600,16 +1627,16 @@ struct MasterSession {
            flows_.size();
   }
 
-  bycorf::CoroutineBarrier::Awaiter WaitSnapshotGateClosed() {
-    return snapshot_gate_closed_.Wait(*bycorf::ThisWorker().self_);
+  bycorf::Task<absl::Status> WaitSnapshotGateClosed(unsigned flow) {
+    return WaitSnapshotBarrier(flow, snapshot_gate_closed_);
   }
 
-  bycorf::CoroutineBarrier::Awaiter WaitSnapshotFenced() {
-    return snapshot_fenced_.Wait(*bycorf::ThisWorker().self_);
+  bycorf::Task<absl::Status> WaitSnapshotFenced(unsigned flow) {
+    return WaitSnapshotBarrier(flow, snapshot_fenced_);
   }
 
-  bycorf::CoroutineBarrier::Awaiter WaitSnapshotCaptureStopped() {
-    return snapshot_capture_stopped_.Wait(*bycorf::ThisWorker().self_);
+  bycorf::Task<absl::Status> WaitSnapshotCaptureStopped(unsigned flow) {
+    return WaitSnapshotBarrier(flow, snapshot_capture_stopped_);
   }
 
   void AbortSnapshotCut(const absl::Status& status) {
