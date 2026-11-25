@@ -668,11 +668,11 @@ absl::Status RegisteredBufferPool::Init(
     free_write_buffers_.push_back(static_cast<std::uint16_t>(i));
   // The fixed read arena and its descriptor/control storage stay charged even
   // when every lease is returned. Borrowing and coalescing change no charge.
-  buffer_memory_.Account(
-      worker.id() + 1,
-      registered_write_bytes + read_bytes +
-          read_metadata_.capacity() * sizeof(TlsfRangeAllocator::Metadata) +
-          sizeof(read_allocator_));
+  buffer_memory_.Account(worker.id() + 1,
+                         registered_write_bytes + read_bytes +
+                             read_metadata_.capacity() *
+                                 sizeof(bycorf::TlsfRangeAllocator::Metadata) +
+                             sizeof(read_allocator_));
   return absl::OkStatus();
 }
 

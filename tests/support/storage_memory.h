@@ -44,9 +44,9 @@ inline std::string WithStorageBaseline(std::uint64_t working_limit,
   const auto read_bytes =
       buffers.registered_bytes_ -
       buffers.storage_write_buffer_count_ * buffers.write_buffer_bytes_;
-  const auto arena_metadata =
-      read_bytes / buffers.alignment_ * sizeof(TlsfRangeAllocator::Metadata) +
-      sizeof(TlsfRangeAllocator);
+  const auto arena_metadata = read_bytes / buffers.alignment_ *
+                                  sizeof(bycorf::TlsfRangeAllocator::Metadata) +
+                              sizeof(bycorf::TlsfRangeAllocator);
   auto fixed_bytes =
       workers * (buffers.registered_bytes_ + 3 * storage::kStorageBlockBytes +
                  arena_metadata) +

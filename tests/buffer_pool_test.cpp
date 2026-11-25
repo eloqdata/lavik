@@ -674,8 +674,8 @@ TEST_F(BufferPoolMemlockTest, PreparedMaintenanceSurvivesWorkerInitialization) {
                 pool_->write_buffer_count() * options_.write_buffer_bytes_ +
                 pool_->read_capacity_bytes() +
                 pool_->read_capacity_bytes() / options_.alignment_ *
-                    sizeof(TlsfRangeAllocator::Metadata) +
-                sizeof(TlsfRangeAllocator));
+                    sizeof(bycorf::TlsfRangeAllocator::Metadata) +
+                sizeof(bycorf::TlsfRangeAllocator));
   worker_->Shutdown();
   worker_.reset();
   bycorf::MutableThisWorker() = saved_context_;
@@ -692,8 +692,8 @@ TEST_F(BufferPoolMemlockTest, AccountsArenaMetadataAndHeapOutputs) {
       pool_->write_buffer_count() * options_.write_buffer_bytes_ +
       pool_->read_capacity_bytes() +
       pool_->read_capacity_bytes() / options_.alignment_ *
-          sizeof(TlsfRangeAllocator::Metadata) +
-      sizeof(TlsfRangeAllocator) + 24 * kMiB;
+          sizeof(bycorf::TlsfRangeAllocator::Metadata) +
+      sizeof(bycorf::TlsfRangeAllocator) + 24 * kMiB;
   const auto fixed_total = baseline + fixed_bytes;
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total);
   EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
@@ -1393,8 +1393,8 @@ TEST_F(BufferPoolMemlockTest, MaintenanceRegistersAfterAllOrdinarySlots) {
             baseline + 24 * kMiB + 2 * options_.write_buffer_bytes_ +
                 pool_->read_capacity_bytes() +
                 pool_->read_capacity_bytes() / options_.alignment_ *
-                    sizeof(TlsfRangeAllocator::Metadata) +
-                sizeof(TlsfRangeAllocator));
+                    sizeof(bycorf::TlsfRangeAllocator::Metadata) +
+                sizeof(bycorf::TlsfRangeAllocator));
 }
 
 TEST_F(BufferPoolMemlockTest, AllFixedWorkspacesRegisterWithEnoughMemlock) {

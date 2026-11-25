@@ -28,11 +28,11 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "bycorf/base/tlsf_range_allocator.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/sync.h"
 #include "lavik/latency_diagnostics.h"
 #include "lavik/memory.h"
-#include "lavik/tlsf_range_allocator.h"
 
 namespace bycorf {
 class CrossCore;
@@ -536,8 +536,8 @@ class RegisteredBufferPool {
   bool write_acquisition_failed_ = false;
   bycorf::FixedBuffer read_arena_{};
   unsigned read_unit_shift_ = 12;
-  std::vector<TlsfRangeAllocator::Metadata> read_metadata_;
-  TlsfRangeAllocator read_allocator_;
+  std::vector<bycorf::TlsfRangeAllocator::Metadata> read_metadata_;
+  bycorf::TlsfRangeAllocator read_allocator_;
   std::deque<AcquireReadAwaiter*> read_waiters_;
   // Only ordinary-heap outputs are dynamic. Vacant IDs own no storage and are
   // reused after local or remote return; the backing arena never grows.

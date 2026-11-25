@@ -721,7 +721,7 @@ endif()
 # Microbenchmarks are opt-in build targets, independent of the server and tests.
 add_executable(lavik_tlsf_range_allocator_bench EXCLUDE_FROM_ALL
   microbench/tlsf_range_allocator_bench.cpp)
-target_include_directories(lavik_tlsf_range_allocator_bench PRIVATE include)
+target_include_directories(lavik_tlsf_range_allocator_bench PRIVATE "${LAVIK_BYCORF_SOURCE_DIR}/include")
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(lavik_tlsf_range_allocator_bench PRIVATE
     -Wall -Wextra -Wpedantic)
@@ -1822,7 +1822,7 @@ if (BUILD_TESTING)
   # The range allocator has no runtime/storage dependencies. Keep its tests
   # usable without initializing workers, io_uring, or the DMA environment.
   add_executable(lavik_tlsf_range_allocator_tests tests/tlsf_range_allocator_test.cpp)
-  target_include_directories(lavik_tlsf_range_allocator_tests PRIVATE include)
+  target_include_directories(lavik_tlsf_range_allocator_tests PRIVATE "${LAVIK_BYCORF_SOURCE_DIR}/include")
   target_link_libraries(lavik_tlsf_range_allocator_tests PRIVATE GTest::gtest_main)
   gtest_discover_tests(lavik_tlsf_range_allocator_tests
     PROPERTIES LABELS allocator TIMEOUT 30)

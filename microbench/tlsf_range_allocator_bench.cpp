@@ -31,11 +31,11 @@
 #include <string_view>
 #include <vector>
 
-#include "lavik/tlsf_range_allocator.h"
+#include "bycorf/base/tlsf_range_allocator.h"
 
 namespace {
 
-using Allocator = lavik::TlsfRangeAllocator;
+using Allocator = bycorf::TlsfRangeAllocator;
 using Allocation = Allocator::Allocation;
 constexpr std::uint32_t kCapacity = 8192;
 constexpr std::uint32_t kLive = 256;
