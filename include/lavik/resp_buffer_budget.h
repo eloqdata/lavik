@@ -23,7 +23,9 @@ struct ConnectionArgsStorage : CommandArgsStorage {
   friend class RespBufferBudget;
   TAILQ_ENTRY(ConnectionArgsStorage) review_link_;
   std::chrono::steady_clock::time_point review_at_;
-  std::size_t peak_bytes_ = 0;
+  // Capacity observed above the trim threshold in the current window.
+  // Inline slots need no review. Zero requests a new observation.
+  std::size_t active_capacity_ = CommandArgs::kInlineBytes;
 };
 
 // Each Data worker owns a deadline-ordered queue of its admitted allocations.
@@ -46,11 +48,17 @@ class alignas(64) RespBufferBudget {
 
   // Sample the actual packed bytes after a socket read round. Return true
   // only when the caller needs to start the worker's maintenance coroutine.
-  [[nodiscard]] bool Admit(ConnectionArgsStorage& slot) noexcept {
+  [[nodiscard, gnu::always_inline]] bool Admit(ConnectionArgsStorage& slot) noexcept {
     const auto capacity = slot.bytes.capacity();
+    if (capacity == slot.active_capacity_) return false;
+    return Observe(slot, capacity);
+  }
+
+ private:
+  [[gnu::noinline]] bool Observe(ConnectionArgsStorage& slot,
+                                 std::size_t capacity) noexcept {
     if (capacity == slot.retained_byte_capacity_) {
-      if (capacity > CommandArgs::kInlineBytes)
-        slot.peak_bytes_ = std::max(slot.peak_bytes_, slot.bytes.size());
+      if (slot.bytes.size() > capacity / 4) slot.active_capacity_ = capacity;
       return false;
     }
     Release(slot);
@@ -67,11 +75,12 @@ class alignas(64) RespBufferBudget {
     reservation->Commit(bytes);
     available_bytes_ -= bytes;
     slot.retained_byte_capacity_ = capacity;
-    slot.peak_bytes_ = slot.bytes.size();
+    slot.active_capacity_ = capacity;
     Schedule(slot, Clock::now());
     return !std::exchange(maintenance_running_, true);
   }
 
+ public:
   // Revoke retention only. A borrowed handle still owns every argument until
   // its release, which then discards the overflow through its normal path.
   void Release(ConnectionArgsStorage& slot) noexcept {
@@ -82,6 +91,7 @@ class alignas(64) RespBufferBudget {
     available_bytes_ += bytes;
     ReleaseRetainedMemory(CurrentMemoryAccountingShard(), bytes);
     slot.retained_byte_capacity_ = CommandArgs::kInlineBytes;
+    slot.active_capacity_ = CommandArgs::kInlineBytes;
   }
 
   // A zero delay ends maintenance until the next admission starts it again.
@@ -91,13 +101,13 @@ class alignas(64) RespBufferBudget {
     for (std::size_t i = 0; i < kReviewBatch; ++i) {
       auto* slot = TAILQ_FIRST(&queue_);
       if (!slot || (!drain && slot->review_at_ > now)) break;
-      if (drain || slot->peak_bytes_ <= slot->retained_byte_capacity_ / 4) {
+      if (drain || slot->active_capacity_ == 0) {
         Release(*slot);
         // Drop the empty allocation directly. A smaller active workload grows
         // to its new demand on the next request without copying old contents.
         if (!slot->borrowed()) slot->bytes.clear();
       } else {
-        slot->peak_bytes_ = 0;
+        slot->active_capacity_ = 0;
         TAILQ_REMOVE(&queue_, slot, review_link_);
         Schedule(*slot, now);
       }

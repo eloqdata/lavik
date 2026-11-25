@@ -428,8 +428,10 @@ inline void CommandArgsHandle::Reset() noexcept {
   if (slot == nullptr) return;
   if (slot->borrowed_) {
     slot->args.clear();
-    if (slot->bytes.capacity() == slot->retained_byte_capacity_) {
-      slot->bytes.resize(0);  // Abseil clear() releases heap storage.
+    if (slot->retained_byte_capacity_ != CommandArgs::kInlineBytes &&
+        slot->bytes.capacity() == slot->retained_byte_capacity_) {
+      // Erasing the contents keeps the admitted allocation.
+      slot->bytes.erase(slot->bytes.begin(), slot->bytes.end());
     } else {
       slot->bytes.clear();
     }
