@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/strings/ascii.h"
 #include "lavik/command.h"
 #include "lavik/glob.h"
 #include "lavik/resp.h"
@@ -45,6 +46,35 @@ using lavik::CommandSpec;
 using lavik::DetermineKeys;
 using lavik::FindCommand;
 using lavik::KeyIndexView;
+
+TEST(CommandTableTest, NameLookupReturnsTheDeclaredSpecInEverySpelling) {
+  for (const auto& spec : lavik::CommandSpecs()) {
+    SCOPED_TRACE(spec.name_);
+    EXPECT_EQ(FindCommand(spec.name_), &spec);
+    auto mixed = absl::AsciiStrToUpper(spec.name_);
+    EXPECT_EQ(FindCommand(mixed), &spec);
+    for (std::size_t i = 1; i < mixed.size(); i += 2)
+      mixed[i] = absl::ascii_tolower(mixed[i]);
+    EXPECT_EQ(FindCommand(mixed), &spec);
+  }
+  EXPECT_EQ(FindCommand("MGEZ"), nullptr);
+  EXPECT_EQ(FindCommand("MGE"), nullptr);
+  EXPECT_EQ(FindCommand(std::string_view("MGE\0", 4)), nullptr);
+  EXPECT_EQ(FindCommand("\xffGT"), nullptr);
+  EXPECT_EQ(FindCommand("sort\x7fro"), nullptr);
+}
+
+TEST(CommandTableTest, FunctionAccessDependsOnTheSubcommand) {
+  const auto* function = FindCommand("FUNCTION");
+  ASSERT_NE(function, nullptr);
+  const lavik::CommandArgs inspect{"FuNcTiOn", "LiSt"};
+  const auto* read = FindCommand(inspect);
+  ASSERT_NE(read, nullptr);
+  EXPECT_EQ(read->kind_, function->kind_);
+  EXPECT_NE(read->flags_ & lavik::kCmdReadOnly, 0u);
+  const lavik::CommandArgs mutate{"FuNcTiOn", "LoAd"};
+  EXPECT_EQ(FindCommand(mutate), function);
+}
 
 TEST(CommandTableTest, CanonicalIdentitiesPreserveAliasesAndUnknown) {
   for (const auto& spec : lavik::CommandSpecs()) {
