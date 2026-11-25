@@ -342,6 +342,36 @@ TEST(RespParserTest, EnforcesConfiguredQueryBufferLimitAcrossFragments) {
             "client request exceeds the query buffer limit");
 }
 
+TEST(RespParserTest, ResumesAtEverySplitOfAMultidigitLength) {
+  const std::string header = "*1\r\n$1024\r\n";
+  const std::string value(1024, 'v');
+  const std::string wire = header + value + "\r\n";
+  for (std::size_t split = 5; split <= header.size(); ++split) {
+    SCOPED_TRACE(split);
+    RespCommandParser parser;
+    auto first = parser.Parse(std::string_view(wire).substr(0, split));
+    ASSERT_EQ(first.state_, RespParseState::kNeedMoreData);
+    // A trailing CR stays in the input until its LF arrives.
+    ASSERT_EQ(first.consumed_, split - (wire[split - 1] == '\r'));
+    auto rest = parser.Parse(std::string_view(wire).substr(first.consumed_));
+    ASSERT_EQ(rest.state_, RespParseState::kOk) << rest.status_;
+    EXPECT_EQ(first.consumed_ + rest.consumed_, wire.size());
+    EXPECT_EQ(rest.command_.args_, (CommandArgs{value}));
+  }
+}
+
+TEST(RespParserTest, ReportsConsumedOffsetInsideMultidigitLength) {
+  constexpr std::string_view header = "*1\r\n$1024\r\n";
+  for (std::size_t limit = 5; limit < header.size(); ++limit) {
+    RespCommandParser parser(limit);
+    auto result = parser.Parse(header);
+    EXPECT_EQ(result.status_.code(), absl::StatusCode::kResourceExhausted)
+        << limit;
+    // Digits are consumed individually and the final CRLF is consumed together.
+    EXPECT_EQ(result.consumed_, limit < 9 ? limit + 1 : header.size()) << limit;
+  }
+}
+
 TEST(RespParserTest, ReportsConsumedOffsetAtBulkFramingLimits) {
   constexpr std::string_view request = "*1\r\n$1\r\nx\r\n";
   // The length parser consumes the digit, then CRLF as a pair. The payload

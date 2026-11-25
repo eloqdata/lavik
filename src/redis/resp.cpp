@@ -41,6 +41,20 @@ constexpr std::size_t kDirectBulkThreshold = 32 * 1024;
 constexpr std::size_t kDirectBulkReservation = 1024 * 1024;
 constexpr std::size_t kDirectBulkReadBytes = 256 * 1024;
 constexpr std::size_t kMaxLengthTextBytes = 32;
+
+// Return the wire size only for a complete, valid length at the start of
+// input. Bound the numeric scan even when the line terminator hasn't arrived.
+std::size_t CompleteLength(std::string_view input, long long& parsed) {
+  const char* first = input.data();
+  const auto [end, error] = std::from_chars(
+      first, first + std::min(input.size(), kMaxLengthTextBytes), parsed);
+  const auto digits = static_cast<std::size_t>(end - first);
+  if (error != std::errc{} || parsed < 0 || input.size() - digits < 2 ||
+      end[0] != '\r' || end[1] != '\n')
+    return 0;
+  return digits + 2;
+}
+
 absl::Status AppendArgument(CommandArgs* output, std::string_view value) {
   try {
     output->AppendLast(value);
@@ -302,86 +316,77 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
       case State::kArrayLength:
       case State::kBulkLength: {
         const bool array_length = state_ == State::kArrayLength;
-        while (pos < input.size()) {
-          const char value = input[pos];
-          if (value == '\r') {
-            if (pos + 1 == input.size()) {
-              result.consumed_ = pos;
-              return result;
-            }
-            if (input[pos + 1] != '\n') {
-              return Error(
-                  absl::InvalidArgumentError(
-                      array_length ? "invalid RESP array length"
-                                   : "invalid RESP bulk string length"),
-                  pos);
-            }
-            if (!consume(2)) {
-              return Error(absl::ResourceExhaustedError(
-                               "client request exceeds the query buffer limit"),
-                           pos);
-            }
-
-            long long parsed = 0;
-            const auto [end, error] = std::from_chars(
-                length_text_.data(), length_text_.data() + length_text_.size(),
-                parsed);
-            if (length_text_.empty() || error != std::errc{} ||
-                end != length_text_.data() + length_text_.size() ||
-                parsed < 0) {
-              return Error(
-                  absl::InvalidArgumentError(
-                      array_length ? "invalid RESP array length"
-                                   : "invalid RESP bulk string length"),
-                  pos);
-            }
-            length_text_.clear();
-
-            if (array_length) {
-              if (parsed > kMaxArrayLen) {
-                return Error(
-                    absl::InvalidArgumentError("invalid RESP array length"),
-                    pos);
-              }
-              if (parsed == 0) {
-                ResetCommand();
-                break;
-              }
-              arguments_remaining_ = static_cast<std::size_t>(parsed);
-              auto& args = Arguments();
-              const auto desired =
-                  std::min(arguments_remaining_, kInitialArgCapacity);
-              if (desired > args.capacity()) [[unlikely]] {
-                absl::Status reserved = ReserveArguments(&args, desired);
-                if (!reserved.ok()) return Error(reserved, pos);
-              }
-              state_ = State::kArgumentStart;
-            } else {
-              if (parsed > static_cast<long long>(kMaxBulkLen) ||
-                  static_cast<unsigned long long>(parsed) >
-                      command_.args_.Get().bytes.max_size()) {
-                return Error(
-                    absl::OutOfRangeError("RESP bulk string too large"), pos);
-              }
-              bulk_remaining_ = static_cast<std::size_t>(parsed);
-              assert(bulk_prepared_ == 0);
-              assert(command_.args_.back().empty());
-              state_ = State::kBulkData;
-            }
-            break;
-          }
-          if (value == '\n' || length_text_.size() >= kMaxLengthTextBytes) {
+        long long parsed = 0;
+        const auto header = length_text_.empty()
+                                ? CompleteLength(input.substr(pos), parsed)
+                                : 0;
+        if (header && Account(header)) {
+          pos += header;
+        } else {
+          // Preserve partial digits across reads and consume bytes in their
+          // original order for malformed headers or query-limit errors.
+          const auto invalid_length = [&] {
             return Error(absl::InvalidArgumentError(
                              array_length ? "invalid RESP array length"
                                           : "invalid RESP bulk string length"),
                          pos);
+          };
+          while (pos < input.size() && input[pos] != '\r') {
+            if (input[pos] == '\n' ||
+                length_text_.size() >= kMaxLengthTextBytes)
+              return invalid_length();
+            length_text_.push_back(input[pos]);
+            if (!consume(1))
+              return Error(absl::ResourceExhaustedError(
+                               "client request exceeds the query buffer limit"),
+                           pos);
           }
-          length_text_.push_back(value);
-          if (!consume(1)) {
+          if (input.size() - pos < 2) {
+            result.consumed_ = pos;
+            return result;
+          }
+          if (input[pos + 1] != '\n') return invalid_length();
+          if (!consume(2))
             return Error(absl::ResourceExhaustedError(
                              "client request exceeds the query buffer limit"),
                          pos);
+          const char* last = length_text_.data() + length_text_.size();
+          const auto [end, error] =
+              std::from_chars(length_text_.data(), last, parsed);
+          if (error != std::errc{} || end != last || parsed < 0)
+            return invalid_length();
+          length_text_.clear();
+        }
+
+        if (array_length) {
+          if (parsed > kMaxArrayLen) {
+            return Error(
+                absl::InvalidArgumentError("invalid RESP array length"), pos);
           }
+          if (parsed == 0) {
+            ResetCommand();
+            break;
+          }
+          arguments_remaining_ = static_cast<std::size_t>(parsed);
+          auto& args = Arguments();
+          const auto desired =
+              std::min(arguments_remaining_, kInitialArgCapacity);
+          if (desired > args.capacity()) [[unlikely]] {
+            absl::Status reserved = ReserveArguments(&args, desired);
+            if (!reserved.ok()) return Error(reserved, pos);
+          }
+          state_ = State::kArgumentStart;
+        } else {
+          if (parsed > static_cast<long long>(kMaxBulkLen) ||
+              static_cast<unsigned long long>(parsed) >
+                  command_.args_.Get().bytes.max_size()) {
+            return Error(absl::OutOfRangeError("RESP bulk string too large"),
+                         pos);
+          }
+          bulk_remaining_ = static_cast<std::size_t>(parsed);
+          assert(bulk_prepared_ == 0);
+          assert(command_.args_.back().empty());
+          state_ = State::kBulkData;
         }
         break;
       }
