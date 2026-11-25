@@ -154,7 +154,7 @@ void RespCommandParser::ResetCommand() {
   state_ = State::kArrayStart;
   length_text_.clear();
   // A completed command has already transferred its handle. An abandoned
-  // command releases its storage and both packed buffers' overflow heaps.
+  // command returns its argument handle through the same release path.
   command_.args_.Reset();
   arguments_remaining_ = 0;
   bulk_remaining_ = 0;

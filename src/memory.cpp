@@ -287,16 +287,12 @@ std::uint64_t AdmissionMemoryLimit() noexcept {
 constexpr std::uint64_t kMinimumClientBufferBytes = 128 * 1024;
 
 std::uint64_t EffectiveClientBufferLimit(std::uint64_t maximum) noexcept {
-  const std::uint64_t configured =
-      g_client_buffer_limit_value.load(std::memory_order_relaxed);
-  if (configured == 0) return 0;
-  std::uint64_t bytes = configured;
-  if (g_client_buffer_limit_percentage.load(std::memory_order_relaxed)) {
-    // configured is at most 100, so splitting the multiplication preserves
-    // the exact floor(maximum * percentage / 100) without overflow.
-    bytes = maximum / 100 * configured + maximum % 100 * configured / 100;
-  }
-  return std::max(bytes, kMinimumClientBufferBytes);
+  const ClientBufferLimit limit{
+      g_client_buffer_limit_value.load(std::memory_order_relaxed),
+      g_client_buffer_limit_percentage.load(std::memory_order_relaxed)};
+  return limit.value_
+             ? std::max(limit.Bytes(maximum), kMinimumClientBufferBytes)
+             : 0;
 }
 
 void UpdatePeak(std::uint64_t current) noexcept {
@@ -358,6 +354,13 @@ absl::Status RecoveryMemoryBudget::Finish() {
         g_memory_gauges.max_bytes_.store(1, std::memory_order_relaxed);
       });
   return absl::OkStatus();
+}
+
+std::uint64_t ClientBufferLimit::WorkerShare(std::uint64_t maximum,
+                                             unsigned worker,
+                                             unsigned workers) const noexcept {
+  assert(worker < workers);
+  return DistributedShare(Bytes(maximum), worker, workers);
 }
 
 absl::Status InitMemoryLimit(std::uint64_t configured_max_bytes,

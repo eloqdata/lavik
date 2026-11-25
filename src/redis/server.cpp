@@ -57,6 +57,7 @@
 #if BYCORF_KERNEL_BYPASS
 #include "bycorf/io/dpdk_backend.h"
 #endif
+#include "absl/cleanup/cleanup.h"
 #include "bycorf/io/spdk_storage.h"
 #include "bycorf/net/server.h"
 #include "bycorf/net/tcp_service.h"
@@ -81,6 +82,7 @@
 #include "lavik/rdb.h"
 #include "lavik/replication.h"
 #include "lavik/resp.h"
+#include "lavik/resp_buffer_budget.h"
 #include "lavik/session.h"
 #include "lavik/slowlog.h"
 #include "lavik/storage/engine.h"
@@ -462,7 +464,8 @@ class RedisService final : public TcpService, public ClientLimit {
                long online_mimalloc_purge_delay_ms,
                std::string_view requirepass, std::string load_rdb_file,
                std::uint64_t max_clients,
-               std::size_t client_query_buffer_limit_bytes)
+               std::size_t client_query_buffer_limit_bytes,
+               ClientBufferLimit resp_buffer_cache_limit)
       : TcpService(port),
         storage_(storage),
         replication_(replication),
@@ -471,7 +474,8 @@ class RedisService final : public TcpService, public ClientLimit {
         authenticator_(requirepass),
         load_rdb_file_(std::move(load_rdb_file)),
         max_clients_(max_clients),
-        client_query_buffer_limit_bytes_(client_query_buffer_limit_bytes) {}
+        client_query_buffer_limit_bytes_(client_query_buffer_limit_bytes),
+        resp_buffer_cache_limit_(resp_buffer_cache_limit) {}
 
   void Prepare(unsigned thread_count) override;
   Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
@@ -526,6 +530,7 @@ class RedisService final : public TcpService, public ClientLimit {
       std::optional<absl::Status>* deferred_read_error);
   Task<absl::Status> ImportRdb();
   Task<absl::Status> MonitorRuntimeHealth(Worker& worker);
+  Task<absl::Status> TrimRespBuffers(Worker& worker, RespBufferBudget& budget);
 
   class RequestGuard {
    public:
@@ -560,6 +565,7 @@ class RedisService final : public TcpService, public ClientLimit {
   std::atomic<std::uint64_t> max_clients_;
   // Loaded once per socket-read parsing round, not once per RESP token.
   std::atomic<std::size_t> client_query_buffer_limit_bytes_;
+  const ClientBufferLimit resp_buffer_cache_limit_;
   std::atomic<std::uint64_t> active_clients_{0};
   std::unique_ptr<CoroutineBarrier> recovery_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_collect_barrier_;
@@ -582,6 +588,7 @@ class RedisService final : public TcpService, public ClientLimit {
   // result without making a worker take a mutex. Neither flag is reset.
   absl::Status replication_quiesce_status_;
   RequestGate request_gate_;
+  std::unique_ptr<RespBufferBudget[]> resp_buffer_budgets_;
   Server* server_ = nullptr;
 };
 
@@ -651,6 +658,12 @@ void RedisService::Prepare(unsigned thread_count) {
   // barrier. Global data-worker IDs remain the contiguous prefix [0, N).
   thread_count = storage_->worker_count();
   request_gate_.Prepare(thread_count);
+  resp_buffer_budgets_ = std::make_unique<RespBufferBudget[]>(thread_count);
+  const auto maximum = GetMemoryStats().max_bytes_;
+  for (unsigned worker = 0; worker < thread_count; ++worker) {
+    resp_buffer_budgets_[worker].SetLimit(
+        resp_buffer_cache_limit_.WorkerShare(maximum, worker, thread_count));
+  }
   PrepareMonitor(thread_count);
   PreparePubSub(thread_count);
   recovery_ready_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
@@ -1370,6 +1383,24 @@ bool ShutdownRequested() {
   return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
+Task<absl::Status> RedisService::TrimRespBuffers(Worker& worker,
+                                                 RespBufferBudget& budget) {
+  while (!worker.stop_requested()) {
+    const auto delay = budget.Review(RespBufferBudget::Clock::now());
+    if (delay == RespBufferBudget::Clock::duration::zero()) break;
+    auto status = co_await bycorf::SleepFor(worker, delay);
+    if (!status.ok()) {
+      while (!worker.stop_requested() &&
+             budget.Review(RespBufferBudget::Clock::now(), /*drain=*/true) !=
+                 RespBufferBudget::Clock::duration::zero()) {
+        co_await bycorf::Yield(worker);
+      }
+      co_return status;
+    }
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
   bool storage_failure_handled = false;
   bool replication_quiesce_handled = false;
@@ -1437,6 +1468,10 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
 Task<absl::Status> RedisService::Serve(TcpStream stream) {
   static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
+  auto& budget = resp_buffer_budgets_[ThisWorker().id_];
+  absl::Cleanup release_buffer_credit = [&] {
+    budget.Release(ctx.command_args_storage_);
+  };
   ctx.hello_authenticator_ = &authenticator_;
   ctx.hello_replication_ = replication_;
   ctx.hello_handler_ = &ExecuteHelloFromContext;
@@ -1654,6 +1689,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
 
   // Serve waits for this reader to finish before reusing the connection's
   // builder. The writer consumes owned queue entries, never this buffer.
+  auto& budget = resp_buffer_budgets_[ThisWorker().id_];
   ReplyBuilder& builder = ctx.reply_builder_;
   auto enqueue_command_reply = [&](CommandReply reply) -> Task<absl::Status> {
     if (reply.disk_value_.valid()) {
@@ -1693,6 +1729,10 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
             stream, input, parser, ready, client_buffers,
             &client_query_buffer_limit_bytes_, unassigned_input_bytes,
             deferred_read_error);
+        if (budget.Admit(ctx.command_args_storage_)) {
+          auto& worker = *ThisWorker().self_;
+          worker.SpawnBackground(TrimRespBuffers(worker, budget));
+        }
       }
     }
     if (!read_status.ok()) {
@@ -1899,6 +1939,7 @@ Task<absl::Status> RedisService::HandoffReplicationConnection(
 
 Task<absl::Status> RedisService::Serve(TcpStream& stream,
                                        ConnectionContext& ctx) {
+  auto& budget = resp_buffer_budgets_[ThisWorker().id_];
   RequestInputBuffer input(stream);
   RespCommandParser parser(client_query_buffer_limit(),
                            &ctx.command_args_storage_);
@@ -1926,6 +1967,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
             stream, &input, &parser, &ready, &client_buffers,
             &client_query_buffer_limit_bytes_, &unassigned_input_bytes,
             &deferred_read_error);
+        if (budget.Admit(ctx.command_args_storage_)) {
+          auto& worker = *ThisWorker().self_;
+          worker.SpawnBackground(TrimRespBuffers(worker, budget));
+        }
       }
       if (!read_status.ok()) [[unlikely]] {
         if (read_status.code() == absl::StatusCode::kUnavailable) [[unlikely]] {
@@ -2403,7 +2448,7 @@ int RunServer(ServerOptions options) {
       "storage_read_buffer_bytes={} "
       "record_crc={} "
       "replication_publish_queue_bytes={} per worker max_memory={} "
-      "maxmemory_clients={} "
+      "maxmemory_clients={} resp_buffer_cache_limit={} "
       "client_query_buffer_limit={} "
       "flush_max_ms={} "
       "flush_size_bytes={} "
@@ -2422,6 +2467,7 @@ int RunServer(ServerOptions options) {
       options.record_crc_, options.replication_publish_queue_bytes_,
       options.max_memory_bytes_,
       FormatClientBufferLimit(options.maxmemory_clients_),
+      FormatClientBufferLimit(options.resp_buffer_cache_limit_),
       options.client_query_buffer_limit_bytes_, options.flush_max_ms_,
       options.flush_size_bytes_, options.defrag_max_active_per_device_,
       options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
@@ -2638,7 +2684,8 @@ int RunServer(ServerOptions options) {
   RedisService redis(options.port_, &storage, &replication, &recovery_memory,
                      options.mimalloc_purge_delay_ms_, options.requirepass_,
                      std::move(options.load_rdb_file_), options.max_clients_,
-                     options.client_query_buffer_limit_bytes_);
+                     options.client_query_buffer_limit_bytes_,
+                     options.resp_buffer_cache_limit_);
   InitClientLimit(&redis);
   if (tls_server_context != nullptr) {
     redis.AddTlsEndpoint(options.tls_port_, std::move(tls_server_context));

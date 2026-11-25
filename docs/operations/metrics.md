@@ -286,6 +286,16 @@ consume that reservation as data arrives. Unread reservations are released
 when the connection closes. The quota tracks received and reserved request
 bytes, not allocator capacity or exact heap usage.
 
+`--resp-buffer-cache-limit` caps the packed RESP argument capacity that
+connections may keep for later requests. The startup option accepts an
+absolute size such as `64mb` or a percentage of effective `--max-memory`.
+It defaults to `1%`. Setting it to `0` disables retention. The same name without the dashes
+is accepted in a Redis-style configuration file. Each Data worker receives
+a fixed share of the process cap. Retention also consumes the ordinary
+retained-memory budget. If either admission fails, the command can still use
+its temporary buffer under the normal request limits. Existing hot buffers
+keep their credit and idle or underused capacity ages out.
+
 `--client-query-buffer-limit` is the independent per-connection hard limit for
 an incomplete command. It accepts an absolute Redis-style memory size, defaults
 to `1gb`, and must be at least `1mb`. The same

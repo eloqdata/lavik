@@ -191,7 +191,8 @@ class CommandArgs {
   }
 
   absl::InlinedVector<OffsetAndLength, 8> args;
-  absl::InlinedVector<char, 256> bytes;
+  static constexpr std::size_t kInlineBytes = 256;
+  absl::InlinedVector<char, kInlineBytes> bytes;
 
   [[gnu::always_inline]] operator CommandArgsView() const {
     return {args, bytes.data()};
@@ -295,6 +296,12 @@ class CommandArgsHandle;
 // object; concurrent commands own separate heap objects. Parsing may grow
 // buffers; completed requests are read-only.
 struct CommandArgsStorage : CommandArgs {
+  // Only this exact capacity may survive handle release. The Data worker
+  // updates it after admission. Standalone slots keep only inline storage.
+  std::size_t retained_byte_capacity_ = kInlineBytes;
+  // Maintenance must leave a live parser, dispatched request or MULTI handle
+  // in exclusive control of its bytes.
+  bool borrowed() const noexcept { return borrowed_; }
   CommandArgsStorage() = default;
   ~CommandArgsStorage() { assert(!borrowed_); }
   CommandArgsStorage(const CommandArgsStorage&) = delete;
@@ -348,9 +355,8 @@ class CommandArgsHandle {
     storage.borrowed_ = true;
     return CommandArgsHandle(&storage);
   }
-  // Clears borrowed storage (including both overflow heaps), or deletes an
-  // independently owned object. Additional pipeline/MULTI objects are not
-  // cached.
+  // Returns the embedded slot to its connection. Independently owned
+  // pipeline and MULTI arguments are destroyed with their handle.
   void Reset() noexcept;
   [[gnu::always_inline]] bool HasStorage() const noexcept {
     return storage_ != nullptr;
@@ -421,7 +427,14 @@ inline void CommandArgsHandle::Reset() noexcept {
   auto* slot = std::exchange(storage_, nullptr);
   if (slot == nullptr) return;
   if (slot->borrowed_) {
-    slot->clear();
+    slot->args.clear();
+    if (slot->retained_byte_capacity_ != CommandArgs::kInlineBytes &&
+        slot->bytes.capacity() == slot->retained_byte_capacity_) {
+      // Erasing the contents keeps the admitted allocation.
+      slot->bytes.erase(slot->bytes.begin(), slot->bytes.end());
+    } else {
+      slot->bytes.clear();
+    }
     slot->borrowed_ = false;
   } else {
     delete slot;

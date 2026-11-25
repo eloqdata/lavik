@@ -339,7 +339,7 @@ absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(
     const std::string_view number = text.substr(0, text.size() - 1);
     if (number.empty()) {
       return absl::InvalidArgumentError(
-          "maxmemory-clients percentage must not be empty");
+          "client buffer limit percentage must not be empty");
     }
     std::uint64_t percentage = 0;
     const auto parsed = std::from_chars(
@@ -347,7 +347,7 @@ absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(
     if (parsed.ec != std::errc{} ||
         parsed.ptr != number.data() + number.size() || percentage > 100) {
       return absl::InvalidArgumentError(
-          "maxmemory-clients percentage must be between 0% and 100%");
+          "client buffer limit percentage must be between 0% and 100%");
     }
     return ClientBufferLimit{.value_ = percentage, .percentage_ = true};
   }
@@ -472,11 +472,15 @@ absl::Status ApplyRedisConfigDirective(
     options->cpu_ids_ = std::move(cpus);
     return absl::OkStatus();
   }
-  if (name == "maxmemory-clients") {
+  if (name == "maxmemory-clients" || name == "resp-buffer-cache-limit") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto limit = ParseClientBufferLimit(directive[1]);
     if (!limit.ok()) return limit.status();
-    options->maxmemory_clients_ = *limit;
+    if (name == "maxmemory-clients") {
+      options->maxmemory_clients_ = *limit;
+    } else {
+      options->resp_buffer_cache_limit_ = *limit;
+    }
     return absl::OkStatus();
   }
   if (name == "client-query-buffer-limit") {
@@ -677,6 +681,10 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   }
   if (options.max_clients_ == 0) {
     return absl::InvalidArgumentError("maxclients must be nonzero");
+  }
+  if (options.resp_buffer_cache_limit_.percentage_ &&
+      options.resp_buffer_cache_limit_.value_ > 100) {
+    return absl::InvalidArgumentError("resp-buffer-cache-limit exceeds 100%");
   }
   if (options.client_query_buffer_limit_bytes_ <
           kMinimumClientQueryBufferLimit ||

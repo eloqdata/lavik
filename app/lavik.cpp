@@ -62,6 +62,8 @@ int main(int argc, char** argv) {
       static_cast<unsigned>(options.storage_read_buffer_bytes_ / 1024ULL);
   std::string maxmemory_clients =
       lavik::FormatClientBufferLimit(options.maxmemory_clients_);
+  std::string resp_buffer_cache_limit =
+      lavik::FormatClientBufferLimit(options.resp_buffer_cache_limit_);
   std::string client_query_buffer_limit =
       std::to_string(options.client_query_buffer_limit_bytes_);
   unsigned flush_size_kb = 128;
@@ -295,6 +297,10 @@ int main(int argc, char** argv) {
   app.add_option("--maxmemory-clients", maxmemory_clients,
                  "Ordinary client request-buffer limit (bytes or percentage)")
       ->capture_default_str();
+  app.add_option("--resp-buffer-cache-limit", resp_buffer_cache_limit,
+                 "Retained RESP argument buffer cap (bytes or percent of "
+                 "max-memory, 0 disables reuse)")
+      ->capture_default_str();
   app.add_option("--client-query-buffer-limit", client_query_buffer_limit,
                  "Per-connection request-buffer hard limit")
       ->capture_default_str();
@@ -375,6 +381,14 @@ int main(int argc, char** argv) {
     return 2;
   }
   options.maxmemory_clients_ = *parsed_client_limit;
+  auto parsed_cache_limit =
+      lavik::ParseClientBufferLimit(resp_buffer_cache_limit);
+  if (!parsed_cache_limit.ok()) {
+    std::cerr << "Invalid --resp-buffer-cache-limit: "
+              << parsed_cache_limit.status().message() << '\n';
+    return 2;
+  }
+  options.resp_buffer_cache_limit_ = *parsed_cache_limit;
   auto parsed_query_buffer_limit =
       lavik::ParseClientQueryBufferLimit(client_query_buffer_limit);
   if (!parsed_query_buffer_limit.ok()) {

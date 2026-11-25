@@ -1,0 +1,135 @@
+/*
+ * Copyright (C) 2026 EloqData Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include <sys/queue.h>
+
+#include <algorithm>
+#include <chrono>
+#include <utility>
+
+#include "lavik/command_args.h"
+#include "lavik/memory.h"
+
+namespace lavik {
+
+// Only the embedded connection slot can retain an allocation across commands.
+// Independent pipeline and MULTI storage never enters the maintenance queue.
+struct ConnectionArgsStorage : CommandArgsStorage {
+ private:
+  friend class RespBufferBudget;
+  TAILQ_ENTRY(ConnectionArgsStorage) review_link_;
+  std::chrono::steady_clock::time_point review_at_;
+  // Capacity observed above the trim threshold in the current window.
+  // Inline slots need no review. Zero requests a new observation.
+  std::size_t active_capacity_ = CommandArgs::kInlineBytes;
+};
+
+// Each Data worker owns a deadline-ordered queue of its admitted allocations.
+// The queue links live in the connections so disconnect can unlink in O(1).
+class alignas(64) RespBufferBudget {
+ public:
+  using Clock = std::chrono::steady_clock;
+  static constexpr auto kWindow = std::chrono::seconds(1);
+  static constexpr std::size_t kReviewBatch = 64;
+
+  RespBufferBudget() noexcept { TAILQ_INIT(&queue_); }
+  RespBufferBudget(const RespBufferBudget&) = delete;
+  RespBufferBudget& operator=(const RespBufferBudget&) = delete;
+
+  // Install this worker's cache share during service preparation.
+  void SetLimit(std::uint64_t bytes) noexcept {
+    assert(TAILQ_EMPTY(&queue_));
+    available_bytes_ = bytes;
+  }
+
+  // Sample the actual packed bytes after a socket read round. Return true
+  // only when the caller needs to start the worker's maintenance coroutine.
+  [[nodiscard, gnu::always_inline]] bool Admit(
+      ConnectionArgsStorage& slot) noexcept {
+    const auto capacity = slot.bytes.capacity();
+    if (capacity == slot.active_capacity_) return false;
+    return Observe(slot, capacity);
+  }
+
+ private:
+  [[gnu::noinline]] bool Observe(ConnectionArgsStorage& slot,
+                                 std::size_t capacity) noexcept {
+    if (capacity == slot.retained_byte_capacity_) {
+      if (slot.bytes.size() > capacity / 4) slot.active_capacity_ = capacity;
+      return false;
+    }
+    Release(slot);
+    // A still-borrowed buffer marked for trimming must not regain its old
+    // credit just because a small command or fragment is seen again.
+    if (capacity <= CommandArgs::kInlineBytes ||
+        slot.bytes.size() <= capacity / 4)
+      return false;
+    if (capacity > available_bytes_) return false;
+    const auto bytes = AllocatorUsableSizeForRequest(capacity);
+    if (bytes > available_bytes_) return false;
+    auto reservation = TryReserveMemory(bytes);
+    if (!reservation) return false;
+    reservation->Commit(bytes);
+    available_bytes_ -= bytes;
+    slot.retained_byte_capacity_ = capacity;
+    slot.active_capacity_ = capacity;
+    Schedule(slot, Clock::now());
+    return !std::exchange(maintenance_running_, true);
+  }
+
+ public:
+  // Revoke retention only. A borrowed handle still owns every argument until
+  // its release, which then discards the overflow through its normal path.
+  void Release(ConnectionArgsStorage& slot) noexcept {
+    if (slot.retained_byte_capacity_ == CommandArgs::kInlineBytes) return;
+    TAILQ_REMOVE(&queue_, &slot, review_link_);
+    const auto bytes =
+        AllocatorUsableSizeForRequest(slot.retained_byte_capacity_);
+    available_bytes_ += bytes;
+    ReleaseRetainedMemory(CurrentMemoryAccountingShard(), bytes);
+    slot.retained_byte_capacity_ = CommandArgs::kInlineBytes;
+    slot.active_capacity_ = CommandArgs::kInlineBytes;
+  }
+
+  // A zero delay ends maintenance until the next admission starts it again.
+  // If a timer fails, drain outstanding cache credits in background batches.
+  // Bound each pass, including when many connections went idle together.
+  Clock::duration Review(Clock::time_point now, bool drain = false) noexcept {
+    for (std::size_t i = 0; i < kReviewBatch; ++i) {
+      auto* slot = TAILQ_FIRST(&queue_);
+      if (!slot || (!drain && slot->review_at_ > now)) break;
+      if (drain || slot->active_capacity_ == 0) {
+        Release(*slot);
+        // Drop the empty allocation directly. A smaller active workload grows
+        // to its new demand on the next request without copying old contents.
+        if (!slot->borrowed()) slot->bytes.clear();
+      } else {
+        slot->active_capacity_ = 0;
+        TAILQ_REMOVE(&queue_, slot, review_link_);
+        Schedule(*slot, now);
+      }
+    }
+    if (auto* next = TAILQ_FIRST(&queue_)) {
+      // Leave room for foreground work between overdue batches.
+      return std::max<Clock::duration>(std::chrono::milliseconds(10),
+                                       next->review_at_ - now);
+    }
+    maintenance_running_ = false;
+    return Clock::duration::zero();
+  }
+
+ private:
+  void Schedule(ConnectionArgsStorage& slot, Clock::time_point now) noexcept {
+    slot.review_at_ = now + kWindow;
+    TAILQ_INSERT_TAIL(&queue_, &slot, review_link_);
+  }
+  TAILQ_HEAD(, ConnectionArgsStorage) queue_;
+  bool maintenance_running_ = false;
+  std::uint64_t available_bytes_ = 0;
+};
+
+}  // namespace lavik

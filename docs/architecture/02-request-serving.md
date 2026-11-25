@@ -158,8 +158,13 @@ racing closure is either rejected or remains visible to the drain.
    borrows it when free; commands retained concurrently by a pipeline or MULTI
    own additional independent objects. Queueing and request handoff transfer
    handles without relocating arguments. Completion or abandonment clears the
-   embedded object's buffers and releases their overflow heaps, or deletes an
-   additional object outright; connections keep no cache of extra objects.
+   embedded slot or deletes an additional object outright. The connection
+   may retain its packed byte capacity across requests subject to its Data
+   worker's retained-memory admission and its share of `resp-buffer-cache-limit`.
+   The cache has its own quota independent of in-flight request bytes. A failed
+   cache admission leaves the current request usable through completion.
+   Worker-local maintenance samples peak demand and reclaims idle or underused
+   capacity in bounded batches. A live handle keeps its bytes through completion.
    The connection outlives every handle borrowing its embedded storage,
    including queued MULTI commands. Cross-worker execution borrows the request
    until the originating worker's await completes, so releasing arguments needs
