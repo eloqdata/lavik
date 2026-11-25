@@ -22,6 +22,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <ranges>
 
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
@@ -590,14 +591,16 @@ static_assert(std::size(kCommandTable) <=
 constexpr auto kNameIndex = [] {
   CommandNameIndex index;
   for (const auto& spec : kCommandTable) {
-    ++index.offsets[NameGroup(spec.name_.front(), spec.name_.size()) + 1];
+    ++index.offsets[NameGroup(spec.name_.front(), spec.name_.size())];
   }
   std::partial_sum(index.offsets.begin(), index.offsets.end(),
                    index.offsets.begin());
-  auto next = index.offsets;
-  for (const auto& spec : kCommandTable) {
-    auto& slot = next[NameGroup(spec.name_.front(), spec.name_.size())];
-    index.candidates[slot++] = {spec.name_.data() + 1, &spec};
+  // Prefix sums give exclusive ends. Filling backwards turns each end into
+  // its group's start while preserving declaration order within the group.
+  for (const auto& spec : std::views::reverse(kCommandTable)) {
+    auto& offset =
+        index.offsets[NameGroup(spec.name_.front(), spec.name_.size())];
+    index.candidates[--offset] = {spec.name_.data() + 1, &spec};
   }
   return index;
 }();
