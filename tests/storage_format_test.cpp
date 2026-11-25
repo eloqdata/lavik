@@ -517,16 +517,40 @@ TEST(StorageFormatTest, ComputesRedisClusterSlotsAndHashTags) {
   EXPECT_EQ(RedisSlot("{user1000}.following"), 3'443);
   EXPECT_EQ(RedisSlot("{user1000}.followers"), 3'443);
 
-  // Redis hashes only the first non-empty {...} tag; malformed or empty tags
-  // deliberately fall back to hashing the complete binary-safe key.
+  // Redis uses the first opening brace. A missing closing brace or an empty
+  // first pair makes it hash the entire key, even if a later tag is valid.
   EXPECT_EQ(RedisSlot("foo{bar}{zap}"), RedisSlot("bar"));
   EXPECT_EQ(RedisSlot("foo{{bar}}zap"), RedisSlot("{bar"));
-  EXPECT_EQ(RedisSlot("foo{}{bar}"), RedisSlot("foo{}{bar}"));
-  EXPECT_EQ(RedisSlot("foo{bar"), RedisSlot("foo{bar"));
+  EXPECT_EQ(RedisSlot("foo{}{bar}"), 8'363);
+  EXPECT_EQ(RedisSlot("foo{bar"), 15'278);
 
   const std::string_view binary_tag("a{b\0c}d", 7);
   const std::string_view binary_value("b\0c", 3);
   EXPECT_EQ(RedisSlot(binary_tag), RedisSlot(binary_value));
+}
+
+TEST(StorageFormatTest, RedisSlotMatchesBitwiseCrcAtEveryBlockBoundary) {
+  using lavik::storage::RedisSlot;
+  // Binary keys without braces exercise every tail length and starting
+  // alignment against an independent CRC-16/XMODEM recurrence.
+  std::array<char, 40> bytes{};
+  for (std::size_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = static_cast<char>(i % 2 == 0 ? i : 0x80 + i);
+  }
+  for (std::size_t offset = 0; offset < 8; ++offset) {
+    const std::string_view key(bytes.data() + offset, bytes.size() - offset);
+    std::uint16_t crc = 0;
+    EXPECT_EQ(RedisSlot(key.substr(0, 0)), 0);
+    for (std::size_t length = 1; length <= key.size(); ++length) {
+      crc ^= static_cast<unsigned char>(key[length - 1]) << 8;
+      for (unsigned bit = 0; bit < 8; ++bit) {
+        crc = static_cast<std::uint16_t>((crc & 0x8000U) ? (crc << 1) ^ 0x1021U
+                                                         : crc << 1);
+      }
+      ASSERT_EQ(RedisSlot(key.substr(0, length)), crc & 0x3fffU)
+          << "offset=" << offset << " length=" << length;
+    }
+  }
 }
 
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {

@@ -151,26 +151,51 @@ std::uint64_t SipHash12(std::string_view input,
   return v0 ^ v1 ^ v2 ^ v3;
 }
 
-constexpr std::array<std::uint16_t, 256> MakeRedisCrc16Table() noexcept {
-  std::array<std::uint16_t, 256> table{};
-  for (std::size_t byte = 0; byte < table.size(); ++byte) {
+constexpr auto kRedisCrc16Tables = [] {
+  std::array<std::array<std::uint16_t, 256>, 8> tables{};
+  for (std::size_t byte = 0; byte < tables[0].size(); ++byte) {
     std::uint16_t crc = static_cast<std::uint16_t>(byte << 8);
     for (unsigned bit = 0; bit < 8; ++bit) {
       crc = static_cast<std::uint16_t>(
           (crc & 0x8000U) != 0 ? (crc << 1) ^ 0x1021U : crc << 1);
     }
-    table[byte] = crc;
+    tables[0][byte] = crc;
   }
-  return table;
-}
-
-constexpr auto kRedisCrc16Table = MakeRedisCrc16Table();
+  // Row n is the CRC of one byte followed by n zero bytes. Linearity lets
+  // each byte's contribution to an eight-byte block be looked up independently.
+  for (std::size_t row = 1; row < tables.size(); ++row) {
+    for (std::size_t byte = 0; byte < tables[row].size(); ++byte) {
+      const auto prev = tables[row - 1][byte];
+      tables[row][byte] =
+          static_cast<std::uint16_t>((prev << 8) ^ tables[0][prev >> 8]);
+    }
+  }
+  return tables;
+}();
 
 std::uint16_t RedisCrc16(std::string_view key) noexcept {
+  const auto& tables = kRedisCrc16Tables;
+  auto* bytes = reinterpret_cast<const unsigned char*>(key.data());
+  std::size_t remaining = key.size();
   std::uint16_t crc = 0;
-  for (unsigned char byte : key) {
-    const auto index = static_cast<std::uint8_t>((crc >> 8) ^ byte);
-    crc = static_cast<std::uint16_t>((crc << 8) ^ kRedisCrc16Table[index]);
+  while (remaining >= 8) {
+    crc = tables[7][(crc >> 8) ^ bytes[0]] ^
+          tables[6][(crc & 0xff) ^ bytes[1]] ^ tables[5][bytes[2]] ^
+          tables[4][bytes[3]] ^ tables[3][bytes[4]] ^ tables[2][bytes[5]] ^
+          tables[1][bytes[6]] ^ tables[0][bytes[7]];
+    bytes += 8;
+    remaining -= 8;
+  }
+  if (remaining >= 4) {
+    crc = tables[3][(crc >> 8) ^ bytes[0]] ^
+          tables[2][(crc & 0xff) ^ bytes[1]] ^ tables[1][bytes[2]] ^
+          tables[0][bytes[3]];
+    bytes += 4;
+    remaining -= 4;
+  }
+  for (std::size_t i = 0; i < remaining; ++i) {
+    crc = static_cast<std::uint16_t>((crc << 8) ^
+                                     tables[0][(crc >> 8) ^ bytes[i]]);
   }
   return crc;
 }
