@@ -207,7 +207,7 @@ The standard io_uring build requires:
 
 - Linux 6.1 or newer with io_uring enabled (`x86_64` and `aarch64` are the release-package targets)
 - CMake 3.26 or newer (required by the bundled Meta dependency)
-- a C++23 compiler and standard library with `std::generator` support (the commands below use GCC 14)
+- a C++23 compiler (the commands below use GCC 14)
 - Ninja, Git, and OpenSSL development headers/static libraries; GNU Make is
   additionally required by the optional bypass dependencies
 
@@ -227,8 +227,7 @@ cd lavik
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
-export CC=gcc-14 CXX=g++-14
-./scripts/configure_release.sh
+CC=gcc-14 CXX=g++-14 ./scripts/configure_release.sh
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```

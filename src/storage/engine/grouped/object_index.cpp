@@ -411,7 +411,7 @@ const RecordIndexValue* FindBaseRecord(const NodeHandle& root,
              : &page->locations_[found - page->ids_.begin()];
 }
 
-// Missing manifests also need a stable reference throughout a yielded view.
+// Borrow existing manifest handles during scans, including the empty handle.
 constinit const std::shared_ptr<const std::vector<ExtentRef>> kEmptyManifest;
 
 const std::shared_ptr<const std::vector<ExtentRef>>& ManifestFor(
@@ -532,14 +532,12 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
   return NodeHandle(std::move(*replacement));
 }
 
-std::generator<const GroupIndexPage&> PhysicalPages(const NodeHandle& node) {
-  if (!node) co_return;
-  if (node->page_) {
-    co_yield *node->page_;
-  } else {
-    for (const auto& child : node->children_)
-      co_yield std::ranges::elements_of(PhysicalPages(child));
-  }
+template <typename Visitor>
+bool VisitPagesUntil(const NodeHandle& node, const Visitor& visit) {
+  if (!node) return false;
+  if (node->page_) return visit(*node->page_);
+  return VisitPagesUntil(node->children_[0], visit) ||
+         VisitPagesUntil(node->children_[1], visit);
 }
 
 }  // namespace
@@ -1280,42 +1278,43 @@ bool GroupedObject::SameLogicalRoot(const GroupedObject& other) const noexcept {
              : directory().root() == other.directory().root();
 }
 
-std::generator<const GroupedObject::RecordView&> GroupedObject::Records()
-    const {
-  if (physical_->string_size_) {
-    for (std::size_t i = 0; i < physical_->string_size_; ++i) {
-      const auto& page = physical_->string_pages_[i / kGroupIndexPageEntries];
+bool GroupedObject::VisitRecordsUntil(
+    absl::FunctionRef<bool(GroupedRecordId, const RecordIndexValue&,
+                           const std::shared_ptr<const std::vector<ExtentRef>>&,
+                           bool)>
+        visitor) const {
+  const auto& state = *physical_;
+  if (state.string_size_) {
+    for (std::size_t i = 0; i < state.string_size_; ++i) {
+      const auto& page = state.string_pages_[i / kGroupIndexPageEntries];
       const GroupedRecordId id{i + 1, 0};
-      RecordView record{id, *page->entries_[i % kGroupIndexPageEntries],
-                        ManifestFor(*page->owner_->page_, id), false};
-      co_yield record;
+      if (visitor(id, *page->entries_[i % kGroupIndexPageEntries],
+                  ManifestFor(*page->owner_->page_, id), false))
+        return true;
     }
-    co_return;
+    return false;
   }
 
-  auto overrides = physical_->Overrides();
-  for (const auto& page : PhysicalPages(physical_->root_)) {
-    for (std::size_t i = 0; i < page.ids_.size(); ++i) {
-      const auto id = page.ids_[i];
-      if (!overrides.empty() && overrides.front().id_ == id) {
-        const auto& replacement = overrides.front();
-        RecordView record{id, replacement.entry_, kEmptyManifest,
-                          replacement.retired_};
-        co_yield record;
-        overrides = overrides.subspan(1);
-      } else {
-        RecordView record{id, page.locations_[i], ManifestFor(page, id),
-                          ((page.retired_ >> i) & 1) != 0};
-        co_yield record;
-      }
-    }
-  }
-  assert(overrides.empty());
-}
-
-void GroupedObject::ForEachRecord(const RecordVisitor& visitor) const {
-  for (const auto& [id, entry, extents, retired] : Records())
-    visitor(id, entry, extents, retired);
+  auto overrides = state.Overrides();
+  const bool stopped =
+      VisitPagesUntil(state.root_, [&](const GroupIndexPage& page) {
+        for (std::size_t i = 0; i < page.ids_.size(); ++i) {
+          const auto id = page.ids_[i];
+          if (!overrides.empty() && overrides.front().id_ == id) {
+            const auto& replacement = overrides.front();
+            if (visitor(id, replacement.entry_, kEmptyManifest,
+                        replacement.retired_))
+              return true;
+            overrides = overrides.subspan(1);
+          } else if (visitor(id, page.locations_[i], ManifestFor(page, id),
+                             ((page.retired_ >> i) & 1) != 0)) {
+            return true;
+          }
+        }
+        return false;
+      });
+  assert(stopped || overrides.empty());
+  return stopped;
 }
 
 GroupedObjectIndex::GroupedObjectIndex(

@@ -35,7 +35,6 @@ cd lavik
 git submodule update --init bycorf third_party/mimalloc
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
-export CC=gcc-14 CXX=g++-14
 ./scripts/configure_debug.sh
 cmake --build build_debug --parallel
 ```

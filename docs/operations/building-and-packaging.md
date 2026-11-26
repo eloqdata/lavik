@@ -140,7 +140,6 @@ prepopulate the Go toolchain/module caches. Set
 Optimized local builds use the current machine's instruction set by default:
 
 ```bash
-export CC=gcc-14 CXX=g++-14
 ./scripts/configure_release.sh
 cmake --build build --target lavik lavik-meta lavik-ctl --parallel
 ```
@@ -259,8 +258,8 @@ git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
 cmake -S . -B build-dpdk-net -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAVIK_ENABLE_OPT=OFF \
   -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
-  -DBYCORF_SPDK_C_COMPILER=gcc-14 \
-  -DBYCORF_SPDK_CXX_COMPILER=g++-14 \
+  -DBYCORF_SPDK_C_COMPILER=gcc-13 \
+  -DBYCORF_SPDK_CXX_COMPILER=g++-13 \
   -DLAVIK_KERNEL_BYPASS=ON -DBUILD_TESTING=OFF
 cmake --build build-dpdk-net --target lavik -j4
 ```
@@ -661,7 +660,7 @@ portable path when that system binary is unavailable.
 ## Downloadable release package
 
 ```bash
-CC=gcc-14 CXX=g++-14 ./scripts/package_release.sh
+./scripts/package_release.sh
 ```
 
 The packaging script builds `lavik`, `lavik-meta`, and `lavik-ctl` in Release
@@ -737,7 +736,7 @@ After installing the prerequisites and initializing the pinned submodules in
 with both network and storage bypass capabilities:
 
 ```bash
-CC=gcc-14 CXX=g++-14 LAVIK_PACKAGE_KERNEL_BYPASS=ON ./scripts/package_release.sh
+CC=gcc-13 CXX=g++-13 LAVIK_PACKAGE_KERNEL_BYPASS=ON ./scripts/package_release.sh
 ```
 
 This produces a `lavik-<version>-linux-<arch>.tar.gz` archive containing
@@ -774,7 +773,7 @@ checks apply to all three executables in either package variant.
 push to `main` or a `v*` tag and can also be started with `workflow_dispatch`.
 It builds on
 native `ubuntu-24.04` (x86_64) and `ubuntu-24.04-arm` (aarch64) runners using
-GCC 14, producing four packages: both variants for both architectures.
+GCC 13, producing four packages: both variants for both architectures.
 Each job checks the license files, all three executables, and the packaged
 Admin launcher after extracting the archive. It runs Admin regression tests,
 an authenticated launcher smoke test, and kernel/io_uring SET/GET and recovery

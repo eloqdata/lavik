@@ -17,12 +17,12 @@
 #pragma once
 
 #include <functional>
-#include <generator>
 #include <memory>
 #include <span>
 #include <string_view>
 #include <variant>
 
+#include "absl/functional/function_ref.h"
 #include "lavik/storage/detail/grouped/collection.h"
 #include "lavik/storage/detail/grouped/commit.h"
 #include "lavik/storage/detail/grouped/hash.h"
@@ -190,24 +190,27 @@ class GroupedObject {
                         : directory().root().group_count_;
   }
   std::size_t record_count() const noexcept;
-  struct RecordView {
-    GroupedRecordId id_;
-    const RecordIndexValue& entry_;
-    // Borrow the page's handle. Only a consumer retaining it needs a copy.
-    const std::shared_ptr<const std::vector<ExtentRef>>& extents_;
-    bool retired_;
-  };
-  // Includes active and retired identities in physical index order. Keep this
-  // object alive throughout iteration and materialize block epoch/owner before
-  // suspending the consuming task. The yielded view expires on increment.
-  std::generator<const RecordView&> Records() const;
   using RecordVisitor = std::function<void(
       GroupedRecordId, const RecordIndexValue&,
       const std::shared_ptr<const std::vector<ExtentRef>>&, bool)>;
   // Includes active leaves AND retired parent markers in both identity spaces.
   // The callback borrows compact entries and must materialize block epoch/owner
   // before suspension.
-  void ForEachRecord(const RecordVisitor& visitor) const;
+  template <typename Visitor>
+  void ForEachRecord(Visitor&& visitor) const {
+    VisitRecordsUntil([&](GroupedRecordId id, const RecordIndexValue& entry,
+                          const auto& extents, bool retired) {
+      visitor(id, entry, extents, retired);
+      return false;
+    });
+  }
+  // Same physical order and borrowing rules. Stops when the visitor returns
+  // true, including before entering the next index page.
+  bool VisitRecordsUntil(
+      absl::FunctionRef<
+          bool(GroupedRecordId, const RecordIndexValue&,
+               const std::shared_ptr<const std::vector<ExtentRef>>&, bool)>
+          visitor) const;
 
  private:
   // Common physical ownership validation and allocation; directory-specific
