@@ -16,10 +16,13 @@
 
 #include "lavik/command_table.h"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <limits>
+#include <numeric>
 #include <optional>
+#include <ranges>
 
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
@@ -562,29 +565,71 @@ constexpr auto kCanonicalNames = [] {
   return names;
 }();
 
-bool EqualsIgnoreCase(std::string_view name, std::string_view lower) {
-  if (name.size() != lower.size()) {
-    return false;
+constexpr std::size_t kMaxNameLength =
+    std::ranges::max_element(kCommandTable, {}, [](const CommandSpec& spec) {
+      return spec.name_.size();
+    })->name_.size();
+
+constexpr std::size_t NameGroup(unsigned char initial, std::size_t length) {
+  return (initial - 'a') * (kMaxNameLength + 1) + length;
+}
+
+// Group only lookup entries. COMMAND enumerates the original table in
+// declaration order, and all callers get pointers into that same table,
+// including aliases.
+struct CommandNameIndex {
+  struct Candidate {
+    const char* suffix;
+    const CommandSpec* spec;
+  };
+  std::array<std::uint16_t, 26 * (kMaxNameLength + 1) + 1> offsets{};
+  std::array<Candidate, std::size(kCommandTable)> candidates{};
+};
+static_assert(std::size(kCommandTable) <=
+              std::numeric_limits<std::uint16_t>::max());
+
+constexpr auto kNameIndex = [] {
+  CommandNameIndex index;
+  for (const auto& spec : kCommandTable) {
+    ++index.offsets[NameGroup(spec.name_.front(), spec.name_.size())];
   }
-  for (std::size_t i = 0; i < name.size(); ++i) {
-    unsigned char c = static_cast<unsigned char>(name[i]);
-    if (c >= 'A' && c <= 'Z') {
-      c += 'a' - 'A';
-    }
-    if (c != static_cast<unsigned char>(lower[i])) {
-      return false;
-    }
+  std::partial_sum(index.offsets.begin(), index.offsets.end(),
+                   index.offsets.begin());
+  // Prefix sums give exclusive ends. Filling backwards turns each end into
+  // its group's start while preserving declaration order within the group.
+  for (const auto& spec : std::views::reverse(kCommandTable)) {
+    auto& offset =
+        index.offsets[NameGroup(spec.name_.front(), spec.name_.size())];
+    index.candidates[--offset] = {spec.name_.data() + 1, &spec};
   }
-  return true;
+  return index;
+}();
+
+bool MatchesLowerBytes(std::string_view input, const char* lower) {
+  return std::equal(input.begin(), input.end(), lower,
+                    [](unsigned char c, char expected) {
+                      if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                      return c == expected;
+                    });
+}
+
+bool EqualsIgnoreCase(std::string_view input, std::string_view lower) {
+  return input.size() == lower.size() && MatchesLowerBytes(input, lower.data());
 }
 
 }  // namespace
 
 const CommandSpec* FindCommand(std::string_view name) {
-  for (const CommandSpec& spec : kCommandTable) {
-    if (EqualsIgnoreCase(name, spec.name_)) {
-      return &spec;
-    }
+  if (name.empty() || name.size() > kMaxNameLength) return nullptr;
+  const unsigned initial = static_cast<unsigned char>(name.front()) | 0x20u;
+  if (initial < 'a' || initial > 'z') return nullptr;
+  const auto group = NameGroup(initial, name.size());
+  // The group already established the length and the first ASCII letter.
+  for (auto i = kNameIndex.offsets[group]; i < kNameIndex.offsets[group + 1];
+       ++i) {
+    const auto& candidate = kNameIndex.candidates[i];
+    if (MatchesLowerBytes(name.substr(1), candidate.suffix))
+      return candidate.spec;
   }
   return nullptr;
 }
