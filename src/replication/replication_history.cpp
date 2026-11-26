@@ -20,7 +20,6 @@
 #include <cassert>
 #include <cstring>
 #include <deque>
-#include <generator>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -55,20 +54,19 @@ template <typename T>
 void Store(std::byte* data, const T& value) {
   std::memcpy(data, &value, sizeof(value));
 }
-struct EffectRecord {
-  RecordHeader header;
-  const std::byte* payload;
-};
-// The effect stays in its owning history block for this synchronous scan.
-std::generator<EffectRecord> Records(const std::byte* effect) {
+// The visitor returns true to stop at the current record. Full scans inline
+// a constant false, keeping traversal allocation-free in both cases.
+template <typename F>
+bool VisitRecordsUntil(const std::byte* effect, F&& visit) {
   auto header = Load<EffectHeader>(effect);
   auto* at = effect + sizeof(EffectHeader);
   for (std::uint32_t i = 0; i < header.records_; ++i) {
     auto record = Load<RecordHeader>(at);
     at += sizeof(RecordHeader);
-    co_yield EffectRecord{record, at};
+    if (visit(record, at)) return true;
     at += record.bytes_;
   }
+  return false;
 }
 }  // namespace
 
@@ -107,9 +105,10 @@ struct ReplicationHistory::Impl {
       for (std::uint32_t offset = 0; offset < committed_bytes_;) {
         auto* effect = bytes_.get() + offset;
         auto header = Load<EffectHeader>(effect);
-        for (const auto& [record, bytes] : Records(effect)) {
+        VisitRecordsUntil(effect, [&](auto record, const auto*) {
           next.push_back({record.lsn_, header.sequence_, record.flow_id_});
-        }
+          return false;
+        });
         offset += header.bytes_;
       }
       std::ranges::sort(next, [](const auto& left, const auto& right) {
@@ -148,9 +147,10 @@ struct ReplicationHistory::Impl {
       }
       for (auto offset = indexed_bytes_; offset < committed_bytes_;) {
         auto* effect = bytes_.get() + offset;
-        for (const auto& [record, bytes] : Records(effect)) {
-          if (record.flow_id_ == flow && record.lsn_ == lsn) return effect;
-        }
+        if (VisitRecordsUntil(effect, [&](auto record, const auto*) {
+              return record.flow_id_ == flow && record.lsn_ == lsn;
+            }))
+          return effect;
         offset += Load<EffectHeader>(effect).bytes_;
       }
       return nullptr;
@@ -335,13 +335,14 @@ std::vector<std::vector<NativeHistoryRange>> ReplicationHistory::Coverage(
   for (const auto& block : impl_->blocks_) {
     for (std::uint32_t offset = 0; offset < block.committed_bytes_;) {
       const auto* effect = block.bytes_.get() + offset;
-      for (const auto& [record, bytes] : Records(effect)) {
+      VisitRecordsUntil(effect, [&](auto record, const auto*) {
         auto& ranges = result[record.flow_id_];
         if (!ranges.empty() && ranges.back().end_lsn_ == record.lsn_)
           ranges.back().end_lsn_ = record.lsn_ + 1;
         else
           ranges.push_back({record.lsn_, record.lsn_ + 1});
-      }
+        return false;
+      });
       offset += Load<EffectHeader>(effect).bytes_;
     }
   }
@@ -363,9 +364,10 @@ ReplicationHistory::DescribeEffect(std::string_view history_id,
   const auto* effect = impl_->Find(flow_id, lsn);
   if (!effect) return absl::NotFoundError("retained history has a gap");
   std::vector<NativeHistoryRecordInfo> records;
-  for (const auto& [record, bytes] : Records(effect)) {
+  VisitRecordsUntil(effect, [&](auto record, const auto*) {
     records.push_back({record.flow_id_, record.lsn_, record.bytes_});
-  }
+    return false;
+  });
   return records;
 }
 
@@ -379,12 +381,11 @@ absl::StatusOr<NativeHistoryChunk> ReplicationHistory::Read(
   const auto* effect = impl_->Find(flow_id, lsn);
   if (!effect) return absl::NotFoundError("retained history has a gap");
   std::string_view payload;
-  for (const auto& [record, bytes] : Records(effect)) {
-    if (record.flow_id_ == flow_id && record.lsn_ == lsn) {
-      payload = {reinterpret_cast<const char*>(bytes), record.bytes_};
-      break;
-    }
-  }
+  VisitRecordsUntil(effect, [&](auto record, const auto* bytes) {
+    if (record.flow_id_ != flow_id || record.lsn_ != lsn) return false;
+    payload = {reinterpret_cast<const char*>(bytes), record.bytes_};
+    return true;
+  });
   if (offset >= payload.size())
     return absl::OutOfRangeError("retained event chunk offset is past its end");
   return NativeHistoryChunk{payload.size(),
