@@ -411,13 +411,16 @@ const RecordIndexValue* FindBaseRecord(const NodeHandle& root,
              : &page->locations_[found - page->ids_.begin()];
 }
 
-std::shared_ptr<const std::vector<ExtentRef>> ManifestFor(
+// Borrow existing manifest handles during scans, including the empty handle.
+constinit const std::shared_ptr<const std::vector<ExtentRef>> kEmptyManifest;
+
+const std::shared_ptr<const std::vector<ExtentRef>>& ManifestFor(
     const GroupIndexPage& page, GroupedRecordId id) {
-  if (page.extents_.empty()) return nullptr;
+  if (page.extents_.empty()) return kEmptyManifest;
   const auto bytes = GroupKey(id);
   const std::string_view key(bytes.data(), bytes.size());
   const auto* entry = page.extents_.Find(ComputeDigest(key), key);
-  return entry ? entry->value_ : nullptr;
+  return entry ? entry->value_ : kEmptyManifest;
 }
 
 absl::StatusOr<NodeHandle> UpdatePhysical(
@@ -529,20 +532,12 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
   return NodeHandle(std::move(*replacement));
 }
 
-void VisitPhysical(const NodeHandle& node,
-                   const GroupedObject::RecordVisitor& visitor) {
-  if (!node) return;
-  if (!node->page_) {
-    VisitPhysical(node->children_[0], visitor);
-    VisitPhysical(node->children_[1], visitor);
-    return;
-  }
-  const auto& page = *node->page_;
-  for (std::size_t i = 0; i < page.ids_.size(); ++i) {
-    const auto id = page.ids_[i];
-    visitor(id, page.locations_[i], ManifestFor(page, id),
-            ((page.retired_ >> i) & 1) != 0);
-  }
+template <typename Visitor>
+bool VisitPagesUntil(const NodeHandle& node, const Visitor& visit) {
+  if (!node) return false;
+  if (node->page_) return visit(*node->page_);
+  return VisitPagesUntil(node->children_[0], visit) ||
+         VisitPagesUntil(node->children_[1], visit);
 }
 
 }  // namespace
@@ -1283,35 +1278,43 @@ bool GroupedObject::SameLogicalRoot(const GroupedObject& other) const noexcept {
              : directory().root() == other.directory().root();
 }
 
-void GroupedObject::ForEachRecord(const RecordVisitor& visitor) const {
-  if (physical_->string_size_) {
-    for (std::size_t i = 0; i < physical_->string_size_; ++i) {
-      const auto& page = physical_->string_pages_[i / kGroupIndexPageEntries];
+bool GroupedObject::VisitRecordsUntil(
+    absl::FunctionRef<bool(GroupedRecordId, const RecordIndexValue&,
+                           const std::shared_ptr<const std::vector<ExtentRef>>&,
+                           bool)>
+        visitor) const {
+  const auto& state = *physical_;
+  if (state.string_size_) {
+    for (std::size_t i = 0; i < state.string_size_; ++i) {
+      const auto& page = state.string_pages_[i / kGroupIndexPageEntries];
       const GroupedRecordId id{i + 1, 0};
-      visitor(id, *page->entries_[i % kGroupIndexPageEntries],
-              ManifestFor(*page->owner_->page_, id), false);
+      if (visitor(id, *page->entries_[i % kGroupIndexPageEntries],
+                  ManifestFor(*page->owner_->page_, id), false))
+        return true;
     }
-    return;
+    return false;
   }
-  if (physical_->overrides_.size() == 0) {
-    VisitPhysical(physical_->root_, visitor);
-    return;
-  }
-  std::size_t cursor = 0;
-  VisitPhysical(
-      physical_->root_,
-      [&](GroupedRecordId id, const RecordIndexValue& entry,
-          const std::shared_ptr<const std::vector<ExtentRef>>& extents,
-          bool retired) {
-        if (cursor < physical_->overrides_.size() &&
-            physical_->overrides_[cursor].id_ == id) {
-          const auto& replacement = physical_->overrides_[cursor++];
-          visitor(id, replacement.entry_, nullptr, replacement.retired_);
-        } else {
-          visitor(id, entry, extents, retired);
+
+  auto overrides = state.Overrides();
+  const bool stopped =
+      VisitPagesUntil(state.root_, [&](const GroupIndexPage& page) {
+        for (std::size_t i = 0; i < page.ids_.size(); ++i) {
+          const auto id = page.ids_[i];
+          if (!overrides.empty() && overrides.front().id_ == id) {
+            const auto& replacement = overrides.front();
+            if (visitor(id, replacement.entry_, kEmptyManifest,
+                        replacement.retired_))
+              return true;
+            overrides = overrides.subspan(1);
+          } else if (visitor(id, page.locations_[i], ManifestFor(page, id),
+                             ((page.retired_ >> i) & 1) != 0)) {
+            return true;
+          }
         }
+        return false;
       });
-  assert(cursor == physical_->overrides_.size());
+  assert(stopped || overrides.empty());
+  return stopped;
 }
 
 GroupedObjectIndex::GroupedObjectIndex(

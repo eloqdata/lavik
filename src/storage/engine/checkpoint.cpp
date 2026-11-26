@@ -1376,16 +1376,15 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     append_extents(extents);
     append(root.data(), root.size());
     absl::Status status = account_extents(extents);
+    if (!status.ok()) co_return status;
     if (object)
-      object->ForEachRecord([&](GroupedRecordId id,
-                                const RecordIndexValue& value,
-                                const ExtentManifest& refs, bool retired) {
-        if (!status.ok()) return;
+      object->VisitRecordsUntil([&](auto id, const auto& value,
+                                    const auto& refs, bool retired) {
         const auto physical = MaterializeIndexLocation(value);
         if (physical.tx_tagged()) {
           status = absl::FailedPreconditionError(
               "checkpoint group still transaction-tagged");
-          return;
+          return true;
         }
         CheckpointGroupHeader group{
             .location = SaveLocation(physical),
@@ -1398,7 +1397,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
               object->ordered_directory().FindRecord(id.prefix_);
           if (!route) {
             status = absl::DataLossError("checkpoint ordered route missing");
-            return;
+            return true;
           }
           group.previous = route->previous_;
           group.next = route->next_;
@@ -1418,7 +1417,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
           }
           if (!route) {
             status = absl::DataLossError("checkpoint prefix route missing");
-            return;
+            return true;
           }
           group.lsn = route->lsn_;
           group.encoded_bytes = route->encoded_bytes_;
@@ -1426,6 +1425,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         append(&group, sizeof(group));
         append_extents(refs);
         status = account_extents(refs);
+        return !status.ok();
       });
     if (!status.ok()) co_return status;
     if (bytes.size() != total)

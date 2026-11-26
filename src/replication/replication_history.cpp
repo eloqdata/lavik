@@ -54,16 +54,19 @@ template <typename T>
 void Store(std::byte* data, const T& value) {
   std::memcpy(data, &value, sizeof(value));
 }
+// The visitor returns true to stop at the current record. Full scans inline
+// a constant false, keeping traversal allocation-free in both cases.
 template <typename F>
-void ForEachRecord(const std::byte* effect, F&& visit) {
+bool VisitRecordsUntil(const std::byte* effect, F&& visit) {
   auto header = Load<EffectHeader>(effect);
   auto* at = effect + sizeof(EffectHeader);
   for (std::uint32_t i = 0; i < header.records_; ++i) {
     auto record = Load<RecordHeader>(at);
     at += sizeof(RecordHeader);
-    visit(record, at);
+    if (visit(record, at)) return true;
     at += record.bytes_;
   }
+  return false;
 }
 }  // namespace
 
@@ -102,8 +105,9 @@ struct ReplicationHistory::Impl {
       for (std::uint32_t offset = 0; offset < committed_bytes_;) {
         auto* effect = bytes_.get() + offset;
         auto header = Load<EffectHeader>(effect);
-        ForEachRecord(effect, [&](auto record, const auto*) {
+        VisitRecordsUntil(effect, [&](auto record, const auto*) {
           next.push_back({record.lsn_, header.sequence_, record.flow_id_});
+          return false;
         });
         offset += header.bytes_;
       }
@@ -143,11 +147,10 @@ struct ReplicationHistory::Impl {
       }
       for (auto offset = indexed_bytes_; offset < committed_bytes_;) {
         auto* effect = bytes_.get() + offset;
-        bool match = false;
-        ForEachRecord(effect, [&](auto record, const auto*) {
-          match |= record.flow_id_ == flow && record.lsn_ == lsn;
-        });
-        if (match) return effect;
+        if (VisitRecordsUntil(effect, [&](auto record, const auto*) {
+              return record.flow_id_ == flow && record.lsn_ == lsn;
+            }))
+          return effect;
         offset += Load<EffectHeader>(effect).bytes_;
       }
       return nullptr;
@@ -332,12 +335,13 @@ std::vector<std::vector<NativeHistoryRange>> ReplicationHistory::Coverage(
   for (const auto& block : impl_->blocks_) {
     for (std::uint32_t offset = 0; offset < block.committed_bytes_;) {
       const auto* effect = block.bytes_.get() + offset;
-      ForEachRecord(effect, [&](auto record, const auto*) {
+      VisitRecordsUntil(effect, [&](auto record, const auto*) {
         auto& ranges = result[record.flow_id_];
         if (!ranges.empty() && ranges.back().end_lsn_ == record.lsn_)
           ranges.back().end_lsn_ = record.lsn_ + 1;
         else
           ranges.push_back({record.lsn_, record.lsn_ + 1});
+        return false;
       });
       offset += Load<EffectHeader>(effect).bytes_;
     }
@@ -360,8 +364,9 @@ ReplicationHistory::DescribeEffect(std::string_view history_id,
   const auto* effect = impl_->Find(flow_id, lsn);
   if (!effect) return absl::NotFoundError("retained history has a gap");
   std::vector<NativeHistoryRecordInfo> records;
-  ForEachRecord(effect, [&](auto record, const auto*) {
+  VisitRecordsUntil(effect, [&](auto record, const auto*) {
     records.push_back({record.flow_id_, record.lsn_, record.bytes_});
+    return false;
   });
   return records;
 }
@@ -376,9 +381,10 @@ absl::StatusOr<NativeHistoryChunk> ReplicationHistory::Read(
   const auto* effect = impl_->Find(flow_id, lsn);
   if (!effect) return absl::NotFoundError("retained history has a gap");
   std::string_view payload;
-  ForEachRecord(effect, [&](auto record, const auto* bytes) {
-    if (record.flow_id_ == flow_id && record.lsn_ == lsn)
-      payload = {reinterpret_cast<const char*>(bytes), record.bytes_};
+  VisitRecordsUntil(effect, [&](auto record, const auto* bytes) {
+    if (record.flow_id_ != flow_id || record.lsn_ != lsn) return false;
+    payload = {reinterpret_cast<const char*>(bytes), record.bytes_};
+    return true;
   });
   if (offset >= payload.size())
     return absl::OutOfRangeError("retained event chunk offset is past its end");

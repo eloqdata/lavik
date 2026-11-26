@@ -1238,16 +1238,27 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
     expected[group.id_] = replacement.block_id();
     if (step % 7 == 0) snapshots.push_back({current, expected});
     EXPECT_EQ(current->record_count(), input.locations_.size());
-    std::map<GroupedRecordId, std::uint64_t> visited;
-    current->ForEachRecord([&](GroupedRecordId id,
-                               const RecordIndexValue& entry,
-                               const auto& extents, bool retired) {
-      EXPECT_FALSE(retired);
-      EXPECT_EQ(extents, nullptr);
-      EXPECT_EQ(current->FindRecord(id), &entry);
-      EXPECT_TRUE(visited.emplace(id, entry.block_id()).second);
-    });
-    EXPECT_EQ(visited, expected);
+    auto next = expected.begin();
+    current->ForEachRecord(
+        [&](auto id, const auto& entry, const auto& extents, bool retired) {
+          ASSERT_NE(next, expected.end());
+          EXPECT_EQ(id, next->first);
+          EXPECT_EQ(entry.block_id(), next->second);
+          EXPECT_FALSE(retired);
+          EXPECT_EQ(extents, nullptr);
+          EXPECT_EQ(current->FindRecord(id), &entry);
+          ++next;
+        });
+    EXPECT_EQ(next, expected.end());
+    const auto target = group.id_;
+    std::size_t count = 0;
+    EXPECT_TRUE(current->VisitRecordsUntil(
+        [&](auto id, const auto&, const auto&, bool) {
+          ++count;
+          return id == target;
+        }));
+    EXPECT_EQ(count,
+              1u + std::distance(expected.begin(), expected.find(target)));
   }
   for (const auto& snapshot : snapshots)
     for (const auto& [id, block] : snapshot.blocks)

@@ -22,6 +22,7 @@
 #include <string_view>
 #include <variant>
 
+#include "absl/functional/function_ref.h"
 #include "lavik/storage/detail/grouped/collection.h"
 #include "lavik/storage/detail/grouped/commit.h"
 #include "lavik/storage/detail/grouped/hash.h"
@@ -195,7 +196,21 @@ class GroupedObject {
   // Includes active leaves AND retired parent markers in both identity spaces.
   // The callback borrows compact entries and must materialize block epoch/owner
   // before suspension.
-  void ForEachRecord(const RecordVisitor& visitor) const;
+  template <typename Visitor>
+  void ForEachRecord(Visitor&& visitor) const {
+    VisitRecordsUntil([&](GroupedRecordId id, const RecordIndexValue& entry,
+                          const auto& extents, bool retired) {
+      visitor(id, entry, extents, retired);
+      return false;
+    });
+  }
+  // Same physical order and borrowing rules. Stops when the visitor returns
+  // true, including before entering the next index page.
+  bool VisitRecordsUntil(
+      absl::FunctionRef<
+          bool(GroupedRecordId, const RecordIndexValue&,
+               const std::shared_ptr<const std::vector<ExtentRef>>&, bool)>
+          visitor) const;
 
  private:
   // Common physical ownership validation and allocation; directory-specific
